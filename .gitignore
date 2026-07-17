@@ -1,0 +1,73 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+__MACOSX/
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_view.db
+$RECYCLE.BIN/
+Recycled/
+System Volume Information/
+INetCache/
+ntuser.dat*
+ntuser.ini
+[Hh]idden*
+Desktop.ini
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*.iml
+
+# Node / Vite / Frontend
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+/public/vendor/pdfjs/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/Cargo.lock
+src-tauri/gen/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.playwright-cli/
+/output/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Project specific
+.omc/
+.omx/
+.codex/
+.claude/
+.aider/
+.cursor/
+.windsurf/
+.continue/
+.cody/
+.codeium/

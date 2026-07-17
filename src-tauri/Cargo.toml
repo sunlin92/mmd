@@ -1,0 +1,40 @@
+[package]
+name = "mmd"
+version = "0.1.0"
+description = "Local Markdown editor"
+edition = "2021"
+
+[lib]
+name = "mmd_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+base64 = "=0.22.1"
+fs2 = "=0.4.3"
+getrandom = "=0.3.4"
+mime_guess = "2.0.5"
+notify = "=8.2.0"
+notify-debouncer-full = "=0.7.0"
+percent-encoding = "2.3.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tauri = { version = "2.11.5", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2.7.1"
+tiny_http = "0.12.0"
+walkdir = "2.5.0"
+zip = { version = "=2.4.2", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

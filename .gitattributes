@@ -1,0 +1,2 @@
+# Preserve synchronized third-party license text byte-for-byte.
+public/vendor/notices/** -whitespace
