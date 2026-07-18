@@ -1,0 +1,671 @@
+name: Rolling Latest Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rehearsal:
+        description: Build and smoke-test without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  source:
+    name: Source quality gates
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run check:release-version
+      - run: npm run test:release-tools
+      - id: version
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --exit-code
+
+  build-macos-arm64:
+    name: Build macOS arm64
+    needs: source
+    runs-on: macos-15
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: test "$(uname -m)" = arm64
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+          key: aarch64-apple-darwin
+      - run: npm ci
+      - run: npm run check:release-version
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --release
+      - name: Native filesystem watcher
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
+        env:
+          MMD_RUN_NATIVE_WATCH_TESTS: '1'
+      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles dmg --ci
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+      - name: Stage immutable artifact
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          mkdir staging
+          mapfile=($(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg'))
+          test "${#mapfile[@]}" -eq 1
+          cp "${mapfile[0]}" "staging/MMD_${VERSION}_aarch64.dmg"
+          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_aarch64.dmg"
+      - id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos-arm64
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos-x64:
+    name: Build macOS x64
+    needs: source
+    runs-on: macos-15-intel
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: test "$(uname -m)" = x86_64
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+          key: x86_64-apple-darwin
+      - run: npm ci
+      - run: npm run check:release-version
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin --release
+      - name: Native filesystem watcher
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
+        env:
+          MMD_RUN_NATIVE_WATCH_TESTS: '1'
+      - run: npm run tauri -- build --target x86_64-apple-darwin --bundles dmg --ci
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+      - name: Stage immutable artifact
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          mkdir staging
+          mapfile=($(find src-tauri/target/x86_64-apple-darwin/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg'))
+          test "${#mapfile[@]}" -eq 1
+          cp "${mapfile[0]}" "staging/MMD_${VERSION}_x64.dmg"
+          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_x64.dmg"
+      - id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos-x64
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows-x64:
+    name: Build Windows x64
+    needs: source
+    runs-on: windows-latest
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - shell: pwsh
+        run: if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') { throw 'Expected x64' }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+          key: x86_64-pc-windows-msvc
+      - run: npm ci
+      - run: npm run check:release-version
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release
+      - name: Native filesystem watcher
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
+        env:
+          MMD_RUN_NATIVE_WATCH_TESTS: '1'
+      - run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci
+      - name: Stage immutable artifact
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          New-Item -ItemType Directory staging | Out-Null
+          $files = @(Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter '*-setup.exe' -File)
+          if ($files.Count -ne 1) { throw "Expected one NSIS installer, found $($files.Count)" }
+          $name = "MMD_$env:VERSION`_x64-setup.exe"
+          Copy-Item $files[0].FullName "staging/$name"
+          node scripts/ci/artifact-manifest.mjs create staging $name
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest creation failed' }
+      - id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-x64
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux-x64:
+    name: Build Linux x64
+    needs: source
+    runs-on: ubuntu-22.04
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: test "$(uname -m)" = x86_64
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+          key: x86_64-unknown-linux-gnu
+      - run: npm ci
+      - run: npm run check:release-version
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-unknown-linux-gnu --release
+      - name: Native filesystem watcher
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-unknown-linux-gnu --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
+        env:
+          MMD_RUN_NATIVE_WATCH_TESTS: '1'
+      - run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles appimage,deb --ci
+      - name: Stage immutable artifacts
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          mkdir staging
+          appimages=($(find src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage'))
+          debs=($(find src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb -maxdepth 1 -type f -name '*.deb'))
+          test "${#appimages[@]}" -eq 1
+          test "${#debs[@]}" -eq 1
+          cp "${appimages[0]}" "staging/MMD_${VERSION}_amd64.AppImage"
+          cp "${debs[0]}" "staging/MMD_${VERSION}_amd64.deb"
+          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_amd64.AppImage" "MMD_${VERSION}_amd64.deb"
+      - id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux-x64
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke-macos-arm64:
+    name: Smoke macOS arm64
+    needs: build-macos-arm64
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Verify trusted artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build-macos-arm64.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.build-macos-arm64.outputs.artifact-digest }}
+        run: |
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)
+          test "${actual#sha256:}" = "${ARTIFACT_DIGEST#sha256:}"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-macos-arm64.outputs.artifact-id }}
+          path: artifact
+          merge-multiple: true
+      - run: scripts/ci/smoke-macos.sh artifact arm64
+
+  smoke-macos-x64:
+    name: Smoke macOS x64
+    needs: build-macos-x64
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Verify trusted artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build-macos-x64.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.build-macos-x64.outputs.artifact-digest }}
+        run: |
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)
+          test "${actual#sha256:}" = "${ARTIFACT_DIGEST#sha256:}"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-macos-x64.outputs.artifact-id }}
+          path: artifact
+          merge-multiple: true
+      - run: scripts/ci/smoke-macos.sh artifact x86_64
+
+  smoke-windows-x64:
+    name: Smoke Windows x64
+    needs: build-windows-x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Verify trusted artifact identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build-windows-x64.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.build-windows-x64.outputs.artifact-digest }}
+        run: |
+          $actual = gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:ARTIFACT_ID" --jq .digest
+          $actual = $actual -replace '^sha256:', ''
+          $expected = $env:ARTIFACT_DIGEST -replace '^sha256:', ''
+          if ($actual -ne $expected) { throw "Artifact digest mismatch: $actual" }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-windows-x64.outputs.artifact-id }}
+          path: artifact
+          merge-multiple: true
+      - shell: pwsh
+        run: ./scripts/ci/smoke-windows.ps1 -ArtifactDirectory artifact
+
+  smoke-linux-x64:
+    name: Smoke Linux x64
+    needs: build-linux-x64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse libfuse2 xvfb
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Verify trusted artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build-linux-x64.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.build-linux-x64.outputs.artifact-digest }}
+        run: |
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)
+          test "${actual#sha256:}" = "${ARTIFACT_DIGEST#sha256:}"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-linux-x64.outputs.artifact-id }}
+          path: artifact
+          merge-multiple: true
+      - run: scripts/ci/smoke-linux.sh artifact
+
+  assemble-release:
+    name: Assemble verified release
+    needs:
+      - source
+      - build-macos-arm64
+      - build-macos-x64
+      - build-windows-x64
+      - build-linux-x64
+      - smoke-macos-arm64
+      - smoke-macos-x64
+      - smoke-windows-x64
+      - smoke-linux-x64
+    runs-on: ubuntu-22.04
+    outputs:
+      artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload-candidate.outputs.artifact-digest }}
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.source.outputs.version }}
+      MAC_ARM_ID: ${{ needs.build-macos-arm64.outputs.artifact-id }}
+      MAC_ARM_DIGEST: ${{ needs.build-macos-arm64.outputs.artifact-digest }}
+      MAC_X64_ID: ${{ needs.build-macos-x64.outputs.artifact-id }}
+      MAC_X64_DIGEST: ${{ needs.build-macos-x64.outputs.artifact-digest }}
+      WINDOWS_ID: ${{ needs.build-windows-x64.outputs.artifact-id }}
+      WINDOWS_DIGEST: ${{ needs.build-windows-x64.outputs.artifact-digest }}
+      LINUX_ID: ${{ needs.build-linux-x64.outputs.artifact-id }}
+      LINUX_DIGEST: ${{ needs.build-linux-x64.outputs.artifact-digest }}
+    steps:
+      - name: Verify artifact IDs and digests
+        run: |
+          set -euo pipefail
+          for pair in "$MAC_ARM_ID $MAC_ARM_DIGEST" "$MAC_X64_ID $MAC_X64_DIGEST" "$WINDOWS_ID $WINDOWS_DIGEST" "$LINUX_ID $LINUX_DIGEST"; do
+            read -r id digest <<<"$pair"
+            [[ "$id" =~ ^[0-9]+$ ]]
+            expected=${digest#sha256:}
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            actual=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --jq .digest)
+            [[ "$actual" =~ ^sha256:[0-9a-f]{64}$ ]]
+            test "${actual#sha256:}" = "$expected"
+          done
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-macos-arm64.outputs.artifact-id }}
+          path: artifacts/macos-arm64
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-macos-x64.outputs.artifact-id }}
+          path: artifacts/macos-x64
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-windows-x64.outputs.artifact-id }}
+          path: artifacts/windows-x64
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-linux-x64.outputs.artifact-id }}
+          path: artifacts/linux-x64
+          merge-multiple: true
+      - name: Verify manifests and assemble release assets
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          for directory in artifacts/*; do
+            mapfile -t actual < <(find "$directory" -maxdepth 1 -type f -printf '%f\n' | sort)
+            mapfile -t expected < <(jq -r '.files[].name, "artifact-manifest.json"' "$directory/artifact-manifest.json" | sort)
+            diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
+            while IFS=$'\t' read -r name size digest; do
+              test "$(stat -c %s "$directory/$name")" = "$size"
+              test "$(sha256sum "$directory/$name" | cut -d ' ' -f 1)" = "$digest"
+              cp --no-clobber "$directory/$name" release-assets/
+            done < <(jq -r '.files[] | [.name, (.size | tostring), .sha256] | @tsv' "$directory/artifact-manifest.json")
+          done
+          mapfile -t actual_assets < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          expected_assets=(
+            "MMD_${VERSION}_aarch64.dmg"
+            "MMD_${VERSION}_amd64.AppImage"
+            "MMD_${VERSION}_amd64.deb"
+            "MMD_${VERSION}_x64-setup.exe"
+            "MMD_${VERSION}_x64.dmg"
+          )
+          diff -u <(printf '%s\n' "${expected_assets[@]}" | sort) <(printf '%s\n' "${actual_assets[@]}")
+          (cd release-assets && sha256sum MMD_* | sort -k2 > SHA256SUMS.txt && sha256sum --check SHA256SUMS.txt)
+      - id: upload-candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish-latest:
+    name: Publish verified Latest
+    if: github.event_name == 'push' || (github.ref == 'refs/heads/main' && inputs.rehearsal == false)
+    concurrency:
+      group: rolling-latest-publisher
+      cancel-in-progress: false
+    needs:
+      - source
+      - assemble-release
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.source.outputs.version }}
+      SOURCE_SHA: ${{ github.sha }}
+      CANDIDATE_ID: ${{ needs.assemble-release.outputs.artifact-id }}
+      CANDIDATE_DIGEST: ${{ needs.assemble-release.outputs.artifact-digest }}
+    steps:
+      - id: freshness
+        name: Require current main source
+        run: |
+          set -euo pipefail
+          main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$main_head" == "$SOURCE_SHA" ]]; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'current=false' >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping obsolete candidate $SOURCE_SHA; main is now $main_head."
+          fi
+      - name: Verify candidate artifact identity
+        if: steps.freshness.outputs.current == 'true'
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_ID" =~ ^[0-9]+$ ]]
+          expected=${CANDIDATE_DIGEST#sha256:}
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ID" --jq .digest)
+          [[ "$actual" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "${actual#sha256:}" = "$expected"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.freshness.outputs.current == 'true'
+        with:
+          artifact-ids: ${{ needs.assemble-release.outputs.artifact-id }}
+          path: release-assets
+          merge-multiple: true
+      - name: Verify candidate asset set and checksums
+        if: steps.freshness.outputs.current == 'true'
+        run: |
+          set -euo pipefail
+          mapfile -t actual < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          expected=(
+            "MMD_${VERSION}_aarch64.dmg"
+            "MMD_${VERSION}_amd64.AppImage"
+            "MMD_${VERSION}_amd64.deb"
+            "MMD_${VERSION}_x64-setup.exe"
+            "MMD_${VERSION}_x64.dmg"
+            "SHA256SUMS.txt"
+          )
+          diff -u <(printf '%s\n' "${expected[@]}" | sort) <(printf '%s\n' "${actual[@]}")
+          (cd release-assets && sha256sum --check SHA256SUMS.txt)
+      - name: Create, verify, and roll Latest
+        if: steps.freshness.outputs.current == 'true'
+        run: |
+          set -euo pipefail
+          tag="mmd-latest-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SOURCE_SHA:0:12}"
+          committed=false
+          rollback_required=false
+
+          retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              [[ "$attempt" == 5 ]] && return 1
+              sleep "$attempt"
+            done
+          }
+
+          candidate_release_count() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp |
+              jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | length'
+          }
+
+          candidate_tag_count() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/mmd-latest-" --slurp |
+              jq --arg tag "$tag" '[.[][] | select(.ref == ("refs/tags/" + $tag))] | length'
+          }
+
+          public_release_count() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp |
+              jq '[.[][] | select(.draft == false and .prerelease == false)] | length'
+          }
+
+          candidate_release_absent() {
+            [[ "$(candidate_release_count)" == 0 ]]
+          }
+
+          candidate_tag_absent() {
+            [[ "$(candidate_tag_count)" == 0 ]]
+          }
+
+          previous_is_latest() {
+            [[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" == "$previous_latest_tag" ]]
+          }
+
+          no_public_latest() {
+            [[ "$(public_release_count)" == 0 ]]
+          }
+
+          rollback_candidate() {
+            local status=$?
+            trap - EXIT
+            if [[ "$rollback_required" == true && "$committed" == false ]]; then
+              set +e
+              local rollback_ok=true
+              retry gh release delete "$tag" --yes >/dev/null 2>&1 || true
+              retry candidate_release_absent || rollback_ok=false
+              retry gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" >/dev/null 2>&1 || true
+              retry candidate_tag_absent || rollback_ok=false
+              if [[ -n "$previous_latest_tag" ]]; then
+                retry gh release edit "$previous_latest_tag" --latest >/dev/null 2>&1 || true
+                retry previous_is_latest || rollback_ok=false
+              else
+                retry no_public_latest || rollback_ok=false
+              fi
+              if [[ "$rollback_ok" != true ]]; then
+                echo '::error::Candidate rollback could not be verified; inspect Releases before retrying.'
+                [[ "$status" == 0 ]] && status=1
+              fi
+            fi
+            exit "$status"
+          }
+          trap rollback_candidate EXIT
+
+          if previous_latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null); then
+            :
+          else
+            previous_latest_tag=
+            [[ "$(public_release_count)" == 0 ]]
+          fi
+
+          main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$main_head" != "$SOURCE_SHA" ]]; then
+            echo "::notice::Skipping obsolete candidate $SOURCE_SHA; main is now $main_head."
+            exit 0
+          fi
+
+          rollback_required=true
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$SOURCE_SHA" >/dev/null || true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$SOURCE_SHA"
+          gh release create "$tag" release-assets/* --draft --verify-tag --title Latest --notes "Automated verified build of ${SOURCE_SHA}."
+
+          mapfile -t remote_names < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name' | sort)
+          mapfile -t local_names < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          diff -u <(printf '%s\n' "${local_names[@]}") <(printf '%s\n' "${remote_names[@]}")
+          while IFS=$'\t' read -r name size; do
+            test "$(stat -c %s "release-assets/$name")" = "$size"
+          done < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[] | [.name, (.size | tostring)] | @tsv')
+          mkdir downloaded-release
+          gh release download "$tag" --dir downloaded-release
+          cmp release-assets/SHA256SUMS.txt downloaded-release/SHA256SUMS.txt
+          (cd downloaded-release && sha256sum --check SHA256SUMS.txt)
+
+          main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$main_head" != "$SOURCE_SHA" ]]; then
+            echo "Candidate became obsolete before publication: main is now $main_head." >&2
+            exit 1
+          fi
+          gh release edit "$tag" --draft=false --latest || true
+          candidate_draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .draft)
+          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$candidate_draft" != false || "$latest_tag" != "$tag" || "$main_head" != "$SOURCE_SHA" ]]; then
+            echo 'Latest publication did not reach a confirmed remote state.' >&2
+            exit 1
+          fi
+          committed=true
+          rollback_required=false
+
+          cleanup_failed=false
+          release_inventory_ok=true
+          managed_releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name | startswith("mmd-latest-")) | [.id, .tag_name] | @tsv') || {
+            release_inventory_ok=false
+            cleanup_failed=true
+            managed_releases=
+          }
+          declare -A retained_tags=()
+          while IFS=$'\t' read -r id old_tag; do
+            [[ -z "$id" || "$old_tag" == "$tag" ]] && continue
+            if ! retry gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" >/dev/null; then
+              retained_tags["$old_tag"]=1
+              cleanup_failed=true
+            fi
+          done <<<"$managed_releases"
+
+          if [[ "$release_inventory_ok" == true ]]; then
+            managed_tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/mmd-latest-" --jq '.[].ref | sub("refs/tags/"; "")') || {
+              cleanup_failed=true
+              managed_tags=
+            }
+            while read -r old_tag; do
+              [[ -z "$old_tag" || "$old_tag" == "$tag" || -n "${retained_tags[$old_tag]:-}" ]] && continue
+              retry gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$old_tag" >/dev/null || cleanup_failed=true
+            done <<<"$managed_tags"
+          fi
+
+          if [[ "$cleanup_failed" == true ]]; then
+            echo '::warning::Latest was published, but some older managed history could not be removed; the next run will retry.'
+          fi

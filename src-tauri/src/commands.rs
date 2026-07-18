@@ -346,7 +346,12 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    windows_handle_files::rename_no_replace(from, to)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn rename_no_replace(_from: &Path, _to: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -459,7 +464,388 @@ fn write_file_without_following_links(path: &Path, bytes: &[u8]) -> io::Result<(
     file.write_all(bytes)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+mod windows_handle_files {
+    use std::{
+        ffi::{c_void, OsStr, OsString},
+        fs::File,
+        io::{self, Write},
+        mem::{offset_of, size_of},
+        os::windows::{
+            ffi::{OsStrExt, OsStringExt},
+            io::{AsRawHandle, FromRawHandle},
+        },
+        path::{Path, PathBuf},
+        ptr::{null, null_mut},
+    };
+
+    use windows_sys::Wdk::{
+        Foundation::OBJECT_ATTRIBUTES,
+        Storage::FileSystem::{
+            NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+        },
+    };
+    use windows_sys::Win32::{
+        Foundation::{
+            RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, TRUE,
+            UNICODE_STRING,
+        },
+        Globalization::{CompareStringOrdinal, CSTR_EQUAL},
+        Storage::FileSystem::{
+            CreateFileW, FileAttributeTagInfo, FileRenameInfo, GetFileInformationByHandleEx,
+            GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE,
+        },
+        System::IO::IO_STATUS_BLOCK,
+    };
+
+    const DIRECTORY_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    const REGULAR_FILE_OPEN_OPTIONS: u32 =
+        FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT;
+    const ENTRY_OPEN_OPTIONS: u32 = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT;
+
+    fn wide_nul(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+
+    fn handle(file: &File) -> HANDLE {
+        file.as_raw_handle() as HANDLE
+    }
+
+    fn invalid_input(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, message)
+    }
+
+    fn permission_denied(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    fn path_identity(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .map(|unit| {
+                if unit == b'/' as u16 {
+                    b'\\' as u16
+                } else {
+                    unit
+                }
+            })
+            .collect()
+    }
+
+    fn paths_match(left: &Path, right: &Path) -> io::Result<bool> {
+        let left = path_identity(left);
+        let right = path_identity(right);
+        let left_len = i32::try_from(left.len())
+            .map_err(|_| invalid_input("opened path is too long to compare"))?;
+        let right_len = i32::try_from(right.len())
+            .map_err(|_| invalid_input("authorized path is too long to compare"))?;
+        let comparison = unsafe {
+            CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, TRUE)
+        };
+        if comparison == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(comparison == CSTR_EQUAL)
+        }
+    }
+
+    fn opened_path(file: &File) -> io::Result<PathBuf> {
+        let required = unsafe { GetFinalPathNameByHandleW(handle(file), null_mut(), 0, 0) };
+        if required == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buffer = vec![0_u16; required as usize + 1];
+        let written = unsafe {
+            GetFinalPathNameByHandleW(handle(file), buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        };
+        if written == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize >= buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "opened path changed while it was queried",
+            ));
+        }
+        buffer.truncate(written as usize);
+        Ok(PathBuf::from(OsString::from_wide(&buffer)))
+    }
+
+    fn attribute_tag(file: &File) -> io::Result<FILE_ATTRIBUTE_TAG_INFO> {
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                handle(file),
+                FileAttributeTagInfo,
+                (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if succeeded == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(info)
+        }
+    }
+
+    fn open_verified_parent(parent: &Path) -> io::Result<File> {
+        let path = wide_nul(parent.as_os_str());
+        let raw = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                DIRECTORY_SHARE_MODE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let directory = unsafe { File::from_raw_handle(raw as _) };
+        let attributes = attribute_tag(&directory)?.FileAttributes;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_denied("parent directory is a reparse point"));
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(invalid_input("parent path is not a directory"));
+        }
+        if !paths_match(&opened_path(&directory)?, parent)? {
+            return Err(permission_denied(
+                "parent directory changed after authorization",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn relative_name(path: &Path) -> io::Result<Vec<u16>> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid_input("path has no file name"))?;
+        let name: Vec<u16> = name.encode_wide().collect();
+        let byte_length = name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(|| invalid_input("file name is too long"))?;
+        if name.is_empty() || byte_length > u16::MAX as usize {
+            return Err(invalid_input("file name is too long"));
+        }
+        Ok(name)
+    }
+
+    fn nt_error(status: i32) -> io::Error {
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        io::Error::from_raw_os_error(code as i32)
+    }
+
+    fn nt_open_relative(
+        directory: &File,
+        name: &[u16],
+        desired_access: u32,
+        disposition: u32,
+        open_options: u32,
+    ) -> io::Result<File> {
+        let unicode_name = UNICODE_STRING {
+            Length: (name.len() * size_of::<u16>()) as u16,
+            MaximumLength: (name.len() * size_of::<u16>()) as u16,
+            Buffer: name.as_ptr() as *mut u16,
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: handle(directory),
+            ObjectName: &unicode_name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: null(),
+            SecurityQualityOfService: null(),
+        };
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let mut raw: HANDLE = null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                desired_access,
+                &attributes,
+                &mut io_status,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                DIRECTORY_SHARE_MODE,
+                disposition,
+                open_options,
+                null(),
+                0,
+            )
+        };
+        if status < 0 {
+            return Err(nt_error(status));
+        }
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "NtCreateFile returned an invalid handle",
+            ));
+        }
+        Ok(unsafe { File::from_raw_handle(raw as _) })
+    }
+
+    fn validate_regular_child(file: &File) -> io::Result<()> {
+        let attributes = attribute_tag(file)?.FileAttributes;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_input("file is a reparse point"));
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err(invalid_input("path is a directory"));
+        }
+        Ok(())
+    }
+
+    fn validate_rename_entry(file: &File) -> io::Result<()> {
+        if attribute_tag(file)?.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_input("rename entry is a reparse point"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid_input("path has no parent"))?;
+        let name = relative_name(path)?;
+        let directory = open_verified_parent(parent)?;
+        let access = FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        let (mut file, created) = match nt_open_relative(
+            &directory,
+            &name,
+            access,
+            FILE_OPEN,
+            REGULAR_FILE_OPEN_OPTIONS,
+        ) {
+            Ok(file) => (file, false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                nt_open_relative(
+                    &directory,
+                    &name,
+                    access,
+                    FILE_CREATE,
+                    REGULAR_FILE_OPEN_OPTIONS,
+                )?,
+                true,
+            ),
+            Err(error) => return Err(error),
+        };
+        validate_regular_child(&file)?;
+        if !created {
+            file.set_len(0)?;
+        }
+        file.write_all(bytes)
+    }
+
+    fn destination_exists(directory: &File, name: &[u16]) -> io::Result<bool> {
+        match nt_open_relative(
+            directory,
+            name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+            ENTRY_OPEN_OPTIONS,
+        ) {
+            Ok(file) => {
+                validate_rename_entry(&file)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn rename_no_replace_with_precommit(
+        from: &Path,
+        to: &Path,
+        precommit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let source_parent = from
+            .parent()
+            .ok_or_else(|| invalid_input("source path has no parent"))?;
+        let destination_parent = to
+            .parent()
+            .ok_or_else(|| invalid_input("destination path has no parent"))?;
+        let source_name = relative_name(from)?;
+        let destination_name = relative_name(to)?;
+        let source_directory = open_verified_parent(source_parent)?;
+        let destination_directory = open_verified_parent(destination_parent)?;
+        if destination_exists(&destination_directory, &destination_name)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "rename destination already exists",
+            ));
+        }
+        let source = nt_open_relative(
+            &source_directory,
+            &source_name,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+            ENTRY_OPEN_OPTIONS,
+        )?;
+        validate_rename_entry(&source)?;
+        precommit()?;
+
+        let name_bytes = destination_name.len() * size_of::<u16>();
+        let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName) + name_bytes + size_of::<u16>();
+        let words = buffer_bytes.div_ceil(size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*rename).Anonymous = FILE_RENAME_INFO_0 {
+                ReplaceIfExists: false,
+            };
+            (*rename).RootDirectory = handle(&destination_directory);
+            (*rename).FileNameLength = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                destination_name.as_ptr(),
+                std::ptr::addr_of_mut!((*rename).FileName).cast::<u16>(),
+                destination_name.len(),
+            );
+        }
+        let succeeded = unsafe {
+            SetFileInformationByHandle(
+                handle(&source),
+                FileRenameInfo,
+                rename.cast::<c_void>(),
+                buffer_bytes as u32,
+            )
+        };
+        if succeeded == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+        rename_no_replace_with_precommit(from, to, || Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn rename_no_replace_with_hook(
+        from: &Path,
+        to: &Path,
+        precommit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        rename_no_replace_with_precommit(from, to, precommit)
+    }
+}
+
+#[cfg(windows)]
+fn write_file_without_following_links(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    windows_handle_files::write(path, bytes)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn write_file_without_following_links(_path: &Path, _bytes: &[u8]) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -6884,6 +7270,243 @@ mod tests {
 
         assert!(!source.exists());
         assert_eq!(fs::read(&target).unwrap(), b"source-owned");
+    }
+
+    #[cfg(windows)]
+    mod windows_handle_bound_filesystem {
+        use super::*;
+        use std::{os::windows::fs::symlink_file, process::Command};
+
+        fn create_junction(link: &Path, target: &Path) {
+            let status = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to create test junction");
+        }
+
+        #[test]
+        fn writes_existing_and_new_regular_files() {
+            let workspace = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let existing = parent.join("existing.md");
+            let new = parent.join("new.md");
+            fs::write(&existing, b"old-longer-content").unwrap();
+
+            SystemFileSystemPort.write(&existing, b"updated").unwrap();
+            SystemFileSystemPort.write(&new, b"created").unwrap();
+
+            assert_eq!(fs::read(existing).unwrap(), b"updated");
+            assert_eq!(fs::read(new).unwrap(), b"created");
+        }
+
+        #[test]
+        fn renames_unicode_file_without_replacing_destination() {
+            let workspace = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let source = parent.join("草稿.md");
+            let destination = parent.join("定稿.md");
+            fs::write(&source, b"source").unwrap();
+
+            SystemFileSystemPort.rename(&source, &destination).unwrap();
+
+            assert!(!source.exists());
+            assert_eq!(fs::read(destination).unwrap(), b"source");
+        }
+
+        #[test]
+        fn renames_file_to_a_single_code_unit_name() {
+            let workspace = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let source = parent.join("source.md");
+            let destination = parent.join("x");
+            fs::write(&source, b"source").unwrap();
+
+            SystemFileSystemPort.rename(&source, &destination).unwrap();
+
+            assert!(!source.exists());
+            assert_eq!(fs::read(destination).unwrap(), b"source");
+        }
+
+        #[test]
+        fn rename_preserves_existing_destination_and_source() {
+            let workspace = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let source = parent.join("source.md");
+            let destination = parent.join("destination.md");
+            fs::write(&source, b"source-owned").unwrap();
+            fs::write(&destination, b"destination-owned").unwrap();
+
+            let error = SystemFileSystemPort
+                .rename(&source, &destination)
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(source).unwrap(), b"source-owned");
+            assert_eq!(fs::read(destination).unwrap(), b"destination-owned");
+        }
+
+        #[test]
+        fn renames_directory_without_replacing_destination() {
+            let workspace = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let source = parent.join("drafts");
+            let destination = parent.join("archive");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("nested.md"), b"nested").unwrap();
+
+            SystemFileSystemPort.rename(&source, &destination).unwrap();
+
+            assert!(!source.exists());
+            assert_eq!(fs::read(destination.join("nested.md")).unwrap(), b"nested");
+        }
+
+        #[test]
+        fn directory_rename_preserves_existing_destination_and_source() {
+            let workspace = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let source = parent.join("source-directory");
+            let destination = parent.join("destination-directory");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::write(source.join("source.md"), b"source-owned").unwrap();
+            fs::write(destination.join("destination.md"), b"destination-owned").unwrap();
+
+            let error = SystemFileSystemPort
+                .rename(&source, &destination)
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(source.join("source.md")).unwrap(), b"source-owned");
+            assert_eq!(
+                fs::read(destination.join("destination.md")).unwrap(),
+                b"destination-owned"
+            );
+        }
+
+        #[test]
+        fn rename_does_not_replace_destination_created_after_preflight() {
+            let workspace = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let source = parent.join("source.md");
+            let destination = parent.join("destination.md");
+            fs::write(&source, b"source-owned").unwrap();
+
+            let error =
+                windows_handle_files::rename_no_replace_with_hook(&source, &destination, || {
+                    fs::write(&destination, b"racer-owned")
+                })
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(source).unwrap(), b"source-owned");
+            assert_eq!(fs::read(destination).unwrap(), b"racer-owned");
+        }
+
+        #[test]
+        fn rename_rejects_source_and_destination_child_reparse_points() {
+            let workspace = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let external_source = outside.path().join("external-source.md");
+            let external_destination = outside.path().join("external-destination.md");
+            let source_link = parent.join("source-link.md");
+            let destination_link = parent.join("destination-link.md");
+            fs::write(&external_source, b"external-source-owned").unwrap();
+            fs::write(&external_destination, b"external-destination-owned").unwrap();
+            symlink_file(&external_source, &source_link).unwrap();
+            symlink_file(&external_destination, &destination_link).unwrap();
+
+            let source_error = SystemFileSystemPort
+                .rename(&source_link, &parent.join("renamed.md"))
+                .unwrap_err();
+            assert_eq!(source_error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                fs::read(&external_source).unwrap(),
+                b"external-source-owned"
+            );
+
+            let regular_source = parent.join("regular-source.md");
+            fs::write(&regular_source, b"regular-source-owned").unwrap();
+            let destination_error = SystemFileSystemPort
+                .rename(&regular_source, &destination_link)
+                .unwrap_err();
+            assert_eq!(destination_error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(regular_source).unwrap(), b"regular-source-owned");
+            assert_eq!(
+                fs::read(external_destination).unwrap(),
+                b"external-destination-owned"
+            );
+        }
+
+        #[test]
+        fn write_rejects_child_reparse_point_without_touching_external_target() {
+            let workspace = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            let parent = workspace.path().canonicalize().unwrap();
+            let external = outside.path().join("external.md");
+            let child = parent.join("child.md");
+            fs::write(&external, b"external-owned").unwrap();
+            symlink_file(&external, &child).unwrap();
+
+            let error = SystemFileSystemPort
+                .write(&child, b"attacker-write")
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(external).unwrap(), b"external-owned");
+        }
+
+        #[test]
+        fn write_rejects_junction_parent_without_touching_external_target() {
+            let workspace = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            let junction = workspace.path().join("linked");
+            let external = outside.path().join("external.md");
+            fs::write(&external, b"external-owned").unwrap();
+            create_junction(&junction, outside.path());
+
+            let error = SystemFileSystemPort
+                .write(&junction.join("external.md"), b"attacker-write")
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(fs::read(external).unwrap(), b"external-owned");
+        }
+
+        #[test]
+        fn rename_rejects_source_and_destination_junction_parents() {
+            let workspace = tempdir().unwrap();
+            let source_outside = tempdir().unwrap();
+            let destination_outside = tempdir().unwrap();
+            let source_junction = workspace.path().join("source-linked");
+            let destination_junction = workspace.path().join("destination-linked");
+            create_junction(&source_junction, source_outside.path());
+            create_junction(&destination_junction, destination_outside.path());
+            fs::write(source_outside.path().join("source.md"), b"source-owned").unwrap();
+
+            let source_parent_error = SystemFileSystemPort
+                .rename(
+                    &source_junction.join("source.md"),
+                    &workspace.path().join("target.md"),
+                )
+                .unwrap_err();
+            assert_eq!(source_parent_error.kind(), io::ErrorKind::PermissionDenied);
+
+            let regular_source = workspace.path().join("regular.md");
+            fs::write(&regular_source, b"regular-owned").unwrap();
+            let destination_parent_error = SystemFileSystemPort
+                .rename(&regular_source, &destination_junction.join("target.md"))
+                .unwrap_err();
+            assert_eq!(
+                destination_parent_error.kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(fs::read(regular_source).unwrap(), b"regular-owned");
+            assert!(!destination_outside.path().join("target.md").exists());
+        }
     }
 
     #[cfg(unix)]

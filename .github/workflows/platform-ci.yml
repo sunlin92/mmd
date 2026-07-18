@@ -1,0 +1,110 @@
+name: Platform CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend quality
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run check:release-version
+      - run: npm run test:release-tools
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --exit-code
+
+  native:
+    name: Native ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            arch_command: test "$(uname -m)" = arm64
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - name: macOS x64
+            os: macos-15-intel
+            arch_command: test "$(uname -m)" = x86_64
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - name: Windows x64
+            os: windows-latest
+            arch_command: if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') { throw 'Expected x64' }
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - name: Linux x64
+            os: ubuntu-22.04
+            arch_command: test "$(uname -m)" = x86_64
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Assert runner architecture
+        run: ${{ matrix.arch_command }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+      - run: npm ci
+      - run: npm run check:release-version
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Native filesystem watcher
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
+        env:
+          MMD_RUN_NATIVE_WATCH_TESTS: '1'
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Build macOS package
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: npm run tauri -- build --debug --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
+      - name: Build non-macOS package
+        if: runner.os != 'macOS'
+        run: npm run tauri -- build --debug --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
+
+  platform-ci:
+    name: Platform CI complete
+    if: always()
+    needs: [frontend, native]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require every platform
+        env:
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
+        run: test "$FRONTEND_RESULT" = success && test "$NATIVE_RESULT" = success

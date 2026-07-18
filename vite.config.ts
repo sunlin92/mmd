@@ -15,7 +15,13 @@ export default defineConfig({
     watch: { ignored: ['**/src-tauri/**'] },
   },
   test: {
-    exclude: [...configDefaults.exclude, '.omx/**'],
+    maxWorkers: 2,
+    exclude: [
+      ...configDefaults.exclude,
+      '.omx/**',
+      'scripts/check-release-version.test.mjs',
+      'scripts/ci/artifact-manifest.test.mjs',
+    ],
     server: {
       deps: {
         inline: ['@excalidraw/excalidraw', 'open-color'],
