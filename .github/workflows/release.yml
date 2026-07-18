@@ -4,11 +4,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      rehearsal:
-        description: Build and smoke-test without publishing
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -91,6 +86,7 @@ jobs:
           name: release-macos-arm64
           path: staging/*
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   build-macos-x64:
@@ -142,6 +138,7 @@ jobs:
           name: release-macos-x64
           path: staging/*
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   build-windows-x64:
@@ -195,6 +192,7 @@ jobs:
           name: release-windows-x64
           path: staging/*
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   build-linux-x64:
@@ -250,6 +248,7 @@ jobs:
           name: release-linux-x64
           path: staging/*
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   smoke-macos-arm64:
@@ -461,7 +460,7 @@ jobs:
 
   publish-latest:
     name: Publish verified Latest
-    if: github.event_name == 'push' || (github.ref == 'refs/heads/main' && inputs.rehearsal == false)
+    if: github.event_name == 'push'
     concurrency:
       group: rolling-latest-publisher
       cancel-in-progress: false
@@ -528,6 +527,12 @@ jobs:
           tag="mmd-latest-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SOURCE_SHA:0:12}"
           committed=false
           rollback_required=false
+          previous_latest_tag=
+          previous_latest_sha=
+          previous_latest_release_id=
+          previous_release_removed=false
+          previous_tag_removal_started=false
+          previous_release_removal_started=false
 
           retry() {
             local attempt
@@ -548,6 +553,16 @@ jobs:
               jq --arg tag "$tag" '[.[][] | select(.ref == ("refs/tags/" + $tag))] | length'
           }
 
+          managed_release_count() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp |
+              jq '[.[][] | select(.tag_name | startswith("mmd-latest-"))] | length'
+          }
+
+          managed_tag_count() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/mmd-latest-" --slurp |
+              jq '[.[][]] | length'
+          }
+
           public_release_count() {
             gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp |
               jq '[.[][] | select(.draft == false and .prerelease == false)] | length'
@@ -561,6 +576,55 @@ jobs:
             [[ "$(candidate_tag_count)" == 0 ]]
           }
 
+          candidate_is_only_managed_release() {
+            [[ "$(candidate_release_count)" == 1 && "$(managed_release_count)" == 1 ]]
+          }
+
+          candidate_is_only_managed_tag() {
+            [[ "$(candidate_tag_count)" == 1 && "$(managed_tag_count)" == 1 ]]
+          }
+
+          release_absent() {
+            local release_tag=$1
+            [[ "$(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp |
+                jq --arg tag "$release_tag" '[.[][] | select(.tag_name == $tag)] | length'
+            )" == 0 ]]
+          }
+
+          tag_absent() {
+            local release_tag=$1
+            [[ "$(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/mmd-latest-" --slurp |
+                jq --arg tag "$release_tag" '[.[][] | select(.ref == ("refs/tags/" + $tag))] | length'
+            )" == 0 ]]
+          }
+
+          delete_release_or_confirm_absent() {
+            local release_id=$1 release_tag=$2
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id" >/dev/null 2>&1 ||
+              release_absent "$release_tag"
+            release_absent "$release_tag"
+          }
+
+          delete_tag_or_confirm_absent() {
+            local release_tag=$1
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$release_tag" >/dev/null 2>&1 ||
+              tag_absent "$release_tag"
+            tag_absent "$release_tag"
+          }
+
+          delete_candidate_release_or_confirm_absent() {
+            gh release delete "$tag" --yes >/dev/null 2>&1 || candidate_release_absent
+            candidate_release_absent
+          }
+
+          delete_candidate_tag_or_confirm_absent() {
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" >/dev/null 2>&1 ||
+              candidate_tag_absent
+            candidate_tag_absent
+          }
+
           previous_is_latest() {
             [[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" == "$previous_latest_tag" ]]
           }
@@ -569,21 +633,66 @@ jobs:
             [[ "$(public_release_count)" == 0 ]]
           }
 
+          candidate_is_promoted() {
+            local candidate_draft latest_tag main_head
+            candidate_draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .draft) || return 1
+            latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name) || return 1
+            main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha) || return 1
+            [[ "$candidate_draft" == false && "$latest_tag" == "$tag" && "$main_head" == "$SOURCE_SHA" ]]
+          }
+
+          newer_same_sha_generation_exists() {
+            local release_tag ref_sha run_id run_attempt sha_prefix tag_records
+            tag_records=$(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/mmd-latest-" \
+                --jq '.[] | [(.ref | sub("refs/tags/"; "")), .object.sha] | @tsv'
+            ) || return 1
+            while IFS=$'\t' read -r release_tag ref_sha; do
+              [[ "$release_tag" =~ ^mmd-latest-([0-9]+)-([0-9]+)-([0-9a-f]{12})$ ]] || continue
+              run_id=${BASH_REMATCH[1]}
+              run_attempt=${BASH_REMATCH[2]}
+              sha_prefix=${BASH_REMATCH[3]}
+              [[ "$sha_prefix" == "${SOURCE_SHA:0:12}" ]] || continue
+              [[ "$ref_sha" == "$SOURCE_SHA" ]] || continue
+              if (( 10#$run_id > 10#$GITHUB_RUN_ID )) ||
+                (( 10#$run_id == 10#$GITHUB_RUN_ID && 10#$run_attempt > 10#$GITHUB_RUN_ATTEMPT )); then
+                echo "$release_tag"
+                return 0
+              fi
+            done <<<"$tag_records"
+          }
+
+          require_no_newer_same_sha_generation() {
+            local newer_tag
+            newer_tag=$(newer_same_sha_generation_exists)
+            if [[ -n "$newer_tag" ]]; then
+              echo "A newer workflow generation already exists for $SOURCE_SHA: $newer_tag" >&2
+              return 1
+            fi
+          }
+
           rollback_candidate() {
             local status=$?
             trap - EXIT
             if [[ "$rollback_required" == true && "$committed" == false ]]; then
               set +e
-              local rollback_ok=true
-              retry gh release delete "$tag" --yes >/dev/null 2>&1 || true
-              retry candidate_release_absent || rollback_ok=false
-              retry gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" >/dev/null 2>&1 || true
-              retry candidate_tag_absent || rollback_ok=false
-              if [[ -n "$previous_latest_tag" ]]; then
+              local newer_tag rollback_ok=true
+              retry delete_candidate_release_or_confirm_absent || rollback_ok=false
+              retry delete_candidate_tag_or_confirm_absent || rollback_ok=false
+              if [[ "$previous_tag_removal_started" == true && "$previous_release_removal_started" == false ]]; then
+                retry gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$previous_latest_tag" -f sha="$previous_latest_sha" >/dev/null 2>&1 || true
+                test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$previous_latest_tag" --jq .object.sha 2>/dev/null)" = "$previous_latest_sha" || rollback_ok=false
+              fi
+              newer_tag=$(newer_same_sha_generation_exists) || rollback_ok=false
+              if [[ -n "$newer_tag" ]]; then
+                echo "::notice::Rollback will not mark an older release Latest because newer generation $newer_tag exists."
+              elif [[ -n "$previous_latest_tag" && "$previous_release_removed" == false ]]; then
                 retry gh release edit "$previous_latest_tag" --latest >/dev/null 2>&1 || true
                 retry previous_is_latest || rollback_ok=false
-              else
+              elif [[ -z "$previous_latest_tag" ]]; then
                 retry no_public_latest || rollback_ok=false
+              else
+                rollback_ok=false
               fi
               if [[ "$rollback_ok" != true ]]; then
                 echo '::error::Candidate rollback could not be verified; inspect Releases before retrying.'
@@ -595,7 +704,8 @@ jobs:
           trap rollback_candidate EXIT
 
           if previous_latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null); then
-            :
+            previous_latest_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$previous_latest_tag" --jq .object.sha 2>/dev/null || true)
+            previous_latest_release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$previous_latest_tag" --jq .id)
           else
             previous_latest_tag=
             [[ "$(public_release_count)" == 0 ]]
@@ -604,6 +714,12 @@ jobs:
           main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
           if [[ "$main_head" != "$SOURCE_SHA" ]]; then
             echo "::notice::Skipping obsolete candidate $SOURCE_SHA; main is now $main_head."
+            exit 0
+          fi
+
+          newer_tag=$(newer_same_sha_generation_exists)
+          if [[ -n "$newer_tag" ]]; then
+            echo "::notice::Skipping generation ${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}; newer generation $newer_tag already exists for this commit."
             exit 0
           fi
 
@@ -623,49 +739,50 @@ jobs:
           cmp release-assets/SHA256SUMS.txt downloaded-release/SHA256SUMS.txt
           (cd downloaded-release && sha256sum --check SHA256SUMS.txt)
 
+          # Remove stale managed history while retaining the previous Latest as
+          # the rollback anchor until the candidate has been promoted.
+          require_no_newer_same_sha_generation
+          managed_releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name | startswith("mmd-latest-")) | [.id, .tag_name] | @tsv')
+          while IFS=$'\t' read -r id old_tag; do
+            [[ -z "$id" || "$old_tag" == "$tag" || "$old_tag" == "$previous_latest_tag" ]] && continue
+            retry delete_release_or_confirm_absent "$id" "$old_tag"
+          done <<<"$managed_releases"
+
+          managed_tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/mmd-latest-" --jq '.[].ref | sub("refs/tags/"; "")')
+          while read -r old_tag; do
+            [[ -z "$old_tag" || "$old_tag" == "$tag" || "$old_tag" == "$previous_latest_tag" ]] && continue
+            retry delete_tag_or_confirm_absent "$old_tag"
+          done <<<"$managed_tags"
+
           main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
           if [[ "$main_head" != "$SOURCE_SHA" ]]; then
             echo "Candidate became obsolete before publication: main is now $main_head." >&2
             exit 1
           fi
-          gh release edit "$tag" --draft=false --latest || true
-          candidate_draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .draft)
-          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
-          main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-          if [[ "$candidate_draft" != false || "$latest_tag" != "$tag" || "$main_head" != "$SOURCE_SHA" ]]; then
-            echo 'Latest publication did not reach a confirmed remote state.' >&2
-            exit 1
+
+          require_no_newer_same_sha_generation
+          retry gh release edit "$tag" --draft=false --latest >/dev/null
+          retry candidate_is_promoted
+          require_no_newer_same_sha_generation
+
+          if [[ "$previous_latest_tag" == mmd-latest-* && "$previous_latest_tag" != "$tag" ]]; then
+            test -n "$previous_latest_sha"
+            previous_tag_removal_started=true
+            retry delete_tag_or_confirm_absent "$previous_latest_tag"
+
+            # Deleting a Release is irreversible. From here onward the verified
+            # candidate remains published even if the final inventory read fails.
+            committed=true
+            rollback_required=false
+            previous_release_removal_started=true
+            retry delete_release_or_confirm_absent "$previous_latest_release_id" "$previous_latest_tag"
+            previous_release_removed=true
           fi
+
+          retry candidate_is_only_managed_release
+          retry candidate_is_only_managed_tag
+          require_no_newer_same_sha_generation
+          retry candidate_is_promoted
+
           committed=true
           rollback_required=false
-
-          cleanup_failed=false
-          release_inventory_ok=true
-          managed_releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name | startswith("mmd-latest-")) | [.id, .tag_name] | @tsv') || {
-            release_inventory_ok=false
-            cleanup_failed=true
-            managed_releases=
-          }
-          declare -A retained_tags=()
-          while IFS=$'\t' read -r id old_tag; do
-            [[ -z "$id" || "$old_tag" == "$tag" ]] && continue
-            if ! retry gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" >/dev/null; then
-              retained_tags["$old_tag"]=1
-              cleanup_failed=true
-            fi
-          done <<<"$managed_releases"
-
-          if [[ "$release_inventory_ok" == true ]]; then
-            managed_tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/mmd-latest-" --jq '.[].ref | sub("refs/tags/"; "")') || {
-              cleanup_failed=true
-              managed_tags=
-            }
-            while read -r old_tag; do
-              [[ -z "$old_tag" || "$old_tag" == "$tag" || -n "${retained_tags[$old_tag]:-}" ]] && continue
-              retry gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$old_tag" >/dev/null || cleanup_failed=true
-            done <<<"$managed_tags"
-          fi
-
-          if [[ "$cleanup_failed" == true ]]; then
-            echo '::warning::Latest was published, but some older managed history could not be removed; the next run will retry.'
-          fi

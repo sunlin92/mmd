@@ -66,11 +66,15 @@ function noticeSourcePath(projectRoot, nodeModulesRoot, spec) {
     : path.join(nodeModulesRoot, spec.packageName, spec.sourceName);
 }
 
+export function joinPortableNoticePath(prefix, name) {
+  return path.posix.join(prefix, name);
+}
+
 async function collectRelativeFiles(directory, prefix = '') {
   const entries = await readdir(directory, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    const relativePath = path.join(prefix, entry.name);
+    const relativePath = joinPortableNoticePath(prefix, entry.name);
     const absolutePath = path.join(directory, entry.name);
     if (entry.isDirectory()) {
       files.push(...await collectRelativeFiles(absolutePath, relativePath));

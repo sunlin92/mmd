@@ -1,6 +1,6 @@
 # Releasing MMD
 
-MMD uses a rolling public GitHub Release named **Latest**. Every push to `main` starts its own native builds and smoke tests. Only the final publishing jobs are serialized, so a newer push cannot interrupt a release mutation that has already started. A manual workflow dispatch defaults to rehearsal mode and does not create or modify a Release; manual publishing is restricted to the `main` ref.
+MMD uses a rolling public GitHub Release named **Latest**. Every push to `main` starts its own native builds and smoke tests. Only the final publishing jobs are serialized, so a newer push cannot interrupt a release mutation that has already started. Manual workflow dispatches are rehearsal-only and never create or modify a Release.
 
 ## Version and toolchains
 
@@ -25,11 +25,15 @@ Build jobs upload immutable workflow artifacts with an artifact ID, GitHub diges
 - `MMD_<version>_amd64.deb`
 - `SHA256SUMS.txt`
 
-The publishing job first confirms that its source SHA is still the head of `main`, then creates a unique candidate tag containing the workflow run ID, attempt, and source SHA. It uploads a draft candidate, verifies the remote asset names, sizes, and downloaded SHA-256 values, and only then makes it public and marks it Latest. Any failure before that confirmed commit point triggers a retried, verified candidate rollback and restores the prior Latest marker. After commit, cleanup of older workflow-managed Releases and tags in the `mmd-latest-*` namespace is retried but non-gating; a warning leaves the verified Latest published and the next run retries cleanup.
+The publishing job first confirms that its source SHA is still the head of `main` and that no newer workflow generation for the same commit has started publishing. It then creates a unique candidate tag containing the workflow run ID, attempt, and source SHA. The job uploads a draft candidate, verifies the remote asset names, sizes, and downloaded SHA-256 values, and only then makes it public and marks it Latest. Any failure before that confirmed commit point triggers a retried, verified candidate rollback and restores the prior Latest marker.
+
+Older workflow-managed Releases and tags in the `mmd-latest-*` namespace are deleted with idempotent retries. A successful run verifies that exactly one managed Release and one managed tag remain, both for the new candidate. Once deletion of the previous Release begins, the verified candidate is retained even if a final API read fails, avoiding a state with no downloadable Latest.
 
 ## Rehearsal and diagnosis
 
-Run **Rolling Latest Release** manually with `rehearsal` enabled to exercise source checks, all native builds, artifact identity checks, fresh install/start smoke jobs, and final asset assembly without running the write-scoped publishing job. Workflow artifacts are retained for seven days for diagnosis.
+Run **Rolling Latest Release** manually to exercise source checks, all native builds, artifact identity checks, fresh install/start smoke jobs, and final asset assembly without running the write-scoped publishing job. Workflow artifacts are retained for seven days for diagnosis.
+
+Branch pushes and pull requests run the same release-profile package builds through **Platform CI**. Its separate native smoke runners mount the DMGs, install and start the NSIS package, and install and start both Linux packages before a change reaches `main`.
 
 The following evidence can only be obtained on GitHub-hosted native runners: DMG mounting and executable slice inspection, Windows NSIS install/uninstall behavior, WebView startup, and real FUSE AppImage mounting. A local YAML or build check cannot replace those jobs.
 

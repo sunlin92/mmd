@@ -41,21 +41,28 @@ jobs:
             arch_command: test "$(uname -m)" = arm64
             target: aarch64-apple-darwin
             bundles: dmg
+            artifact: platform-ci-macos-arm64
+            asset: MMD_ci_aarch64.dmg
           - name: macOS x64
             os: macos-15-intel
             arch_command: test "$(uname -m)" = x86_64
             target: x86_64-apple-darwin
             bundles: dmg
+            artifact: platform-ci-macos-x64
+            asset: MMD_ci_x64.dmg
           - name: Windows x64
             os: windows-latest
             arch_command: if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') { throw 'Expected x64' }
             target: x86_64-pc-windows-msvc
             bundles: nsis
+            artifact: platform-ci-windows-x64
+            asset: MMD_ci_x64-setup.exe
           - name: Linux x64
             os: ubuntu-22.04
             arch_command: test "$(uname -m)" = x86_64
             target: x86_64-unknown-linux-gnu
             bundles: appimage,deb
+            artifact: platform-ci-linux-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -82,29 +89,126 @@ jobs:
           key: ${{ matrix.target }}
       - run: npm ci
       - run: npm run check:release-version
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release
       - name: Native filesystem watcher
-        run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release
       - name: Build macOS package
         if: runner.os == 'macOS'
         env:
           APPLE_SIGNING_IDENTITY: '-'
-        run: npm run tauri -- build --debug --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
       - name: Build non-macOS package
         if: runner.os != 'macOS'
-        run: npm run tauri -- build --debug --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
+      - name: Stage macOS artifact
+        if: runner.os == 'macOS'
+        env:
+          ASSET: ${{ matrix.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir staging
+          mapfile=($(find "src-tauri/target/$TARGET/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg'))
+          test "${#mapfile[@]}" -eq 1
+          cp "${mapfile[0]}" "staging/$ASSET"
+          node scripts/ci/artifact-manifest.mjs create staging "$ASSET"
+      - name: Stage Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ASSET: ${{ matrix.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          New-Item -ItemType Directory staging | Out-Null
+          $files = @(Get-ChildItem "src-tauri/target/$env:TARGET/release/bundle/nsis" -Filter '*-setup.exe' -File)
+          if ($files.Count -ne 1) { throw "Expected one NSIS installer, found $($files.Count)" }
+          Copy-Item $files[0].FullName "staging/$env:ASSET"
+          node scripts/ci/artifact-manifest.mjs create staging $env:ASSET
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest creation failed' }
+      - name: Stage Linux artifacts
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir staging
+          appimages=($(find "src-tauri/target/$TARGET/release/bundle/appimage" -maxdepth 1 -type f -name '*.AppImage'))
+          debs=($(find "src-tauri/target/$TARGET/release/bundle/deb" -maxdepth 1 -type f -name '*.deb'))
+          test "${#appimages[@]}" -eq 1
+          test "${#debs[@]}" -eq 1
+          cp "${appimages[0]}" staging/MMD_ci_amd64.AppImage
+          cp "${debs[0]}" staging/MMD_ci_amd64.deb
+          node scripts/ci/artifact-manifest.mjs create staging MMD_ci_amd64.AppImage MMD_ci_amd64.deb
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 3
+
+  smoke:
+    name: Smoke ${{ matrix.name }}
+    needs: native
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            artifact: platform-ci-macos-arm64
+            expected_arch: arm64
+          - name: macOS x64
+            os: macos-15-intel
+            artifact: platform-ci-macos-x64
+            expected_arch: x86_64
+          - name: Windows x64
+            os: windows-latest
+            artifact: platform-ci-windows-x64
+          - name: Linux x64
+            os: ubuntu-22.04
+            artifact: platform-ci-linux-x64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Linux smoke dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse libfuse2 xvfb
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifact
+      - name: Install and start macOS package
+        if: runner.os == 'macOS'
+        run: scripts/ci/smoke-macos.sh artifact ${{ matrix.expected_arch }}
+      - name: Install, start, and uninstall Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/smoke-windows.ps1 -ArtifactDirectory artifact
+      - name: Install and start Linux packages
+        if: runner.os == 'Linux'
+        run: scripts/ci/smoke-linux.sh artifact
 
   platform-ci:
     name: Platform CI complete
     if: always()
-    needs: [frontend, native]
+    needs: [frontend, native, smoke]
     runs-on: ubuntu-22.04
     steps:
       - name: Require every platform
         env:
           FRONTEND_RESULT: ${{ needs.frontend.result }}
           NATIVE_RESULT: ${{ needs.native.result }}
-        run: test "$FRONTEND_RESULT" = success && test "$NATIVE_RESULT" = success
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+        run: test "$FRONTEND_RESULT" = success && test "$NATIVE_RESULT" = success && test "$SMOKE_RESULT" = success

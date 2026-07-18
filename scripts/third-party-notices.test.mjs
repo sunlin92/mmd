@@ -11,6 +11,7 @@ import {
   MERMAID_VERSION,
   NOTICE_SPECS,
   collectSynchronizedThirdPartyNotices,
+  joinPortableNoticePath,
   syncThirdPartyNotices,
 } from './sync-third-party-notices.mjs';
 
@@ -54,6 +55,11 @@ afterEach(async () => {
 });
 
 describe('third-party notice synchronization', () => {
+  it('keeps logical notice paths portable across operating systems', () => {
+    expect(path.win32.join('dompurify', 'LICENSE')).toBe('dompurify\\LICENSE');
+    expect(joinPortableNoticePath('dompurify', 'LICENSE')).toBe('dompurify/LICENSE');
+  });
+
   it('keeps the checked-in notices byte-identical to exact pinned packages', async () => {
     const packageManifest = JSON.parse(await readFile(
       path.join(projectRoot, 'package.json'),

@@ -2585,14 +2585,23 @@ mod tests {
         assert!(!store.store_path().exists());
         lock.unlock().unwrap();
 
+        let waiting_store = store_with(
+            directory.path().to_path_buf(),
+            Arc::new(SystemRecentStoreAtomicReplacer),
+            Duration::from_millis(5),
+            Duration::from_secs(2),
+        );
         let lock = Arc::new(lock);
         lock.lock_exclusive().unwrap();
         let releasing_lock = Arc::clone(&lock);
+        let (release_started_tx, release_started_rx) = mpsc::channel();
         let release = thread::spawn(move || {
+            release_started_tx.send(()).unwrap();
             thread::sleep(Duration::from_millis(30));
             releasing_lock.unlock().unwrap();
         });
-        let snapshot = store.list().unwrap();
+        release_started_rx.recv().unwrap();
+        let snapshot = waiting_store.list().unwrap();
         release.join().unwrap();
         assert!(snapshot.entries.is_empty());
     }
