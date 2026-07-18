@@ -5,6 +5,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import type { DocxPreviewFeedback } from './components/DocxPreview';
+import { APP_FEEDBACK_ERROR_EVENT } from './lib/appFeedback';
 
 const appMocks = vi.hoisted(() => ({
   editorPane: vi.fn<(props: Record<string, unknown>) => null>(() => null),
@@ -15,6 +16,11 @@ const appMocks = vi.hoisted(() => ({
   pdfPreview: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   workspaceImagePreview: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   workspaceMediaPreview: vi.fn<(props: Record<string, unknown>) => null>(() => null),
+  previewModuleLoads: {
+    docx: 0,
+    excalidraw: 0,
+    pdf: 0,
+  },
   setNativeSaveMenuEnabled: vi.fn<(enabled: boolean) => Promise<void>>(),
   session: null as unknown as Record<string, unknown>,
   useDocumentSession: vi.fn<(input: Record<string, unknown>) => Record<string, unknown>>(),
@@ -54,11 +60,20 @@ vi.mock('./hooks/useProgramCloseGuard', () => ({
   }),
 }));
 vi.mock('./components/EditorPane', () => ({ EditorPane: appMocks.editorPane }));
-vi.mock('./components/DocxPreview', () => ({ DocxPreview: appMocks.docxPreview }));
-vi.mock('./components/ExcalidrawPane', () => ({ ExcalidrawPane: appMocks.excalidrawPane }));
+vi.mock('./components/DocxPreview', () => {
+  appMocks.previewModuleLoads.docx += 1;
+  return { DocxPreview: appMocks.docxPreview };
+});
+vi.mock('./components/ExcalidrawPane', () => {
+  appMocks.previewModuleLoads.excalidraw += 1;
+  return { ExcalidrawPane: appMocks.excalidrawPane };
+});
 vi.mock('./components/PaneResizer', () => ({ PaneResizer: appMocks.paneResizer }));
 vi.mock('./components/JinxiuMarkdown', () => ({ default: appMocks.jinxiuMarkdown }));
-vi.mock('./components/PdfPreview', () => ({ PdfPreview: appMocks.pdfPreview }));
+vi.mock('./components/PdfPreview', () => {
+  appMocks.previewModuleLoads.pdf += 1;
+  return { PdfPreview: appMocks.pdfPreview };
+});
 vi.mock('./components/WorkspaceImagePreview', () => ({
   WorkspaceImagePreview: (props: Record<string, unknown>) => appMocks.workspaceImagePreview(props),
 }));
@@ -241,6 +256,32 @@ describe('App binary document composition', () => {
     act(() => root.unmount());
     container.remove();
     window.history.replaceState({}, '', '/');
+  });
+
+  it('loads heavy preview modules only when their file type becomes active', async () => {
+    const session = createTextSession('markdown');
+    appMocks.useDocumentSession.mockReturnValue(session);
+
+    await act(async () => root.render(<App />));
+    expect(appMocks.previewModuleLoads).toEqual({ docx: 0, excalidraw: 0, pdf: 0 });
+
+    Object.assign(session, createBinarySession('pdf', 'committed'));
+    appMocks.useDocumentSession.mockReturnValue(session);
+    await act(async () => root.render(<App />));
+    expect(appMocks.previewModuleLoads).toEqual({ docx: 0, excalidraw: 0, pdf: 1 });
+    expect(appMocks.pdfPreview).toHaveBeenCalledOnce();
+
+    Object.assign(session, createBinarySession('docx', 'committed'));
+    appMocks.useDocumentSession.mockReturnValue(session);
+    await act(async () => root.render(<App />));
+    expect(appMocks.previewModuleLoads).toEqual({ docx: 1, excalidraw: 0, pdf: 1 });
+    expect(appMocks.docxPreview).toHaveBeenCalledOnce();
+
+    Object.assign(session, createExcalidrawSession());
+    appMocks.useDocumentSession.mockReturnValue(session);
+    await act(async () => root.render(<App />));
+    expect(appMocks.previewModuleLoads).toEqual({ docx: 1, excalidraw: 1, pdf: 1 });
+    expect(appMocks.excalidrawPane).toHaveBeenCalledOnce();
   });
 
   it.each(COMPOSITION_CASES)(
@@ -510,6 +551,21 @@ describe('App binary document composition', () => {
     act(() => firstFeedback({ kind: 'notice', message: 'PDF degraded' }));
     expect(session.setNotice).toHaveBeenLastCalledWith('PDF degraded');
     expect(session.setError).toHaveBeenLastCalledWith(null);
+  });
+
+  it('routes lazy preview module failures into the shared modal feedback owner', async () => {
+    const session = createBinarySession('pdf', 'committed');
+    appMocks.useDocumentSession.mockReturnValue(session);
+
+    await act(async () => root.render(<App />));
+    act(() => window.dispatchEvent(new CustomEvent(APP_FEEDBACK_ERROR_EVENT, {
+      detail: 'The operation could not be completed. Please try again.',
+    })));
+
+    expect(session.setError).toHaveBeenLastCalledWith(
+      'The operation could not be completed. Please try again.',
+    );
+    expect(session.setNotice).toHaveBeenLastCalledWith(null);
   });
 
   it('routes inline rename and the move sheet through the workspace session', async () => {

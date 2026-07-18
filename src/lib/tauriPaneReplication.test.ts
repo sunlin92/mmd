@@ -115,7 +115,154 @@ const binarySnapshot: PaneSnapshotEnvelope = {
   },
 };
 
+function installAnimationFrameHarness() {
+  const callbacks = new Map<number, FrameRequestCallback>();
+  let nextHandle = 0;
+  const cancel = vi.fn<(handle: number) => void>((handle) => {
+    callbacks.delete(handle);
+  });
+  vi.stubGlobal('requestAnimationFrame', vi.fn<(callback: FrameRequestCallback) => number>((callback) => {
+    const handle = ++nextHandle;
+    callbacks.set(handle, callback);
+    return handle;
+  }));
+  vi.stubGlobal('cancelAnimationFrame', cancel);
+  return { callbacks, cancel };
+}
+
+function createMainReplication(eventApi: PaneEventApi, storage: PaneStorage) {
+  return createTauriPaneReplication({
+    role: 'main',
+    observe: () => undefined,
+    onError: () => undefined,
+  }, {
+    eventApi,
+    storage,
+    createId: () => 'authority-main',
+  });
+}
+
 describe('Tauri pane replication runtime', () => {
+  it('publishes_the_latest_main_window_snapshot_on_the_next_animation_frame', () => {
+    vi.useFakeTimers();
+    const frame = installAnimationFrameHarness();
+    try {
+      const eventApi = new FakePaneEventApi();
+      const storage = new MemoryPaneStorage();
+      const replication = createMainReplication(eventApi, storage);
+      const state = (nextContent: string): PaneSnapshotEnvelope['state'] => ({
+        ...snapshot.state,
+        content: nextContent,
+      });
+
+      replication.publishAuthoritativeState(state('# First'));
+      replication.publishAuthoritativeState(state('# Second'));
+      replication.publishAuthoritativeState(state('# Final'));
+
+      expect(storage.values.has(PANE_STATE_EVENT)).toBe(false);
+      expect(eventApi.emitted).toEqual([]);
+
+      frame.callbacks.get(1)?.(16);
+
+      const serialized = storage.values.get(PANE_STATE_EVENT);
+      expect(serialized).toBeDefined();
+      expect(JSON.parse(serialized!)).toMatchObject({
+        revision: 3,
+        state: { content: '# Final' },
+      });
+      expect(eventApi.emitted).toHaveLength(1);
+      expect(eventApi.emitted[0]).toMatchObject({
+        event: PANE_STATE_EVENT,
+        payload: {
+          revision: 3,
+          state: { content: '# Final' },
+        },
+      });
+      expect(frame.cancel).toHaveBeenCalledWith(1);
+      expect(vi.getTimerCount()).toBe(0);
+
+      vi.runAllTimers();
+      expect(eventApi.emitted).toHaveLength(1);
+
+      replication.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls_back_to_a_bounded_timer_when_animation_frames_are_suspended', () => {
+    vi.useFakeTimers();
+    const frame = installAnimationFrameHarness();
+    try {
+      const eventApi = new FakePaneEventApi();
+      const replication = createMainReplication(eventApi, new MemoryPaneStorage());
+
+      replication.publishAuthoritativeState(snapshot.state);
+      expect(eventApi.emitted).toEqual([]);
+
+      vi.advanceTimersByTime(99);
+      expect(eventApi.emitted).toEqual([]);
+      vi.advanceTimersByTime(1);
+
+      expect(eventApi.emitted).toHaveLength(1);
+      expect(frame.cancel).toHaveBeenCalledWith(1);
+      expect(frame.callbacks.has(1)).toBe(false);
+
+      replication.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels_the_timer_and_frame_without_double_publishing_when_either_one_wins', () => {
+    vi.useFakeTimers();
+    const frame = installAnimationFrameHarness();
+    try {
+      const eventApi = new FakePaneEventApi();
+      const replication = createMainReplication(eventApi, new MemoryPaneStorage());
+
+      replication.publishAuthoritativeState(snapshot.state);
+      const firstFrame = frame.callbacks.get(1);
+      firstFrame?.(16);
+      vi.runAllTimers();
+      firstFrame?.(32);
+      expect(eventApi.emitted).toHaveLength(1);
+
+      replication.publishAuthoritativeState({ ...snapshot.state, content: '# Timer wins' });
+      const secondFrame = frame.callbacks.get(2);
+      vi.runAllTimers();
+      secondFrame?.(48);
+      expect(eventApi.emitted).toHaveLength(2);
+
+      replication.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does_not_publish_a_scheduled_snapshot_after_disposal', () => {
+    vi.useFakeTimers();
+    const frame = installAnimationFrameHarness();
+    try {
+      const eventApi = new FakePaneEventApi();
+      const replication = createMainReplication(eventApi, new MemoryPaneStorage());
+
+      replication.publishAuthoritativeState(snapshot.state);
+      const frameCallback = frame.callbacks.get(1);
+      replication.dispose();
+      frameCallback?.(16);
+      vi.runAllTimers();
+
+      expect(eventApi.emitted).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
   it('maps_the_three_protocol_envelopes_to_their_existing_tauri_events', async () => {
     const eventApi = new FakePaneEventApi();
     const runtime = createTauriPaneRuntime({

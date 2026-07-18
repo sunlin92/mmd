@@ -1,15 +1,24 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  lazy,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentProps,
+} from 'react';
 import { emit, listen } from '@tauri-apps/api/event';
 import { AppToolbar } from './components/AppToolbar';
-import { DocxPreview, type DocxPreviewFeedback } from './components/DocxPreview';
+import type { DocxPreviewFeedback } from './components/DocxPreview';
 import { EditorPane } from './components/EditorPane';
-import { ExcalidrawPane } from './components/ExcalidrawPane';
 import { ExternalFileChangeDialog } from './components/ExternalFileChangeDialog';
 import { FeedbackDialog } from './components/FeedbackDialog';
 import { FileSidebar } from './components/FileSidebar';
 import JinxiuMarkdown from './components/JinxiuMarkdown';
+import { LazyPreviewBoundary } from './components/LazyPreviewBoundary';
 import { PaneResizer } from './components/PaneResizer';
-import { PdfPreview, type PdfPreviewFeedback } from './components/PdfPreview';
+import type { PdfPreviewFeedback } from './components/PdfPreview';
 import { PopoutPaneShell } from './components/PopoutPaneShell';
 import { PreviewPane } from './components/PreviewPane';
 import { UnsavedExitDialog } from './components/UnsavedExitDialog';
@@ -24,6 +33,7 @@ import { usePanePopouts } from './hooks/usePanePopouts';
 import { usePaneResize } from './hooks/usePaneResize';
 import { useProgramCloseGuard } from './hooks/useProgramCloseGuard';
 import { useI18n } from './lib/i18n';
+import type { EffectiveLocale } from './lib/locale';
 import { useWorkspaceSidebarResize } from './hooks/useWorkspaceSidebarResize';
 import { APP_FEEDBACK_ERROR_EVENT, getFeedbackDialog, normalizeAppError } from './lib/appFeedback';
 import { getUnsavedExitPrompt, getUnsavedFileSwitchPrompt } from './lib/closeGuard';
@@ -55,12 +65,54 @@ import { getWorkspacePresentation } from './lib/workspaceFileKind';
 import type { WorkspaceFileEntry } from './types';
 import './styles.css';
 
+const LazyDocxPreview = lazy(() => import('./components/DocxPreview').then((module) => ({
+  default: module.DocxPreview,
+})));
+const LazyExcalidrawPane = lazy(() => import('./components/ExcalidrawPane').then((module) => ({
+  default: module.ExcalidrawPane,
+})));
+const LazyPdfPreview = lazy(() => import('./components/PdfPreview').then((module) => ({
+  default: module.PdfPreview,
+})));
+
+interface LazyPreviewWrapperProps {
+  loadingLabel: string;
+  locale: EffectiveLocale;
+}
+
+function DocxPreview({ loadingLabel, locale, ...props }:
+ComponentProps<typeof LazyDocxPreview> & LazyPreviewWrapperProps) {
+  return (
+    <LazyPreviewBoundary loadingLabel={loadingLabel} locale={locale}>
+      <LazyDocxPreview {...props} />
+    </LazyPreviewBoundary>
+  );
+}
+
+function ExcalidrawPane({ loadingLabel, locale, ...props }:
+ComponentProps<typeof LazyExcalidrawPane> & LazyPreviewWrapperProps) {
+  return (
+    <LazyPreviewBoundary loadingLabel={loadingLabel} locale={locale}>
+      <LazyExcalidrawPane {...props} />
+    </LazyPreviewBoundary>
+  );
+}
+
+function PdfPreview({ loadingLabel, locale, ...props }:
+ComponentProps<typeof LazyPdfPreview> & LazyPreviewWrapperProps) {
+  return (
+    <LazyPreviewBoundary loadingLabel={loadingLabel} locale={locale}>
+      <LazyPdfPreview {...props} />
+    </LazyPreviewBoundary>
+  );
+}
+
 function currentPopoutPane() {
   return typeof window === 'undefined' ? 'main' : parsePopoutPane(window.location.search);
 }
 
 export default function App() {
-  const { locale } = useI18n();
+  const { locale, t } = useI18n();
   const popoutPane = useMemo(() => currentPopoutPane(), []);
   const isPopout = popoutPane !== 'main';
   const [showUnsavedExitPrompt, setShowUnsavedExitPrompt] = useState(false);
@@ -200,6 +252,8 @@ export default function App() {
         documentEpoch={documentEpoch}
         documentId={documentId}
         enabled={documentAssetsEnabled}
+        loadingLabel={t('loadingPdf')}
+        locale={locale}
         onFeedback={handleDocumentPreviewFeedback}
       />
     )
@@ -210,6 +264,8 @@ export default function App() {
           documentEpoch={documentEpoch}
           documentId={documentId}
           enabled={documentAssetsEnabled}
+          loadingLabel={t('loadingDocx')}
+          locale={locale}
           onFeedback={handleDocumentPreviewFeedback}
         />
       )
@@ -469,6 +525,8 @@ export default function App() {
               documentEpoch={documentEpoch}
               documentId={documentId}
               editable={authorityStatus === 'committed'}
+              loadingLabel={t('loadingExcalidraw')}
+              locale={locale}
               onContentChange={updateContent}
               onInvalidScene={handleExcalidrawError}
               popout
@@ -497,6 +555,8 @@ export default function App() {
               documentEpoch={documentEpoch}
               documentId={documentId}
               editable={false}
+              loadingLabel={t('loadingExcalidraw')}
+              locale={locale}
               onContentChange={updateContent}
               onInvalidScene={handleExcalidrawError}
               popout
@@ -624,6 +684,8 @@ export default function App() {
             documentEpoch={documentEpoch}
             documentId={documentId}
             editable={authorityStatus === 'committed'}
+            loadingLabel={t('loadingExcalidraw')}
+            locale={locale}
             paneRef={editorPaneRef}
             popoutButton={editorPopoutButton}
             onContentChange={updateContent}

@@ -20,6 +20,29 @@ const PANE_EVENT_NAMES = [
   PANE_CONTENT_CHANGE_EVENT,
   PANE_STATE_REQUEST_EVENT,
 ] as const;
+const PANE_PUBLICATION_FALLBACK_MS = 100;
+
+const batchedPaneScheduler: PaneScheduler = {
+  schedule: (task) => {
+    let completed = false;
+    let frameId: number | null = null;
+    let fallbackTimerId: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const runOnce = () => {
+      if (completed) return;
+      completed = true;
+      if (frameId !== null && typeof globalThis.cancelAnimationFrame === 'function') {
+        globalThis.cancelAnimationFrame(frameId);
+      }
+      if (fallbackTimerId !== null) globalThis.clearTimeout(fallbackTimerId);
+      task();
+    };
+
+    fallbackTimerId = globalThis.setTimeout(runOnce, PANE_PUBLICATION_FALLBACK_MS);
+    if (typeof globalThis.requestAnimationFrame === 'function') {
+      frameId = globalThis.requestAnimationFrame(runOnce);
+    }
+  },
+};
 
 let fallbackIdSequence = 0;
 
@@ -204,7 +227,7 @@ export function createTauriPaneReplication(
       ...common,
       role: 'main',
       authorityId: createId('pane-authority'),
-      scheduler: options.scheduler,
+      scheduler: options.scheduler ?? batchedPaneScheduler,
     });
   }
   if (options.role === 'editor-popout') {
