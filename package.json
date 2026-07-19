@@ -16,7 +16,7 @@
     "lint": "oxlint --deny-warnings --react-plugin --jsx-a11y-plugin --vitest-plugin",
     "check:release-version": "node scripts/check-release-version.mjs",
     "test:release-version": "node --test scripts/check-release-version.test.mjs",
-    "test:release-tools": "node --test scripts/check-release-version.test.mjs scripts/ci/artifact-manifest.test.mjs scripts/ci/smoke-linux.node-test.mjs scripts/ci/smoke-macos.node-test.mjs",
+    "test:release-tools": "node --test scripts/check-release-version.test.mjs scripts/release-workflow.node-test.mjs scripts/ci/artifact-manifest.test.mjs scripts/ci/smoke-linux.node-test.mjs scripts/ci/smoke-macos.node-test.mjs",
     "sync:pdf-assets": "node scripts/sync-pdf-assets.mjs",
     "sync:third-party-notices": "node scripts/sync-third-party-notices.mjs",
     "sync:vendor-assets": "npm run sync:pdf-assets && npm run sync:third-party-notices"

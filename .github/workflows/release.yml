@@ -614,7 +614,7 @@ jobs:
           }
 
           delete_candidate_release_or_confirm_absent() {
-            gh release delete "$tag" --yes >/dev/null 2>&1 || candidate_release_absent
+            gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || candidate_release_absent
             candidate_release_absent
           }
 
@@ -686,7 +686,7 @@ jobs:
               if [[ -n "$newer_tag" ]]; then
                 echo "::notice::Rollback will not mark an older release Latest because newer generation $newer_tag exists."
               elif [[ -n "$previous_latest_tag" && "$previous_release_removed" == false ]]; then
-                retry gh release edit "$previous_latest_tag" --latest >/dev/null 2>&1 || true
+                retry gh release edit "$previous_latest_tag" --latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
                 retry previous_is_latest || rollback_ok=false
               elif [[ -z "$previous_latest_tag" ]]; then
                 retry no_public_latest || rollback_ok=false
@@ -725,7 +725,7 @@ jobs:
           rollback_required=true
           gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$SOURCE_SHA" >/dev/null || true
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$SOURCE_SHA"
-          gh release create "$tag" release-assets/* --draft --verify-tag --title Latest --notes "Automated verified build of ${SOURCE_SHA}."
+          gh release create "$tag" release-assets/* --draft --verify-tag --title Latest --notes "Automated verified build of ${SOURCE_SHA}." --repo "$GITHUB_REPOSITORY"
 
           mapfile -t remote_names < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name' | sort)
           mapfile -t local_names < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
@@ -734,7 +734,7 @@ jobs:
             test "$(stat -c %s "release-assets/$name")" = "$size"
           done < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[] | [.name, (.size | tostring)] | @tsv')
           mkdir downloaded-release
-          gh release download "$tag" --dir downloaded-release
+          gh release download "$tag" --dir downloaded-release --repo "$GITHUB_REPOSITORY"
           cmp release-assets/SHA256SUMS.txt downloaded-release/SHA256SUMS.txt
           (cd downloaded-release && sha256sum --check SHA256SUMS.txt)
 
@@ -760,7 +760,7 @@ jobs:
           fi
 
           require_no_newer_same_sha_generation
-          retry gh release edit "$tag" --draft=false --latest >/dev/null
+          retry gh release edit "$tag" --draft=false --latest --repo "$GITHUB_REPOSITORY" >/dev/null
           retry candidate_is_promoted
           require_no_newer_same_sha_generation
 
