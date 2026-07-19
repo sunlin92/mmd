@@ -1866,7 +1866,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "fs2",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "mime_guess",
  "notify",
  "notify-debouncer-full",
