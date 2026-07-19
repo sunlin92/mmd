@@ -1874,11 +1874,12 @@ mod tests {
             "set MMD_RUN_NATIVE_WATCH_TESTS=1 before running ignored native watcher tests",
         );
         let workspace = tempdir().unwrap();
-        let active = workspace.path().join("notes.md");
+        let canonical_workspace = fs::canonicalize(workspace.path()).unwrap();
+        let active = canonical_workspace.join("notes.md");
         fs::write(&active, "before").unwrap();
         let active = fs::canonicalize(active).unwrap();
         let (sender, receiver) = mpsc::channel::<DebounceEventResult>();
-        let mut handle = create_native_debouncer(workspace.path(), sender).unwrap();
+        let mut handle = create_native_debouncer(&canonical_workspace, sender).unwrap();
 
         fs::write(&active, "after").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
