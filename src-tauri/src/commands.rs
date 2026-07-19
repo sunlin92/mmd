@@ -497,13 +497,15 @@ mod windows_handle_files {
             GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE,
+            FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, OPEN_EXISTING,
+            SYNCHRONIZE,
         },
         System::IO::IO_STATUS_BLOCK,
     };
 
-    const DIRECTORY_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    const DIRECTORY_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const VERIFIED_PARENT_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
     const REGULAR_FILE_OPEN_OPTIONS: u32 =
         FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT;
     const ENTRY_OPEN_OPTIONS: u32 = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT;
@@ -598,7 +600,7 @@ mod windows_handle_files {
         let raw = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                FILE_READ_ATTRIBUTES,
+                VERIFIED_PARENT_ACCESS,
                 DIRECTORY_SHARE_MODE,
                 null(),
                 OPEN_EXISTING,
@@ -861,6 +863,12 @@ mod windows_handle_files {
                         + name_bytes
                         + size_of::<u16>()
             );
+        }
+
+        #[test]
+        fn verified_parent_handle_supports_relative_rename() {
+            assert_ne!(VERIFIED_PARENT_ACCESS & FILE_TRAVERSE, 0);
+            assert_ne!(DIRECTORY_SHARE_MODE & FILE_SHARE_DELETE, 0);
         }
     }
 }

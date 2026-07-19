@@ -1411,7 +1411,10 @@ mod tests {
         );
 
         store
-            .promote(absolute_path("docs/c.html"), &mut next_id)
+            .promote(
+                absolute_path(Path::new("docs").join("c.html")),
+                &mut next_id,
+            )
             .unwrap();
         assert_eq!(
             store
