@@ -529,6 +529,7 @@ jobs:
           previous_latest_tag=
           previous_latest_sha=
           previous_latest_release_id=
+          candidate_release_id=
           previous_release_removed=false
           previous_tag_removal_started=false
           previous_release_removal_started=false
@@ -545,6 +546,11 @@ jobs:
           candidate_release_count() {
             gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp |
               jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | length'
+          }
+
+          find_candidate_release_id() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp |
+              jq -er --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | if length == 1 then .[0].id else error("expected exactly one candidate release for " + $tag) end'
           }
 
           candidate_tag_count() {
@@ -614,7 +620,13 @@ jobs:
           }
 
           delete_candidate_release_or_confirm_absent() {
-            gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || candidate_release_absent
+            if [[ "$candidate_release_id" =~ ^[0-9]+$ ]]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$candidate_release_id" >/dev/null 2>&1 ||
+                candidate_release_absent
+            else
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+                candidate_release_absent
+            fi
             candidate_release_absent
           }
 
@@ -633,11 +645,13 @@ jobs:
           }
 
           candidate_is_promoted() {
-            local candidate_draft latest_tag main_head
-            candidate_draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .draft) || return 1
+            local candidate_draft candidate_tag latest_tag main_head
+            [[ "$candidate_release_id" =~ ^[0-9]+$ ]] || return 1
+            candidate_draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/$candidate_release_id" --jq .draft) || return 1
+            candidate_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/$candidate_release_id" --jq .tag_name) || return 1
             latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name) || return 1
             main_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha) || return 1
-            [[ "$candidate_draft" == false && "$latest_tag" == "$tag" && "$main_head" == "$SOURCE_SHA" ]]
+            [[ "$candidate_draft" == false && "$candidate_tag" == "$tag" && "$latest_tag" == "$tag" && "$main_head" == "$SOURCE_SHA" ]]
           }
 
           newer_same_sha_generation_exists() {
@@ -727,12 +741,18 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$SOURCE_SHA"
           gh release create "$tag" release-assets/* --draft --verify-tag --title Latest --notes "Automated verified build of ${SOURCE_SHA}." --repo "$GITHUB_REPOSITORY"
 
-          mapfile -t remote_names < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name' | sort)
+          candidate_release_id=$(retry find_candidate_release_id)
+          [[ "$candidate_release_id" =~ ^[0-9]+$ ]]
+          candidate_release_json=$(retry gh api "repos/$GITHUB_REPOSITORY/releases/$candidate_release_id")
+          test "$(jq -r .tag_name <<<"$candidate_release_json")" = "$tag"
+          test "$(jq -r .draft <<<"$candidate_release_json")" = true
+
+          mapfile -t remote_names < <(jq -r '.assets[].name' <<<"$candidate_release_json" | sort)
           mapfile -t local_names < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
           diff -u <(printf '%s\n' "${local_names[@]}") <(printf '%s\n' "${remote_names[@]}")
           while IFS=$'\t' read -r name size; do
             test "$(stat -c %s "release-assets/$name")" = "$size"
-          done < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[] | [.name, (.size | tostring)] | @tsv')
+          done < <(jq -r '.assets[] | [.name, (.size | tostring)] | @tsv' <<<"$candidate_release_json")
           mkdir downloaded-release
           gh release download "$tag" --dir downloaded-release --repo "$GITHUB_REPOSITORY"
           cmp release-assets/SHA256SUMS.txt downloaded-release/SHA256SUMS.txt
@@ -760,7 +780,7 @@ jobs:
           fi
 
           require_no_newer_same_sha_generation
-          retry gh release edit "$tag" --draft=false --latest --repo "$GITHUB_REPOSITORY" >/dev/null
+          retry gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$candidate_release_id" -F draft=false -f make_latest=true >/dev/null
           retry candidate_is_promoted
           require_no_newer_same_sha_generation
 
