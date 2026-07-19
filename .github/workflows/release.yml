@@ -27,10 +27,9 @@ jobs:
           node-version-file: .node-version
           cache: npm
       - run: npm ci
-      - run: npm run check:release-version
-      - run: npm run test:release-tools
       - id: version
-        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: npm run check:release-version -- --github-output
+      - run: npm run test:release-tools
       - run: npm test
       - run: npm run typecheck
       - run: npm run lint

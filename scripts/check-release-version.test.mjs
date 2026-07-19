@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { checkReleaseVersion } from './check-release-version.mjs';
+
+const script = fileURLToPath(new URL('./check-release-version.mjs', import.meta.url));
 
 async function fixture(overrides = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mmd-release-version-'));
@@ -61,6 +65,24 @@ test('does not read a version from a later Cargo table', async () => {
 test('accepts matching repository versions on a branch', async () => {
   const root = await fixture();
   assert.equal(await checkReleaseVersion(root, { GITHUB_REF_TYPE: 'branch' }), '0.1.0');
+});
+
+test('writes the checked version to the GitHub output file', async () => {
+  const root = await fixture();
+  const output = path.join(root, 'github-output');
+
+  const result = spawnSync(process.execPath, [script, '--github-output'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_OUTPUT: output,
+      GITHUB_REF_TYPE: 'branch',
+    },
+  });
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(await readFile(output, 'utf8'), 'version=0.1.0\n');
 });
 
 for (const [field, file] of [

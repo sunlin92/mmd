@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { appendFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -52,6 +52,11 @@ export async function checkReleaseVersion(root = process.cwd(), env = process.en
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const version = await checkReleaseVersion();
+    if (process.argv.includes('--github-output')) {
+      const output = process.env.GITHUB_OUTPUT;
+      if (!output) throw new Error('GITHUB_OUTPUT is required with --github-output');
+      await appendFile(output, `version=${version}\n`, 'utf8');
+    }
     console.log(`Release version ${version} is consistent.`);
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
