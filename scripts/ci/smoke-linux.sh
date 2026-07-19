@@ -2,6 +2,7 @@
 set -euo pipefail
 
 artifact_dir=${1:?artifact directory required}
+artifact_dir=$(CDPATH= cd -- "$artifact_dir" && pwd -P)
 [[ "$(uname -m)" == 'x86_64' ]]
 node scripts/ci/artifact-manifest.mjs verify "$artifact_dir"
 
