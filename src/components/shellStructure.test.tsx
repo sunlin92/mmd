@@ -44,6 +44,12 @@ describe('shell structure accessibility', () => {
     expect(appShellCss).toMatch(/prefers-contrast:[\s\S]*?border-color:\s*var\(--chrome-text\)/);
   });
 
+  it('positions the workspace add menu in the viewport with an end-aligned origin', () => {
+    expect(appShellCss).toMatch(
+      /\.sidebar-add-menu\s*\{[^}]*position:\s*fixed;[^}]*transform-origin:\s*top right;/,
+    );
+  });
+
   it('protects file tree role and collapse labels', () => {
     const html = renderToStaticMarkup(
       <FileSidebar

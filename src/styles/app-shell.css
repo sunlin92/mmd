@@ -662,7 +662,7 @@
 }
 
 .sidebar-collapse-toggle { flex: 0 0 28px; }
-.sidebar-add-menu-wrap { position: relative; }
+.sidebar-add-menu-wrap { display: inline-flex; }
 
 .sidebar-add-menu,
 .file-tree-context-menu {
@@ -678,10 +678,8 @@
 }
 
 .sidebar-add-menu {
-  position: absolute;
-  top: 32px;
-  left: 0;
-  transform-origin: top left;
+  position: fixed;
+  transform-origin: top right;
 }
 
 .file-tree-context-menu { position: fixed; transform-origin: top left; }

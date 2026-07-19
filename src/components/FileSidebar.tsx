@@ -17,6 +17,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -24,6 +25,7 @@ import {
   type MouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 import {
   getFileTreeContextMenuItems,
   type FileTreeContextAction,
@@ -31,6 +33,10 @@ import {
 } from '../lib/fileTreeContextMenu';
 import { canMoveWorkspaceEntry } from '../lib/fileTreeOperations';
 import type { WorkspaceFileTreeNode } from '../lib/fileTree';
+import {
+  FLOATING_MENU_VIEWPORT_MARGIN,
+  getFloatingMenuPosition,
+} from '../lib/floatingMenuPosition';
 import { useI18n } from '../lib/i18n';
 import type { MarkdownOutlineItem } from '../lib/markdownOutline';
 import type { WorkspaceFileEntry, WorkspaceFileKind } from '../types';
@@ -63,7 +69,13 @@ interface FileSidebarProps {
 }
 
 interface ContextMenuState {
+  align: 'end' | 'start';
   target: FileTreeContextTarget;
+  x: number;
+  y: number;
+}
+
+interface MenuPosition {
   x: number;
   y: number;
 }
@@ -81,6 +93,8 @@ interface PointerDragSession {
 }
 
 const POINTER_DRAG_THRESHOLD = 6;
+const MENU_TRIGGER_GAP = 4;
+const useClientLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
 function ContextMenuIcon({ action }: { action: FileTreeContextAction }) {
   if (action === 'create-file') return <FilePlus2 size={14} />;
@@ -135,11 +149,11 @@ function findWorkspaceFileEntry(
   return null;
 }
 
-function clampMenuPosition(x: number, y: number) {
-  if (typeof window === 'undefined') return { x, y };
+function getMenuSize(menu: HTMLElement) {
+  const rect = menu.getBoundingClientRect();
   return {
-    x: Math.max(8, Math.min(x, window.innerWidth - 224)),
-    y: Math.max(8, Math.min(y, window.innerHeight - 284)),
+    height: menu.offsetHeight || rect.height,
+    width: menu.offsetWidth || rect.width,
   };
 }
 
@@ -167,13 +181,19 @@ export function FileSidebar({
   const { t } = useI18n();
   const sidebarToggleLabel = collapsed ? t('expandFileTree') : t('collapseFileTree');
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [contextMenuPosition, setContextMenuPosition] = useState<MenuPosition | null>(null);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [addMenuPosition, setAddMenuPosition] = useState<MenuPosition | null>(null);
   const [selectedTarget, setSelectedTarget] = useState<FileTreeContextTarget | null>(null);
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
   const [draggedTarget, setDraggedTarget] = useState<WorkspaceTreeTarget | null>(null);
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
   const [sidebarView, setSidebarView] = useState<SidebarView>('files');
   const [selectedOutlineId, setSelectedOutlineId] = useState<string | null>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const addMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const addMenuRef = useRef<HTMLDivElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const rootButtonRef = useRef<HTMLButtonElement>(null);
   const treeRef = useRef<HTMLDivElement>(null);
   const sidebarTabRefs = useRef<Record<SidebarView, HTMLButtonElement | null>>({
@@ -218,8 +238,43 @@ export function FileSidebar({
 
   const closeMenus = useCallback(() => {
     setContextMenu(null);
+    setContextMenuPosition(null);
     setAddMenuOpen(false);
+    setAddMenuPosition(null);
   }, []);
+
+  useClientLayoutEffect(() => {
+    if (!addMenuOpen) return;
+    const button = addMenuButtonRef.current;
+    const menu = addMenuRef.current;
+    const sidebar = sidebarRef.current;
+    if (!button || !menu || !sidebar) return;
+
+    const buttonRect = button.getBoundingClientRect();
+    const sidebarRect = sidebar.getBoundingClientRect();
+    setAddMenuPosition(getFloatingMenuPosition({
+      align: 'end',
+      anchor: {
+        x: sidebarRect.right - FLOATING_MENU_VIEWPORT_MARGIN,
+        y: buttonRect.bottom + MENU_TRIGGER_GAP,
+      },
+      menu: getMenuSize(menu),
+      viewport: { height: window.innerHeight, width: window.innerWidth },
+    }));
+  }, [addMenuOpen]);
+
+  useClientLayoutEffect(() => {
+    if (!contextMenu) return;
+    const menu = contextMenuRef.current;
+    if (!menu) return;
+
+    setContextMenuPosition(getFloatingMenuPosition({
+      align: contextMenu.align,
+      anchor: { x: contextMenu.x, y: contextMenu.y },
+      menu: getMenuSize(menu),
+      viewport: { height: window.innerHeight, width: window.innerWidth },
+    }));
+  }, [contextMenu]);
 
   useEffect(() => {
     if (!disabled) return;
@@ -276,19 +331,27 @@ export function FileSidebar({
     window.addEventListener('click', close);
     window.addEventListener('blur', close);
     window.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('resize', close);
     return () => {
       window.removeEventListener('click', close);
       window.removeEventListener('blur', close);
       window.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('resize', close);
     };
   }, [addMenuOpen, closeMenus, contextMenu]);
 
-  const openContextMenu = useCallback((x: number, y: number, target: FileTreeContextTarget) => {
+  const openContextMenu = useCallback((
+    x: number,
+    y: number,
+    target: FileTreeContextTarget,
+    align: ContextMenuState['align'] = 'start',
+  ) => {
     if (disabled) return;
-    const position = clampMenuPosition(x, y);
     setSelectedTarget(target);
     setAddMenuOpen(false);
-    setContextMenu({ target, ...position });
+    setAddMenuPosition(null);
+    setContextMenuPosition(null);
+    setContextMenu({ align, target, x, y });
   }, [disabled]);
 
   const openRootContextMenu = useCallback((event: MouseEvent<HTMLElement>) => {
@@ -566,6 +629,7 @@ export function FileSidebar({
 
   return (
     <aside
+      ref={sidebarRef}
       className={collapsed ? 'sidebar is-collapsed' : 'sidebar'}
       onClickCapture={(event) => {
         if (!suppressNextClickRef.current) return;
@@ -604,6 +668,7 @@ export function FileSidebar({
                   {workspaceRoot && (
                     <div className="sidebar-add-menu-wrap">
                       <button
+                        ref={addMenuButtonRef}
                         type="button"
                         className="sidebar-icon-button"
                         aria-label={t('addWorkspaceItem')}
@@ -614,13 +679,25 @@ export function FileSidebar({
                         onClick={(event) => {
                           event.stopPropagation();
                           setContextMenu(null);
-                          setAddMenuOpen((open) => !open);
+                          setContextMenuPosition(null);
+                          setAddMenuPosition(null);
+                          setAddMenuOpen(!addMenuOpen);
                         }}
                       >
                         <Plus size={16} />
                       </button>
-                      {addMenuOpen && (
-                        <div className="sidebar-add-menu" role="menu" tabIndex={-1}>
+                      {addMenuOpen && typeof document !== 'undefined' && createPortal(
+                        <div
+                          ref={addMenuRef}
+                          className="sidebar-add-menu"
+                          role="menu"
+                          tabIndex={-1}
+                          style={{
+                            left: addMenuPosition?.x ?? 0,
+                            top: addMenuPosition?.y ?? 0,
+                            visibility: addMenuPosition ? 'visible' : 'hidden',
+                          }}
+                        >
                           <button type="button" role="menuitem" onClick={() => beginCreate('file')}>
                             <FilePlus2 size={14} />
                             <span>{t('newMarkdownFile')}</span>
@@ -633,7 +710,8 @@ export function FileSidebar({
                             <FolderPlus size={14} />
                             <span>{t('newFolder')}</span>
                           </button>
-                        </div>
+                        </div>,
+                        document.body,
                       )}
                     </div>
                   )}
@@ -649,7 +727,7 @@ export function FileSidebar({
                       onClick={(event) => {
                         event.stopPropagation();
                         const rect = event.currentTarget.getBoundingClientRect();
-                        openContextMenu(rect.right - 196, rect.bottom + 4, selectedTarget);
+                        openContextMenu(rect.right, rect.bottom + MENU_TRIGGER_GAP, selectedTarget, 'end');
                       }}
                     >
                       <Ellipsis size={16} />
@@ -791,12 +869,17 @@ export function FileSidebar({
                 )}
               </div>
 
-              {contextMenu && (
+              {contextMenu && typeof document !== 'undefined' && createPortal(
                 <div
+                  ref={contextMenuRef}
                   className="file-tree-context-menu"
                   role="menu"
                   tabIndex={-1}
-                  style={{ left: contextMenu.x, top: contextMenu.y }}
+                  style={{
+                    left: contextMenuPosition?.x ?? 0,
+                    top: contextMenuPosition?.y ?? 0,
+                    visibility: contextMenuPosition ? 'visible' : 'hidden',
+                  }}
                   onContextMenu={(event) => event.preventDefault()}
                 >
                   {getFileTreeContextMenuItems(contextMenu.target).map((item) => (
@@ -817,7 +900,8 @@ export function FileSidebar({
                       {item.shortcut && <kbd>{item.shortcut}</kbd>}
                     </button>
                   ))}
-                </div>
+                </div>,
+                document.body,
               )}
           </div>
           <div

@@ -2,9 +2,9 @@
 
 ## Source of truth
 - Status: Active
-- Last refreshed: 2026-07-16
+- Last refreshed: 2026-07-19
 - Primary product surfaces: macOS desktop shell, workspace sidebar and file tree, source editor chrome, preview chrome, modal dialogs, pane popouts.
-- Evidence reviewed: `README.md`, `UI-skin.md`, `src/App.tsx`, shell and preview components, `src/lib/theme.ts`, `src/lib/themeRuntime.ts`, `src/styles/base.css`, `src/styles/app-shell.css`, `src/styles/responsive.css`, `src/styles/markdown-preview.css`, theme/shell tests, and Tauri native-menu commands.
+- Evidence reviewed: `README.md`, `UI-skin.md`, `src/App.tsx`, shell and preview components, `src/lib/theme.ts`, `src/lib/themeRuntime.ts`, `src/styles/base.css`, `src/styles/app-shell.css`, `src/styles/responsive.css`, `src/styles/markdown-preview.css`, theme/shell tests, Tauri native-menu commands, and workspace menu screenshots under `output/playwright/`.
 - Rendering and skin boundary: root skin tokens may change application chrome, CodeMirror, Markdown preview, dialogs, Mermaid output, and Excalidraw chrome. Markdown parsing, preprocessing, rendered semantics, export behavior, media/document pixels, and editable Excalidraw scene data remain unchanged.
 
 ## Brand
@@ -32,19 +32,20 @@
 - Familiar macOS grammar: source-list rows, blue selection, system typography, compact icon controls, Return/Escape editing, Command-Delete deletion, contextual menus, and sheet-like dialogs.
 - Document first: chrome stays quiet and compact so source and rendered content carry the visual weight.
 - State is explicit: selected, open, edited, busy, invalid drop, and destructive states must be visually and semantically distinct.
+- Anchors stay trustworthy: contextual menus open at the pointer or keyboard anchor and move only as much as required to remain visible; toolbar menus expand toward the owning pane instead of appearing cut by a divider.
 - Tradeoffs: single selection is preferred over multi-select in this pass; permanent deletion remains explicit instead of being mislabeled as moving to Trash.
 
 ## Visual language
 - Color: five token-complete Chinese-inspired palettes cover chrome, editor, preview, controls, and diagrams; semantic red/yellow/green and varied file-kind icon colors remain recognizable in every skin.
 - Typography: `-apple-system`/BlinkMacSystemFont for chrome; established CodeMirror and Markdown font roles, metrics, and hierarchy remain unchanged across skins.
-- Spacing/layout rhythm: 4px base rhythm; compact 28-32px controls and rows; 44-48px primary toolbar; 38-40px pane headers.
+- Spacing/layout rhythm: 4px base rhythm; compact 28-32px controls and rows; 44-48px primary toolbar; 38-40px pane headers; trigger menus use a 4px gap and preserve an 8px viewport or pane-edge inset where space allows.
 - Shape/radius/elevation: 5-8px radii for controls and rows, 10px maximum for dialogs, hairline borders, and subtle menu/dialog shadows only.
 - Motion: 120-160ms color/opacity transitions for hover and drop feedback; no layout-shifting animation.
 - Imagery/iconography: existing Lucide icons, used as familiar symbols with tooltips and accessible names.
 
 ## Components
 - Existing components to reuse: `AppToolbar`, `FileSidebar`, `FileTreeRows`, `WorkspaceEntryDialog`, `FeedbackDialog`, `PaneHeader`, existing modal priority in `App.tsx`, and existing Tauri mutation receipts.
-- New/changed components: compact toolbar state presentation; sidebar action menu; roving single-selection tree rows; inline rename editor; drag/drop targets; `WorkspaceMoveDialog`; reusable move-destination/path policy helpers.
+- New/changed components: compact toolbar state presentation; viewport-layer sidebar action and context menus; roving single-selection tree rows; inline rename editor; drag/drop targets; `WorkspaceMoveDialog`; reusable move-destination/path and floating-menu placement helpers.
 - Variants and states: root/folder/file targets; selected/open/drop-target/dragging/renaming; clean/edited/busy; default/destructive dialog; valid/invalid destination.
 - Token/component ownership: shell tokens live in `src/styles/base.css`; application chrome and component states live in `src/styles/app-shell.css`; narrow-window adaptations live in `src/styles/responsive.css`.
 
@@ -79,7 +80,7 @@
 - Performance constraints: tree interactions must remain synchronous; drag feedback must not trigger filesystem work until drop; no document re-rendering solely for chrome changes.
 - Compatibility constraints: preserve Tauri authorization boundaries, mutation receipts, popout replication, external-file monitoring, and native menu behavior.
 - Rendering constraint: skin work may replace visual values in `markdown-preview.css` with semantic tokens, but must not change Markdown parser/preprocessor/render components, generated document structure, export themes, content filters, or user-authored media and Excalidraw scene colors.
-- Test/screenshot expectations: TDD for new behavior; frontend unit tests for tree policies/interactions; Rust tests for move authorization and path rules; full frontend/Rust gates; Playwright or macOS screenshots at desktop and narrow sizes before completion.
+- Test/screenshot expectations: TDD for new behavior; frontend unit tests for tree policies/interactions and measured menu placement; Rust tests for move authorization and path rules; full frontend/Rust gates; Playwright or macOS screenshots at desktop and narrow sizes before completion.
 
 ## Open questions
 - [ ] Future localization strategy for the currently mixed English/Chinese UI / product owner / affects copy consistency, not this interaction pass.

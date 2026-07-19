@@ -621,7 +621,9 @@ describe('App binary document composition', () => {
 
     const moreButton = container.querySelector<HTMLButtonElement>('[aria-label="More actions for report.md"]');
     act(() => moreButton?.click());
-    const moveMenuItem = Array.from(container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+    const moveMenuItem = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('.file-tree-context-menu [role="menuitem"]'),
+    )
       .find((button) => button.textContent?.includes('Move'));
     act(() => moveMenuItem?.click());
 

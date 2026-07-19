@@ -25,6 +25,20 @@ function dispatchPointerEvent(
   target.dispatchEvent(event);
 }
 
+function rect(left: number, top: number, width: number, height: number): DOMRect {
+  return {
+    bottom: top + height,
+    height,
+    left,
+    right: left + width,
+    top,
+    width,
+    x: left,
+    y: top,
+    toJSON: () => ({}),
+  };
+}
+
 describe('FileSidebar native workspace interactions', () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -131,6 +145,95 @@ describe('FileSidebar native workspace interactions', () => {
     expect(container.querySelector('[draggable="false"]')).not.toBeNull();
   });
 
+  it('renders pointer context menus in the viewport layer at the pointer position', () => {
+    act(() => root.render(
+      <FileSidebar
+        activePath="/workspace/draft.md"
+        collapsed={false}
+        collapsedFolders={new Set()}
+        fileTree={[{
+          absolutePath: '/workspace/draft.md',
+          kind: 'file',
+          name: 'draft.md',
+          path: '/workspace/draft.md',
+          relativePath: 'draft.md',
+          file: {
+            kind: 'markdown',
+            name: 'draft.md',
+            path: '/workspace/draft.md',
+            relative_path: 'draft.md',
+          },
+        }]}
+        onCollapseChange={vi.fn<() => void>()}
+        onCreateFile={vi.fn<() => void>()}
+        onCreateFolder={vi.fn<() => void>()}
+        onDeleteEntry={vi.fn<() => void>()}
+        onMoveEntry={vi.fn<() => void>()}
+        onOpenFile={vi.fn<() => void>()}
+        onRefreshWorkspace={vi.fn<() => void>()}
+        onRenameEntry={vi.fn<() => void>()}
+        onRequestMove={vi.fn<() => void>()}
+        onToggleFolder={vi.fn<() => void>()}
+        workspaceRoot="/workspace"
+      />,
+    ));
+
+    const row = container.querySelector<HTMLElement>('[data-tree-entry-path="/workspace/draft.md"]');
+    act(() => row?.dispatchEvent(new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 180,
+      clientY: 240,
+    })));
+
+    const menu = document.body.querySelector<HTMLElement>('.file-tree-context-menu');
+    expect(menu).not.toBeNull();
+    expect(menu?.parentElement).toBe(document.body);
+    expect(menu?.closest('.sidebar')).toBeNull();
+    expect(menu?.style.left).toBe('180px');
+    expect(menu?.style.top).toBe('240px');
+  });
+
+  it('insets the add menu from the sidebar divider and leaves a trigger gap', () => {
+    const getBoundingClientRect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockImplementation(function mockRect(this: HTMLElement) {
+        if (this.classList.contains('sidebar')) return rect(0, 48, 264, 672);
+        if (this.getAttribute('aria-label') === 'Add workspace item') return rect(168, 56, 28, 28);
+        if (this.classList.contains('sidebar-add-menu')) return rect(0, 0, 204, 112);
+        return rect(0, 0, 0, 0);
+      });
+
+    try {
+      act(() => root.render(
+        <FileSidebar
+          activePath={null}
+          collapsed={false}
+          collapsedFolders={new Set()}
+          fileTree={[]}
+          onCollapseChange={vi.fn<() => void>()}
+          onCreateFile={vi.fn<() => void>()}
+          onCreateFolder={vi.fn<() => void>()}
+          onDeleteEntry={vi.fn<() => void>()}
+          onMoveEntry={vi.fn<() => void>()}
+          onOpenFile={vi.fn<() => void>()}
+          onRefreshWorkspace={vi.fn<() => void>()}
+          onRenameEntry={vi.fn<() => void>()}
+          onRequestMove={vi.fn<() => void>()}
+          onToggleFolder={vi.fn<() => void>()}
+          workspaceRoot="/workspace"
+        />,
+      ));
+
+      act(() => container.querySelector<HTMLButtonElement>('[aria-label="Add workspace item"]')?.click());
+
+      const menu = document.body.querySelector<HTMLElement>('.sidebar-add-menu');
+      expect(menu?.style.left).toBe('52px');
+      expect(menu?.style.top).toBe('88px');
+    } finally {
+      getBoundingClientRect.mockRestore();
+    }
+  });
+
   it('creates an Excalidraw scene from the workspace add menu', () => {
     const onCreateFile = vi.fn<(
       parentPath: string,
@@ -158,7 +261,7 @@ describe('FileSidebar native workspace interactions', () => {
     ));
 
     act(() => container.querySelector<HTMLButtonElement>('[aria-label="Add workspace item"]')?.click());
-    const createDrawing = Array.from(container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+    const createDrawing = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
       .find((button) => button.textContent?.includes('New Excalidraw File'));
     act(() => createDrawing?.click());
 
@@ -746,7 +849,7 @@ describe('FileSidebar native workspace interactions', () => {
     expect(moreButton).not.toBeNull();
     act(() => moreButton?.click());
 
-    const menuText = container.querySelector('[role="menu"]')?.textContent;
+    const menuText = document.body.querySelector('[role="menu"]')?.textContent;
     expect(menuText).toContain('Rename');
     expect(menuText).toContain('Move…');
     expect(menuText).toContain('Delete');
