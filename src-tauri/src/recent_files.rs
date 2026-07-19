@@ -32,6 +32,13 @@ const STORE_FILE_NAME: &str = "recent-files-v1.json";
 const LOCK_FILE_NAME: &str = "recent-files-v1.lock";
 const STAGING_ATTEMPTS: usize = 8;
 const COMMIT_FAILURE_MESSAGE: &str = "The file could not be finalized. Please try again.";
+// Windows reports fs2 contention as ERROR_LOCK_VIOLATION instead of WouldBlock.
+const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
+
+pub(crate) fn is_retryable_lock_contention(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || (cfg!(windows) && error.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION))
+}
 
 pub(crate) trait MonotonicClock: Send + Sync {
     fn now(&self) -> Duration;
@@ -276,7 +283,7 @@ impl RecentStore {
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error) if is_retryable_lock_contention(&error) => {
                     let elapsed = started.elapsed();
                     if elapsed >= self.lock_timeout {
                         return Err("Recent files store is busy".to_string());
@@ -1257,9 +1264,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        repair_store_bytes, serialize_complete_store, MonotonicClock, OpaqueIdSource, PersistFault,
-        RecentFileEntryV1, RecentFileStoreV1, RecentFilesState, RecentRuntime, RecentStore,
-        RecentStoreAtomicReplacer, SystemRecentStoreAtomicReplacer, TerminalOpenOutcome,
+        is_retryable_lock_contention, repair_store_bytes, serialize_complete_store, MonotonicClock,
+        OpaqueIdSource, PersistFault, RecentFileEntryV1, RecentFileStoreV1, RecentFilesState,
+        RecentRuntime, RecentStore, RecentStoreAtomicReplacer, SystemRecentStoreAtomicReplacer,
+        TerminalOpenOutcome,
     };
     use crate::{
         models::{OpenCommitResult, OpenCommitStatus, RecentFilesSnapshot},
@@ -1273,29 +1281,69 @@ mod tests {
     const ID_E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const ID_F: &str = "ffffffffffffffffffffffffffffffff";
 
+    fn absolute_path(relative: impl AsRef<Path>) -> String {
+        #[cfg(windows)]
+        let root = Path::new(r"C:\");
+        #[cfg(not(windows))]
+        let root = Path::new("/");
+
+        root.join(relative).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn classifies_retryable_lock_contention_errors() {
+        assert!(is_retryable_lock_contention(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+
+        #[cfg(windows)]
+        assert!(is_retryable_lock_contention(&io::Error::from_raw_os_error(
+            super::WINDOWS_ERROR_LOCK_VIOLATION
+        )));
+
+        assert!(!is_retryable_lock_contention(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+    }
+
     fn canonical_target(path: &str) -> Option<String> {
-        match path {
-            "/docs/a.md" | "/alias/a.md" => Some("/docs/a.md".to_string()),
-            "/docs/b.md" | "/docs/c.html" | "/docs/d.md" | "/docs/e.md" | "/docs/f.md" => {
-                Some(path.to_string())
-            }
-            _ => None,
+        let canonical_a = absolute_path("docs/a.md");
+        if path == canonical_a || path == absolute_path("alias/a.md") {
+            return Some(canonical_a);
         }
+        [
+            "docs/b.md",
+            "docs/c.html",
+            "docs/d.md",
+            "docs/e.md",
+            "docs/f.md",
+        ]
+        .into_iter()
+        .map(absolute_path)
+        .find(|candidate| candidate == path)
     }
 
     #[test]
     fn repairs_untrusted_v1_entries_in_order_and_serializes_the_exact_schema() {
+        let canonical_a = absolute_path("docs/a.md");
+        let alias_a = absolute_path("alias/a.md");
+        let canonical_b = absolute_path("docs/b.md");
+        let canonical_c = absolute_path("docs/c.html");
+        let missing = absolute_path("missing.md");
+        let canonical_d = absolute_path("docs/d.md");
+        let canonical_e = absolute_path("docs/e.md");
+        let canonical_f = absolute_path("docs/f.md");
         let bytes = serde_json::to_vec(&json!({
             "version": 1,
             "entries": [
-                { "id": ID_A, "canonicalTarget": "/docs/a.md" },
-                { "id": ID_B, "canonicalTarget": "/alias/a.md" },
-                { "id": ID_A, "canonicalTarget": "/docs/b.md" },
-                { "id": "not-random", "canonicalTarget": "/docs/c.html" },
-                { "id": ID_C, "canonicalTarget": "/missing.md" },
-                { "id": ID_D, "canonicalTarget": "/docs/d.md" },
-                { "id": ID_E, "canonicalTarget": "/docs/e.md" },
-                { "id": ID_F, "canonicalTarget": "/docs/f.md" }
+                { "id": ID_A, "canonicalTarget": &canonical_a },
+                { "id": ID_B, "canonicalTarget": &alias_a },
+                { "id": ID_A, "canonicalTarget": &canonical_b },
+                { "id": "not-random", "canonicalTarget": &canonical_c },
+                { "id": ID_C, "canonicalTarget": &missing },
+                { "id": ID_D, "canonicalTarget": &canonical_d },
+                { "id": ID_E, "canonicalTarget": &canonical_e },
+                { "id": ID_F, "canonicalTarget": &canonical_f }
             ]
         }))
         .unwrap();
@@ -1306,10 +1354,10 @@ mod tests {
         assert_eq!(
             store.entries,
             vec![
-                RecentFileEntryV1::new(ID_A, "/docs/a.md"),
-                RecentFileEntryV1::new(ID_D, "/docs/d.md"),
-                RecentFileEntryV1::new(ID_E, "/docs/e.md"),
-                RecentFileEntryV1::new(ID_F, "/docs/f.md"),
+                RecentFileEntryV1::new(ID_A, &canonical_a),
+                RecentFileEntryV1::new(ID_D, &canonical_d),
+                RecentFileEntryV1::new(ID_E, &canonical_e),
+                RecentFileEntryV1::new(ID_F, &canonical_f),
             ]
         );
         assert_eq!(
@@ -1317,10 +1365,10 @@ mod tests {
             json!({
                 "version": 1,
                 "entries": [
-                    { "id": ID_A, "canonicalTarget": "/docs/a.md" },
-                    { "id": ID_D, "canonicalTarget": "/docs/d.md" },
-                    { "id": ID_E, "canonicalTarget": "/docs/e.md" },
-                    { "id": ID_F, "canonicalTarget": "/docs/f.md" }
+                    { "id": ID_A, "canonicalTarget": &canonical_a },
+                    { "id": ID_D, "canonicalTarget": &canonical_d },
+                    { "id": ID_E, "canonicalTarget": &canonical_e },
+                    { "id": ID_F, "canonicalTarget": &canonical_f }
                 ]
             })
         );
@@ -1347,15 +1395,10 @@ mod tests {
         let mut ids = VecDeque::from([ID_A, ID_B, ID_C, ID_D, ID_E, ID_F]);
         let mut next_id = || Ok(ids.pop_front().unwrap().to_string());
 
-        for target in [
-            "/docs/a.md",
-            "/docs/b.md",
-            "/docs/c.html",
-            "/docs/d.md",
-            "/docs/e.md",
-            "/docs/f.md",
-        ] {
-            store.promote(target.to_string(), &mut next_id).unwrap();
+        for target in ["a.md", "b.md", "c.html", "d.md", "e.md", "f.md"] {
+            store
+                .promote(absolute_path(Path::new("docs").join(target)), &mut next_id)
+                .unwrap();
         }
 
         assert_eq!(
@@ -1368,7 +1411,7 @@ mod tests {
         );
 
         store
-            .promote("/docs/c.html".to_string(), &mut next_id)
+            .promote(absolute_path("docs/c.html"), &mut next_id)
             .unwrap();
         assert_eq!(
             store
@@ -1385,15 +1428,15 @@ mod tests {
         let duplicate_id = RecentFileStoreV1 {
             version: 1,
             entries: vec![
-                RecentFileEntryV1::new(ID_A, "/docs/a.md"),
-                RecentFileEntryV1::new(ID_A, "/docs/b.md"),
+                RecentFileEntryV1::new(ID_A, absolute_path("docs/a.md")),
+                RecentFileEntryV1::new(ID_A, absolute_path("docs/b.md")),
             ],
         };
         let duplicate_target = RecentFileStoreV1 {
             version: 1,
             entries: vec![
-                RecentFileEntryV1::new(ID_A, "/docs/a.md"),
-                RecentFileEntryV1::new(ID_B, "/docs/a.md"),
+                RecentFileEntryV1::new(ID_A, absolute_path("docs/a.md")),
+                RecentFileEntryV1::new(ID_B, absolute_path("docs/a.md")),
             ],
         };
 
@@ -1414,7 +1457,7 @@ mod tests {
             runtime
                 .issue(
                     "main",
-                    format!("/docs/{index}.md"),
+                    absolute_path(format!("docs/{index}.md")),
                     issued_at,
                     opaque_id(index * 2 + 1),
                     opaque_id(index * 2 + 2),
@@ -1440,19 +1483,31 @@ mod tests {
         let mut runtime = RecentRuntime::default();
         let now = Duration::from_secs(1);
         runtime
-            .issue("main", "/docs/a.md".into(), now, opaque_id(1), opaque_id(2))
+            .issue(
+                "main",
+                absolute_path("docs/a.md"),
+                now,
+                opaque_id(1),
+                opaque_id(2),
+            )
             .unwrap();
         runtime
             .issue(
                 "editor",
-                "/docs/b.md".into(),
+                absolute_path("docs/b.md"),
                 now,
                 opaque_id(3),
                 opaque_id(4),
             )
             .unwrap();
         runtime
-            .issue("main", "/docs/c.md".into(), now, opaque_id(5), opaque_id(6))
+            .issue(
+                "main",
+                absolute_path("docs/c.md"),
+                now,
+                opaque_id(5),
+                opaque_id(6),
+            )
             .unwrap();
 
         assert!(!runtime.discard_receipt(&opaque_id(1), "editor", now));
@@ -1467,7 +1522,7 @@ mod tests {
         runtime
             .issue(
                 "editor",
-                "/docs/d.md".into(),
+                absolute_path("docs/d.md"),
                 now,
                 opaque_id(7),
                 opaque_id(8),
@@ -1486,7 +1541,7 @@ mod tests {
         runtime
             .issue(
                 "main",
-                "/docs/pending.md".into(),
+                absolute_path("docs/pending.md"),
                 now,
                 opaque_id(1),
                 opaque_id(2),
@@ -2534,7 +2589,7 @@ mod tests {
         );
         let prior = RecentFileStoreV1 {
             version: 1,
-            entries: vec![RecentFileEntryV1::new(ID_A, "/docs/a.md")],
+            entries: vec![RecentFileEntryV1::new(ID_A, absolute_path("docs/a.md"))],
         };
         active_store.persist(&prior).unwrap();
         let prior_bytes = fs::read(active_store.store_path()).unwrap();
@@ -2547,7 +2602,7 @@ mod tests {
         );
         let next = RecentFileStoreV1 {
             version: 1,
-            entries: vec![RecentFileEntryV1::new(ID_B, "/docs/b.md")],
+            entries: vec![RecentFileEntryV1::new(ID_B, absolute_path("docs/b.md"))],
         };
 
         assert!(failing_store.persist(&next).is_err());

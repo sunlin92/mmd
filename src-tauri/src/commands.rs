@@ -470,7 +470,7 @@ mod windows_handle_files {
         ffi::{c_void, OsStr, OsString},
         fs::File,
         io::{self, Write},
-        mem::{offset_of, size_of},
+        mem::size_of,
         os::windows::{
             ffi::{OsStrExt, OsStringExt},
             io::{AsRawHandle, FromRawHandle},
@@ -763,6 +763,10 @@ mod windows_handle_files {
         }
     }
 
+    fn rename_info_buffer_size(name_bytes: usize) -> usize {
+        size_of::<FILE_RENAME_INFO>() + name_bytes
+    }
+
     fn rename_no_replace_with_precommit(
         from: &Path,
         to: &Path,
@@ -795,7 +799,7 @@ mod windows_handle_files {
         precommit()?;
 
         let name_bytes = destination_name.len() * size_of::<u16>();
-        let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName) + name_bytes + size_of::<u16>();
+        let buffer_bytes = rename_info_buffer_size(name_bytes);
         let words = buffer_bytes.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; words];
         let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
@@ -837,6 +841,27 @@ mod windows_handle_files {
         precommit: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
         rename_no_replace_with_precommit(from, to, precommit)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rename_buffer_includes_the_full_structure_and_file_name() {
+            let name_bytes = size_of::<u16>();
+
+            assert_eq!(
+                rename_info_buffer_size(name_bytes),
+                size_of::<FILE_RENAME_INFO>() + name_bytes
+            );
+            assert!(
+                rename_info_buffer_size(name_bytes)
+                    > std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+                        + name_bytes
+                        + size_of::<u16>()
+            );
+        }
     }
 }
 

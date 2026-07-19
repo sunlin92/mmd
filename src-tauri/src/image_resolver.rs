@@ -35,6 +35,13 @@ fn strip_url_fragment_or_query(src: &str) -> &str {
     src.split(['?', '#']).next().unwrap_or(src)
 }
 
+fn has_rooted_path_syntax(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    Path::new(path).is_absolute()
+        || matches!(bytes.first(), Some(b'/') | Some(b'\\'))
+        || matches!(bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+}
+
 fn reject_unsafe_relative_image_src(src: &str) -> Result<String, String> {
     let trimmed = strip_url_fragment_or_query(src.trim());
     if trimmed.is_empty() {
@@ -50,8 +57,7 @@ fn reject_unsafe_relative_image_src(src: &str) -> Result<String, String> {
         return Err("Only relative local image paths are supported".into());
     }
     let decoded = decode_percent(trimmed)?;
-    let p = Path::new(&decoded);
-    if p.is_absolute() || decoded.starts_with('~') {
+    if has_rooted_path_syntax(&decoded) || decoded.starts_with('~') {
         return Err("Absolute image paths are not allowed".into());
     }
     Ok(decoded)
@@ -107,7 +113,21 @@ mod tests {
 
     #[test]
     fn rejects_absolute_and_external_image_sources() {
-        assert!(reject_unsafe_relative_image_src("/tmp/a.png").is_err());
+        for rooted in [
+            "/tmp/a.png",
+            r"\tmp\a.png",
+            r"C:\tmp\a.png",
+            "C:/tmp/a.png",
+            r"C:images\a.png",
+            r"\\server\share\a.png",
+            "%2Ftmp/a.png",
+            "%5Ctmp%5Ca.png",
+        ] {
+            assert!(
+                reject_unsafe_relative_image_src(rooted).is_err(),
+                "accepted rooted image source: {rooted}"
+            );
+        }
         assert!(reject_unsafe_relative_image_src("https://example.com/a.png").is_err());
         assert!(reject_unsafe_relative_image_src("data:image/png;base64,abc").is_err());
         assert!(reject_unsafe_relative_image_src("../a.png").is_ok());
