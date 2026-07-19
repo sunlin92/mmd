@@ -482,8 +482,9 @@ mod windows_handle_files {
     use windows_sys::Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-            FILE_SYNCHRONOUS_IO_NONALERT,
+            FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+            FILE_RENAME_INFORMATION_0, FILE_SYNCHRONOUS_IO_NONALERT,
         },
     };
     use windows_sys::Win32::{
@@ -493,13 +494,11 @@ mod windows_handle_files {
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL},
         Storage::FileSystem::{
-            CreateFileW, FileAttributeTagInfo, FileRenameInfo, GetFileInformationByHandleEx,
-            GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, OPEN_EXISTING,
-            SYNCHRONIZE,
+            CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx,
+            GetFinalPathNameByHandleW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE,
         },
         System::IO::IO_STATUS_BLOCK,
     };
@@ -765,8 +764,8 @@ mod windows_handle_files {
         }
     }
 
-    fn rename_info_buffer_size(name_bytes: usize) -> usize {
-        size_of::<FILE_RENAME_INFO>() + name_bytes
+    fn rename_information_buffer_size(name_bytes: usize) -> usize {
+        size_of::<FILE_RENAME_INFORMATION>() + name_bytes
     }
 
     fn rename_no_replace_with_precommit(
@@ -801,14 +800,12 @@ mod windows_handle_files {
         precommit()?;
 
         let name_bytes = destination_name.len() * size_of::<u16>();
-        let buffer_bytes = rename_info_buffer_size(name_bytes);
+        let buffer_bytes = rename_information_buffer_size(name_bytes);
         let words = buffer_bytes.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; words];
-        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         unsafe {
-            (*rename).Anonymous = FILE_RENAME_INFO_0 {
-                ReplaceIfExists: false,
-            };
+            (*rename).Anonymous = FILE_RENAME_INFORMATION_0::default();
             (*rename).RootDirectory = handle(&destination_directory);
             (*rename).FileNameLength = name_bytes as u32;
             std::ptr::copy_nonoverlapping(
@@ -817,16 +814,20 @@ mod windows_handle_files {
                 destination_name.len(),
             );
         }
-        let succeeded = unsafe {
-            SetFileInformationByHandle(
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // The kernel32 wrapper canonicalizes relative names before forwarding them;
+        // use the native primitive so the verified directory handle remains the root.
+        let status = unsafe {
+            NtSetInformationFile(
                 handle(&source),
-                FileRenameInfo,
+                &mut io_status,
                 rename.cast::<c_void>(),
                 buffer_bytes as u32,
+                FileRenameInformation,
             )
         };
-        if succeeded == 0 {
-            Err(io::Error::last_os_error())
+        if status < 0 {
+            Err(nt_error(status))
         } else {
             Ok(())
         }
@@ -854,12 +855,12 @@ mod windows_handle_files {
             let name_bytes = size_of::<u16>();
 
             assert_eq!(
-                rename_info_buffer_size(name_bytes),
-                size_of::<FILE_RENAME_INFO>() + name_bytes
+                rename_information_buffer_size(name_bytes),
+                size_of::<FILE_RENAME_INFORMATION>() + name_bytes
             );
             assert!(
-                rename_info_buffer_size(name_bytes)
-                    > std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+                rename_information_buffer_size(name_bytes)
+                    > std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
                         + name_bytes
                         + size_of::<u16>()
             );
