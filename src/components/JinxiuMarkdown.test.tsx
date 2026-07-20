@@ -89,6 +89,22 @@ describe('JinxiuMarkdown document transitions', () => {
     expect(container.querySelector('h2')?.getAttribute('data-heading-line')).toBe('3');
   });
 
+  it('renders math with the stylesheet-compatible KaTeX markup', async () => {
+    await act(async () => root.render(
+      <JinxiuMarkdown currentFilePath="/workspace/guide.md" workspaceRoot="/workspace">
+        {'Inline $x^2$\n\n$$\n\\frac{1}{\\sqrt{2}}\n$$'}
+      </JinxiuMarkdown>,
+    ));
+
+    const renderedMath = [...container.querySelectorAll('.katex')];
+    expect(renderedMath).toHaveLength(2);
+    expect(renderedMath.every((element) => (
+      element.querySelector('.katex-html > .katex-base .katex-strut') !== null
+    ))).toBe(true);
+    expect(container.querySelector('.katex-display > .katex')).not.toBeNull();
+    expect(container.querySelector('.katex .base, .katex .strut')).toBeNull();
+  });
+
   it('renders Mermaid fences through the Mermaid diagram component', async () => {
     await act(async () => root.render(
       <JinxiuMarkdown currentFilePath="/workspace/guide.md" workspaceRoot="/workspace">
