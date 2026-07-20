@@ -5,7 +5,7 @@ import packageManifest from '../../package.json';
 const expectedCodeMirrorVersions = {
   '@codemirror/commands': '6.10.4',
   '@codemirror/lang-html': '6.4.11',
-  '@codemirror/lang-markdown': '6.5.0',
+  '@codemirror/lang-markdown': '6.5.1',
   '@codemirror/language': '6.12.4',
   '@codemirror/search': '6.7.1',
   '@codemirror/state': '6.7.1',

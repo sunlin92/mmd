@@ -364,6 +364,9 @@ pub(crate) fn preflight_docx_zip(bytes: &[u8]) -> Result<(), String> {
 mod tests {
     use super::preflight_docx_zip;
 
+    const REAL_COMPRESSED_DOCX: &[u8] =
+        include_bytes!("../../test-fixtures/p2/docx/single-paragraph.docx");
+
     fn append_u16(bytes: &mut Vec<u8>, value: u16) {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -454,6 +457,11 @@ mod tests {
         append_u32(&mut bytes, u32::MAX);
         append_u16(&mut bytes, 0);
         bytes
+    }
+
+    #[test]
+    fn accepts_real_compressed_docx_fixture() {
+        assert_eq!(preflight_docx_zip(REAL_COMPRESSED_DOCX), Ok(()));
     }
 
     #[test]
