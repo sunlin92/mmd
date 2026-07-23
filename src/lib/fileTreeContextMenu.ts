@@ -1,13 +1,18 @@
 export type FileTreeContextTargetKind = 'file' | 'folder' | 'root';
 
 import type { WorkspaceFileKind } from '../types';
+import { isMarkdownWorkspaceReferenceKind } from './markdownMedia';
 
 export type FileTreeContextTarget =
   | { kind: 'root'; name: string; path: string }
   | { kind: 'folder'; name: string; path: string }
   | { fileKind: WorkspaceFileKind; kind: 'file'; name: string; path: string };
 
-export type FileTreeContextAction = 'create-file' | 'create-folder' | 'delete' | 'move' | 'open' | 'refresh' | 'rename';
+export type FileTreeContextAction = 'create-file' | 'create-folder' | 'delete' | 'insert-at-cursor' | 'move' | 'open' | 'refresh' | 'rename';
+
+interface FileTreeContextMenuOptions {
+  canInsertWorkspaceAsset?: boolean;
+}
 
 export interface FileTreeContextMenuItem {
   action: FileTreeContextAction;
@@ -22,7 +27,10 @@ export function canRenameFileTreeTarget(target: FileTreeContextTarget): boolean 
     && (target.kind === 'folder' || (target.fileKind !== 'pdf' && target.fileKind !== 'docx'));
 }
 
-export function getFileTreeContextMenuItems(target: FileTreeContextTarget): FileTreeContextMenuItem[] {
+export function getFileTreeContextMenuItems(
+  target: FileTreeContextTarget,
+  options: FileTreeContextMenuOptions = {},
+): FileTreeContextMenuItem[] {
   if (target.kind === 'root') {
     return [
       { action: 'create-file', label: 'New Markdown File' },
@@ -44,6 +52,9 @@ export function getFileTreeContextMenuItems(target: FileTreeContextTarget): File
   const items: FileTreeContextMenuItem[] = [
     { action: 'open', label: 'Open', shortcut: '⌘O' },
   ];
+  if (options.canInsertWorkspaceAsset && isMarkdownWorkspaceReferenceKind(target.fileKind)) {
+    items.push({ action: 'insert-at-cursor', label: 'Insert at Current Cursor' });
+  }
   if (canRenameFileTreeTarget(target)) {
     items.push({ action: 'rename', label: 'Rename', separatorBefore: true, shortcut: 'Return' });
   }

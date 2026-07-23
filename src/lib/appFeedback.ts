@@ -33,11 +33,13 @@ function normalizeEnglishError(raw: string, message: string): string {
   if (message.includes('failed to rename')) return 'The item could not be renamed. Confirm that the destination is writable, then try again.';
   if (message.includes('failed to delete')) return 'The item could not be deleted. Confirm that it still exists and is accessible.';
   if (message.includes('failed to read file')) return 'The file could not be read. Confirm that it still exists and is accessible.';
+  if (message.includes('excalidraw preview module')) return 'The Excalidraw editor could not be loaded. Restart MMD and try again.';
   if (message.includes('excalidraw scene')) return 'This Excalidraw file is invalid and cannot be opened or saved.';
   if (message.includes('docx')) return 'This DOCX could not be displayed. The file may be damaged or unsupported.';
   if (message.includes('pdf')) return 'This PDF could not be displayed. The file may be damaged or unsupported.';
   if (message.includes('image')) return 'The image could not be displayed. Check its relative path and file access.';
   if (message.includes('media')) return 'This media file or codec cannot be played on the current system.';
+  if (message.includes('html embed')) return 'The embedded HTML page could not be displayed. Use a relative HTML path within the current workspace.';
   if (message.includes('html preview')) return 'The HTML preview service could not start. Please try again.';
   if (message.includes('workspace entry name')) return 'Enter a valid file or folder name.';
   if (message.includes('already exists')) return 'An item with the same name already exists.';
@@ -103,6 +105,10 @@ export function normalizeAppError(error: unknown, locale: EffectiveLocale = 'zh-
     return '读取文件失败。请确认文件仍然存在并可访问。';
   }
 
+  if (message.includes('excalidraw preview module')) {
+    return 'Excalidraw 编辑器暂时无法加载。请重新启动 MMD 后再试。';
+  }
+
   if (message.includes('invalid excalidraw scene') || message.includes('excalidraw scene')) {
     return '此 Excalidraw 文件格式无效，无法打开或保存。';
   }
@@ -143,6 +149,10 @@ export function normalizeAppError(error: unknown, locale: EffectiveLocale = 'zh-
     message.includes('failed to create html preview token')
   ) {
     return '无法启动 HTML 预览服务。请稍后重试。';
+  }
+
+  if (message.includes('html embed')) {
+    return '无法加载嵌入的 HTML 页面。请使用当前工作区内的相对 HTML 路径。';
   }
 
   if (
@@ -233,9 +243,9 @@ export function normalizeAppError(error: unknown, locale: EffectiveLocale = 'zh-
   return '操作没有完成。请稍后重试。';
 }
 
-export function emitAppFeedbackError(error: unknown, locale: EffectiveLocale = 'zh-CN'): void {
+export function emitAppFeedbackError(error: unknown): void {
   if (typeof window === 'undefined') return;
-  window.dispatchEvent(new CustomEvent(APP_FEEDBACK_ERROR_EVENT, { detail: normalizeAppError(error, locale) }));
+  window.dispatchEvent(new CustomEvent(APP_FEEDBACK_ERROR_EVENT, { detail: stringifyError(error) }));
 }
 
 export function getFeedbackDialog(input: { error: string | null; notice: string | null }, locale: EffectiveLocale = 'zh-CN'): FeedbackDialog | null {

@@ -56,7 +56,7 @@ export default function AdaptiveMarkdownImage({ alt, currentFilePath, localAsset
           setResolvedSrc(undefined);
           setImageError(true);
           setMeasured({ loadState: 'error', naturalWidth: null, naturalHeight: null });
-          emitAppFeedbackError(err, locale);
+          emitAppFeedbackError(err);
         }
       });
     return () => {

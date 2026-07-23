@@ -52,6 +52,15 @@ describe('app feedback dialog', () => {
     expect(normalizeAppError('Failed to create HTML preview token: random source unavailable')).toBe('无法启动 HTML 预览服务。请稍后重试。');
   });
 
+  it('normalizes Markdown HTML embed errors without exposing path validation details', () => {
+    expect(normalizeAppError('HTML embed target escaped the Markdown directory')).toBe(
+      '无法加载嵌入的 HTML 页面。请使用当前工作区内的相对 HTML 路径。',
+    );
+    expect(normalizeAppError('Cannot read HTML embed: Permission denied (os error 13)', 'en')).toBe(
+      'The embedded HTML page could not be displayed. Use a relative HTML path within the current workspace.',
+    );
+  });
+
   it('normalizes recent-file contention and stale entries', () => {
     expect(normalizeAppError('Recent files store is busy')).toBe(
       '最近文件列表正在被另一个应用进程更新。请稍后重试。',
@@ -73,7 +82,18 @@ describe('app feedback dialog', () => {
     );
   });
 
-  it('emits normalized image feedback events for the app shell', () => {
+  it('keeps an exhausted Excalidraw module load failure distinct from an invalid scene', () => {
+    const error = 'Failed to load Excalidraw preview module';
+
+    expect(normalizeAppError(error)).toBe(
+      'Excalidraw 编辑器暂时无法加载。请重新启动 MMD 后再试。',
+    );
+    expect(normalizeAppError(error, 'en')).toBe(
+      'The Excalidraw editor could not be loaded. Restart MMD and try again.',
+    );
+  });
+
+  it('emits raw errors for the app shell to normalize once', () => {
     const eventTarget = new EventTarget();
     vi.stubGlobal('window', eventTarget);
     const handler = vi.fn<(event: Event) => void>();
@@ -86,6 +106,26 @@ describe('app feedback dialog', () => {
     expect(handler).toHaveBeenCalledOnce();
     const event = handler.mock.calls[0][0];
     expect(event).toBeInstanceOf(CustomEvent);
-    expect((event as CustomEvent).detail).toBe('出于安全限制，应用无法访问未授权的文件或文件夹。请从应用内重新打开对应文件或文件夹后再试。');
+    expect((event as CustomEvent).detail).toBe('Resolved image escaped authorized roots');
+  });
+
+  it('keeps Markdown HTML embed errors specific through the feedback event and dialog', () => {
+    const eventTarget = new EventTarget();
+    vi.stubGlobal('window', eventTarget);
+    let emittedError: string | null = null;
+    const handler = (event: Event) => {
+      if (event instanceof CustomEvent && typeof event.detail === 'string') {
+        emittedError = event.detail;
+      }
+    };
+    eventTarget.addEventListener('mmd:app-feedback-error', handler);
+
+    emitAppFeedbackError('HTML embed target escaped the Markdown directory');
+
+    eventTarget.removeEventListener('mmd:app-feedback-error', handler);
+    vi.unstubAllGlobals();
+    expect(getFeedbackDialog({ notice: null, error: emittedError }, 'en')?.message).toBe(
+      'The embedded HTML page could not be displayed. Use a relative HTML path within the current workspace.',
+    );
   });
 });

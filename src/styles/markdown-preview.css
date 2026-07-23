@@ -1,4 +1,5 @@
 .mmd-preview-content.typora-jinxiu {
+  --mmd-preview-inline-padding: 3.5rem;
   max-width: 100%;
   min-height: 100%;
   padding: 2rem 3.5rem 4rem;
@@ -172,3 +173,35 @@
 .typora-jinxiu .jinxiu-text-diagram { white-space: pre; overflow-x: auto; font-family: "JetBrains Mono", ui-monospace, monospace; }
 .typora-jinxiu .mmd-mermaid-diagram { min-height: 1px; margin: 1.4rem 0; overflow-x: auto; color: var(--text-reading); }
 .typora-jinxiu .mmd-mermaid-diagram > svg { display: block; width: auto; max-width: 100%; height: auto; margin: 0 auto; }
+.typora-jinxiu .mmd-html-embed-viewport {
+  display: block;
+  margin-block: 1.4rem;
+  margin-inline: calc(0px - var(--mmd-preview-inline-padding));
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.typora-jinxiu .mmd-html-embed-viewport:focus-visible {
+  outline: 2px solid var(--theme-emphasis);
+  outline-offset: 2px;
+}
+.typora-jinxiu .mmd-html-embed-frame {
+  display: block;
+  width: 100%;
+  min-width: 720px;
+  height: min(70vh, 720px);
+  min-height: 360px;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+.typora-jinxiu .mmd-html-embed-status {
+  display: grid;
+  min-height: 180px;
+  margin: 1.4rem 0;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}

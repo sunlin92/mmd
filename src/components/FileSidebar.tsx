@@ -12,6 +12,7 @@ import {
   PencilRuler,
   Plus,
   RefreshCw,
+  TextCursorInput,
   Trash2,
 } from 'lucide-react';
 import {
@@ -39,6 +40,10 @@ import {
 } from '../lib/floatingMenuPosition';
 import { useI18n } from '../lib/i18n';
 import type { MarkdownOutlineItem } from '../lib/markdownOutline';
+import {
+  isMarkdownWorkspaceReferenceKind,
+  type MarkdownMediaInsertionTarget,
+} from '../lib/markdownMedia';
 import type { WorkspaceFileEntry, WorkspaceFileKind } from '../types';
 import { FileTreeRows } from './FileTreeRows';
 
@@ -56,7 +61,7 @@ interface FileSidebarProps {
   ) => void;
   onCreateFolder: (parentPath: string, parentName: string) => void;
   onDeleteEntry: (path: string, name: string, kind: 'file' | 'folder') => void;
-  onInsertWorkspaceAsset?: (asset: WorkspaceFileEntry, position: { clientX: number; clientY: number }) => void;
+  onInsertWorkspaceAsset?: (asset: WorkspaceFileEntry, target: MarkdownMediaInsertionTarget) => void;
   onMoveEntry: (path: string, destinationParentPath: string) => void;
   onOpenFile: (path: string) => void;
   onRefreshWorkspace: () => void;
@@ -100,6 +105,7 @@ function ContextMenuIcon({ action }: { action: FileTreeContextAction }) {
   if (action === 'create-file') return <FilePlus2 size={14} />;
   if (action === 'create-folder') return <FolderPlus size={14} />;
   if (action === 'open') return <FileText size={14} />;
+  if (action === 'insert-at-cursor') return <TextCursorInput size={14} />;
   if (action === 'refresh') return <RefreshCw size={14} />;
   if (action === 'rename') return <Pencil size={14} />;
   if (action === 'move') return <FolderInput size={14} />;
@@ -414,6 +420,12 @@ export function FileSidebar({
     else if (action === 'open' && target.kind === 'file') {
       closeMenus();
       onOpenFile(target.path);
+    } else if (action === 'insert-at-cursor' && target.kind === 'file') {
+      const asset = findWorkspaceFileEntry(fileTreeRef.current, target.path);
+      closeMenus();
+      if (asset && isMarkdownWorkspaceReferenceKind(asset.kind)) {
+        onInsertWorkspaceAssetRef.current?.(asset, { kind: 'cursor' });
+      }
     } else if (action === 'refresh') {
       closeMenus();
       onRefreshWorkspace();
@@ -528,6 +540,7 @@ export function FileSidebar({
           const mediaAsset = getPointerMediaAsset(session.source, event.clientX, event.clientY);
           if (mediaAsset) {
             onInsertWorkspaceAssetRef.current?.(mediaAsset, {
+              kind: 'coordinates',
               clientX: event.clientX,
               clientY: event.clientY,
             });
@@ -882,7 +895,9 @@ export function FileSidebar({
                   }}
                   onContextMenu={(event) => event.preventDefault()}
                 >
-                  {getFileTreeContextMenuItems(contextMenu.target).map((item) => (
+                  {getFileTreeContextMenuItems(contextMenu.target, {
+                    canInsertWorkspaceAsset: Boolean(onInsertWorkspaceAsset),
+                  }).map((item) => (
                     <button
                       key={item.action}
                       type="button"
@@ -896,7 +911,7 @@ export function FileSidebar({
                       onClick={() => runContextAction(item.action)}
                     >
                       <ContextMenuIcon action={item.action} />
-                      <span>{item.action === 'create-file' ? t('newMarkdownFile') : item.action === 'create-folder' ? t('newFolder') : item.action === 'refresh' ? t('refreshWorkspace') : item.action === 'rename' ? t('rename') : item.action === 'move' ? `${t('move')}…` : item.action === 'delete' ? t('delete') : t('openDocument')}</span>
+                      <span>{item.action === 'create-file' ? t('newMarkdownFile') : item.action === 'create-folder' ? t('newFolder') : item.action === 'refresh' ? t('refreshWorkspace') : item.action === 'rename' ? t('rename') : item.action === 'move' ? `${t('move')}…` : item.action === 'delete' ? t('delete') : item.action === 'insert-at-cursor' ? t('insertAtCurrentCursor') : t('openDocument')}</span>
                       {item.shortcut && <kbd>{item.shortcut}</kbd>}
                     </button>
                   ))}

@@ -9,6 +9,7 @@ const appMocks = vi.hoisted(() => ({
   editorPane: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   excalidrawPane: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   emit: vi.fn<(event: string, payload: unknown) => Promise<void>>(),
+  emitTo: vi.fn<(target: string, event: string, payload: unknown) => Promise<void>>(),
   jinxiuMarkdown: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   paneResizer: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   pdfPreview: vi.fn<(props: Record<string, unknown>) => null>(() => null),
@@ -21,6 +22,7 @@ const appMocks = vi.hoisted(() => ({
 
 vi.mock('@tauri-apps/api/event', () => ({
   emit: appMocks.emit,
+  emitTo: appMocks.emitTo,
   listen: appMocks.listen,
 }));
 vi.mock('./components/EditorPane', () => ({ EditorPane: appMocks.editorPane }));
@@ -116,6 +118,8 @@ describe('App outline navigation', () => {
     appMocks.editorPane.mockClear();
     appMocks.emit.mockReset();
     appMocks.emit.mockResolvedValue(undefined);
+    appMocks.emitTo.mockReset();
+    appMocks.emitTo.mockResolvedValue(undefined);
     appMocks.jinxiuMarkdown.mockClear();
     appMocks.paneResizer.mockClear();
     appMocks.pdfPreview.mockClear();

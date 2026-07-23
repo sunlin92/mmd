@@ -144,7 +144,7 @@ export function ExcalidrawPane({
     if (reportedInvalidSceneRef.current === errorToken) return;
     reportedInvalidSceneRef.current = errorToken;
     if (onInvalidSceneRef.current) onInvalidSceneRef.current('Invalid Excalidraw scene');
-    else emitAppFeedbackError('Invalid Excalidraw scene', locale);
+    else emitAppFeedbackError('Invalid Excalidraw scene');
   }, [content, documentToken, locale, prepared]);
 
   const handleChange = useCallback<ExcalidrawChange>((elements, appState, files) => {

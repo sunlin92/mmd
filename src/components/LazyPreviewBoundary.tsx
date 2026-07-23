@@ -36,7 +36,7 @@ class LazyPreviewErrorBoundary extends Component<
   }
 
   componentDidCatch(error: unknown, _errorInfo: ErrorInfo) {
-    emitAppFeedbackError(error, this.props.locale);
+    emitAppFeedbackError(error);
   }
 
   render() {

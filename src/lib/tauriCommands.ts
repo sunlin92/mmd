@@ -207,3 +207,24 @@ export function resolveWorkspaceMedia(path: string): Promise<string> {
 export function prepareHtmlPreview(path: string, content: string): Promise<string> {
   return invoke<string>('prepare_html_preview', { path, content });
 }
+
+export interface MarkdownHtmlEmbedLease {
+  url: string;
+  ownerId: number;
+}
+
+export function prepareMarkdownHtmlEmbed(
+  markdownPath: string,
+  htmlSrc: string,
+  workspaceRoot: string | null,
+): Promise<MarkdownHtmlEmbedLease> {
+  return invoke<MarkdownHtmlEmbedLease>('prepare_markdown_html_embed', {
+    markdownPath,
+    htmlSrc,
+    workspaceRoot,
+  });
+}
+
+export function releaseMarkdownHtmlEmbed(ownerId: number): Promise<void> {
+  return invoke<void>('release_markdown_html_embed', { ownerId });
+}

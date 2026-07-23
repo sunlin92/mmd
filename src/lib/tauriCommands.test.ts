@@ -8,6 +8,8 @@ import {
   openFileDialog,
   persistWorkspaceSession,
   prepareHtmlPreview,
+  prepareMarkdownHtmlEmbed,
+  releaseMarkdownHtmlEmbed,
   readWorkspaceImage,
   refreshDirectory,
   renameWorkspaceEntry,
@@ -468,6 +470,37 @@ describe('Tauri command wrappers', () => {
     expect(invokeMock).toHaveBeenCalledWith('prepare_html_preview', {
       path: '/workspace/site/index.html',
       content: '<h1>Draft</h1>',
+    });
+  });
+
+  it('prepares a Markdown HTML embed from its document-relative source', async () => {
+    invokeMock.mockResolvedValue({
+      url: 'http://127.0.0.1:43127/demos/counter.html',
+      ownerId: 41,
+    });
+
+    await expect(prepareMarkdownHtmlEmbed(
+      '/workspace/docs/guide.md',
+      '../demos/counter.html',
+      '/workspace',
+    )).resolves.toEqual({
+      url: 'http://127.0.0.1:43127/demos/counter.html',
+      ownerId: 41,
+    });
+    expect(invokeMock).toHaveBeenCalledWith('prepare_markdown_html_embed', {
+      htmlSrc: '../demos/counter.html',
+      markdownPath: '/workspace/docs/guide.md',
+      workspaceRoot: '/workspace',
+    });
+  });
+
+  it('releases a Markdown HTML embed owner through its focused command', async () => {
+    invokeMock.mockResolvedValue(undefined);
+
+    await expect(releaseMarkdownHtmlEmbed(41)).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenCalledWith('release_markdown_html_embed', {
+      ownerId: 41,
     });
   });
 

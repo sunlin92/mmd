@@ -27,7 +27,10 @@
   .pdf-preview-viewport { gap: 14px; padding: 16px; }
   .docx-preview-viewport { padding: 16px; }
   .docx-preview-document { padding: 36px 40px; }
-  .mmd-preview-content.typora-jinxiu { padding: 1.5rem; }
+  .mmd-preview-content.typora-jinxiu {
+    --mmd-preview-inline-padding: 1.5rem;
+    padding: 1.5rem;
+  }
 }
 
 @media (max-width: 640px) {

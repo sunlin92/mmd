@@ -168,6 +168,26 @@ describe('pane window adapter', () => {
     expect(announceCurrentState).toHaveBeenCalledOnce();
   });
 
+  it('forwards_an_editor_instance_id_when_creating_a_popout', async () => {
+    const handle: PaneWindowHandle = {
+      focus: vi.fn<PaneWindowHandle['focus']>(),
+      destroy: vi.fn<PaneWindowHandle['destroy']>(),
+    };
+    const backend: PaneWindowBackend = {
+      lookup: vi.fn<PaneWindowBackend['lookup']>().mockResolvedValue(null),
+      create: vi.fn<PaneWindowBackend['create']>().mockResolvedValue(handle),
+      listenDestroyed: vi.fn<PaneWindowBackend['listenDestroyed']>(),
+    };
+    const controller = new PanePopoutController(new PaneWindowAdapter(backend));
+
+    await expect(controller.open('editor', async () => undefined, 'editor:instance-1')).resolves.toEqual({
+      status: 'created',
+      pane: 'editor',
+    });
+
+    expect(backend.create).toHaveBeenCalledWith('editor', 'editor:instance-1');
+  });
+
   it('tracks_existing_window_and_returns_destroyed_listener_cleanup', async () => {
     const existingHandle: PaneWindowHandle = {
       focus: vi.fn<PaneWindowHandle['focus']>(),

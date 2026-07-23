@@ -408,12 +408,11 @@ describe('EditorPane', () => {
           documentEpoch={1}
           documentId="document-guide"
           mediaInsertion={{
-            clientX: 120,
-            clientY: 80,
             documentEpoch: 1,
             documentId: 'document-guide',
             markdown: '![cover.png](assets/cover.png)',
             requestId: 1,
+            target: { kind: 'coordinates', clientX: 120, clientY: 80 },
           }}
           onContentChange={onContentChange}
         />,
@@ -424,6 +423,49 @@ describe('EditorPane', () => {
     expect(view.state.doc.toString()).toBe('before ![cover.png](assets/cover.png)after');
     expect(view.state.selection.main.head).toBe(37);
     expect(onContentChange).toHaveBeenCalledWith('before ![cover.png](assets/cover.png)after');
+
+    act(() => undo(view));
+    expect(view.state.doc.toString()).toBe(content);
+  });
+
+  it('inserts a context-menu media reference at the current cursor', () => {
+    const content = 'before after';
+    const onContentChange = vi.fn<(nextContent: string) => void>();
+    act(() => root.render(
+      <EditorPane
+        activePath="/workspace/guide.md"
+        content={content}
+        documentEpoch={1}
+        documentId="document-guide"
+        onContentChange={onContentChange}
+      />,
+    ));
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: 7 } }));
+    const posAtCoords = vi.spyOn(view, 'posAtCoords');
+
+    act(() => root.render(
+      <EditorPane
+        activePath="/workspace/guide.md"
+        content={content}
+        documentEpoch={1}
+        documentId="document-guide"
+        mediaInsertion={{
+          documentEpoch: 1,
+          documentId: 'document-guide',
+          markdown: '[intro.mp3](audio/intro.mp3)',
+          requestId: 1,
+          target: { kind: 'cursor' },
+        }}
+        onContentChange={onContentChange}
+      />,
+    ));
+
+    expect(posAtCoords).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe('before [intro.mp3](audio/intro.mp3)after');
+    expect(onContentChange).toHaveBeenCalledWith('before [intro.mp3](audio/intro.mp3)after');
 
     act(() => undo(view));
     expect(view.state.doc.toString()).toBe(content);
@@ -440,12 +482,11 @@ describe('EditorPane', () => {
           documentId="document-guide"
           editable={false}
           mediaInsertion={{
-            clientX: 120,
-            clientY: 80,
             documentEpoch: 1,
             documentId: 'document-guide',
             markdown: '![cover.png](assets/cover.png)',
             requestId: 1,
+            target: { kind: 'coordinates', clientX: 120, clientY: 80 },
           }}
           onContentChange={onContentChange}
         />,

@@ -35,7 +35,7 @@ export function WorkspaceImagePreview({ enabled = true, onPopout, paneRef, path,
       .catch((error: unknown) => {
         if (cancelled) return;
         setFailed(true);
-        emitAppFeedbackError(error, locale);
+        emitAppFeedbackError(error);
       });
     return () => {
       cancelled = true;
@@ -57,7 +57,7 @@ export function WorkspaceImagePreview({ enabled = true, onPopout, paneRef, path,
             onLoad={() => setLoaded(true)}
             onError={() => {
               setFailed(true);
-              emitAppFeedbackError('Image preview could not be displayed', locale);
+              emitAppFeedbackError('Image preview could not be displayed');
             }}
           />
         )}

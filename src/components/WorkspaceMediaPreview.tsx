@@ -45,7 +45,7 @@ export function WorkspaceMediaPreview({ enabled = true, kind, mimeType, onPopout
       .catch((error: unknown) => {
         if (cancelled) return;
         setFailed(true);
-        emitAppFeedbackError(error, locale);
+        emitAppFeedbackError(error);
       });
     return () => {
       cancelled = true;
@@ -68,7 +68,7 @@ export function WorkspaceMediaPreview({ enabled = true, kind, mimeType, onPopout
         if (disposed) return;
         if (!mpegts.isSupported()) {
           setFailed(true);
-          emitAppFeedbackError('Media playback is not supported by this WebView', locale);
+          emitAppFeedbackError('Media playback is not supported by this WebView');
           return;
         }
 
@@ -76,7 +76,7 @@ export function WorkspaceMediaPreview({ enabled = true, kind, mimeType, onPopout
         const handleError = () => {
           if (disposed) return;
           setFailed(true);
-          emitAppFeedbackError('Failed to play media', locale);
+          emitAppFeedbackError('Failed to play media');
         };
         const handleMediaInfo = () => {
           if (!disposed) setLoaded(true);
@@ -96,7 +96,7 @@ export function WorkspaceMediaPreview({ enabled = true, kind, mimeType, onPopout
       .catch((error: unknown) => {
         if (disposed) return;
         setFailed(true);
-        emitAppFeedbackError(error, locale);
+        emitAppFeedbackError(error);
       });
 
     return () => {
@@ -107,7 +107,7 @@ export function WorkspaceMediaPreview({ enabled = true, kind, mimeType, onPopout
 
   const handlePlaybackError = () => {
     setFailed(true);
-    emitAppFeedbackError('Failed to play media', locale);
+    emitAppFeedbackError('Failed to play media');
   };
 
   return (

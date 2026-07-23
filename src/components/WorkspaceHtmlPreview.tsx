@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { displayName } from '../lib/documentNames';
 import { emitAppFeedbackError } from '../lib/appFeedback';
+import { HTML_PREVIEW_SANDBOX } from '../lib/htmlPreviewPolicy';
 import { prepareHtmlPreview } from '../lib/tauriCommands';
 import { useI18n } from '../lib/i18n';
 
@@ -20,16 +21,6 @@ interface HtmlPreviewSurfaceProps extends HtmlPreviewFrameProps {
   loaded: boolean;
   onLoad: () => void;
 }
-
-const HTML_PREVIEW_SANDBOX = [
-  'allow-scripts',
-  'allow-same-origin',
-  'allow-forms',
-  'allow-modals',
-  'allow-popups',
-  'allow-popups-to-escape-sandbox',
-  'allow-downloads',
-].join(' ');
 
 function HtmlPreviewStatus({ busy, message, overlay = false }: { busy: boolean; message: string; overlay?: boolean }) {
   return (
@@ -100,7 +91,7 @@ export function WorkspaceHtmlPreview({ content, enabled = true, path }: Workspac
           if (!active || requestId !== requestIdRef.current) return;
           setPreview(null);
           setFailed(true);
-          emitAppFeedbackError(error, locale);
+          emitAppFeedbackError(error);
         });
     }, 200);
 

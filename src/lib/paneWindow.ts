@@ -30,7 +30,7 @@ export interface PaneWindowHandle {
 
 export interface PaneWindowBackend {
   lookup(pane: PopoutCapablePane): Promise<PaneWindowHandle | null>;
-  create(pane: PopoutCapablePane): Promise<PaneWindowHandle>;
+  create(pane: PopoutCapablePane, instanceId?: string): Promise<PaneWindowHandle>;
   listenDestroyed(pane: PopoutCapablePane, listener: () => void): Promise<() => void>;
 }
 
@@ -50,9 +50,12 @@ export class PaneWindowAdapter {
     }
   }
 
-  async create(pane: PopoutCapablePane): Promise<PaneWindowOutcome<PaneWindowHandle>> {
+  async create(pane: PopoutCapablePane, instanceId?: string): Promise<PaneWindowOutcome<PaneWindowHandle>> {
     try {
-      return { status: 'succeeded', value: await this.backend.create(pane) };
+      const handle = instanceId === undefined
+        ? await this.backend.create(pane)
+        : await this.backend.create(pane, instanceId);
+      return { status: 'succeeded', value: handle };
     } catch (error) {
       return { status: 'failed', failure: this.failure('create-window', pane, error) };
     }
@@ -100,11 +103,12 @@ export class PanePopoutController {
   open(
     pane: PopoutCapablePane,
     announceCurrentState: () => Promise<void>,
+    instanceId?: string,
   ): Promise<PanePopoutOpenOutcome> {
     const inFlight = this.openOperations.get(pane);
     if (inFlight) return inFlight;
 
-    const operation = this.openOnce(pane, announceCurrentState).finally(() => {
+    const operation = this.openOnce(pane, announceCurrentState, instanceId).finally(() => {
       if (this.openOperations.get(pane) === operation) this.openOperations.delete(pane);
     });
     this.openOperations.set(pane, operation);
@@ -114,6 +118,7 @@ export class PanePopoutController {
   private async openOnce(
     pane: PopoutCapablePane,
     announceCurrentState: () => Promise<void>,
+    instanceId?: string,
   ): Promise<PanePopoutOpenOutcome> {
     const lookup = await this.windows.lookup(pane);
     if (lookup.status === 'failed') return lookup;
@@ -124,7 +129,7 @@ export class PanePopoutController {
       return { status: 'existing', pane };
     }
 
-    const create = await this.windows.create(pane);
+    const create = await this.windows.create(pane, instanceId);
     if (create.status === 'failed') return create;
     await announceCurrentState();
     return { status: 'created', pane };

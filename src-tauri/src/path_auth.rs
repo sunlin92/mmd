@@ -402,6 +402,21 @@ pub(crate) struct DocumentGrantId(u64);
 pub(crate) struct PreviewLeaseId {
     generation: u64,
     document: PathBuf,
+    authority_anchor: Option<PathBuf>,
+}
+
+impl PreviewLeaseId {
+    fn references_path(&self, path: &Path) -> bool {
+        self.document == path || self.authority_anchor.as_deref() == Some(path)
+    }
+
+    fn intersects_prefix(&self, prefix: &Path) -> bool {
+        path_is_under(&self.document, prefix)
+            || self
+                .authority_anchor
+                .as_deref()
+                .is_some_and(|anchor| path_is_under(anchor, prefix))
+    }
 }
 
 pub(crate) enum PreviewRetirementError {
@@ -767,7 +782,11 @@ impl AuthorizationState {
         Ok(DocumentGrantId(id))
     }
 
-    fn allocate_preview_lease(&mut self, document: PathBuf) -> Result<PreviewLeaseId, String> {
+    fn allocate_preview_lease(
+        &mut self,
+        document: PathBuf,
+        authority_anchor: Option<PathBuf>,
+    ) -> Result<PreviewLeaseId, String> {
         let generation = self.next_preview_lease_id;
         self.next_preview_lease_id = generation
             .checked_add(1)
@@ -775,6 +794,7 @@ impl AuthorizationState {
         Ok(PreviewLeaseId {
             generation,
             document,
+            authority_anchor,
         })
     }
 
@@ -822,38 +842,47 @@ impl AuthorizationState {
 
         preview_leases
             .into_iter()
-            .filter(|lease| {
-                let document_origins = self
-                    .grants
-                    .iter()
-                    .filter(|(_, ledger)| ledger.is_active())
-                    .filter_map(|(key, ledger)| match key {
-                        GrantKey::ExactReadWrite(path) if path == &lease.document => {
-                            Some(&ledger.origins)
-                        }
-                        GrantKey::DirectoryRead(root)
-                            if path_is_under(&lease.document, root) =>
-                        {
-                            Some(&ledger.origins)
-                        }
-                        _ => None,
-                    })
-                    .flat_map(HashMap::keys)
-                    .filter(|origin| !matches!(origin, GrantOrigin::Preview(_)))
-                    .cloned()
-                    .collect::<HashSet<_>>();
-
-                !self.grants.iter().any(|(key, ledger)| {
-                    ledger.is_active()
-                        && matches!(key, GrantKey::DirectoryRead(root) | GrantKey::InternalAsset(root)
-                            if path_is_under(&lease.document, root))
-                        && ledger.origins.keys().any(|origin| {
-                            !matches!(origin, GrantOrigin::Preview(_))
-                                && document_origins.contains(origin)
-                        })
-                })
-            })
+            .filter(|lease| !self.preview_lease_is_supported(lease))
             .collect()
+    }
+
+    fn preview_lease_is_supported(&self, lease: &PreviewLeaseId) -> bool {
+        let authority_document = lease.authority_anchor.as_deref().unwrap_or(&lease.document);
+        let authority_origins = self
+            .grants
+            .iter()
+            .filter(|(_, ledger)| ledger.is_active())
+            .filter_map(|(key, ledger)| match key {
+                GrantKey::ExactReadWrite(path) if path == authority_document => {
+                    Some(&ledger.origins)
+                }
+                GrantKey::DirectoryRead(root) if path_is_under(authority_document, root) => {
+                    Some(&ledger.origins)
+                }
+                _ => None,
+            })
+            .flat_map(HashMap::keys)
+            .filter(|origin| !matches!(origin, GrantOrigin::Preview(_)))
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        self.grants.iter().any(|(key, ledger)| {
+            ledger.is_active()
+                && matches!(key, GrantKey::DirectoryRead(root) | GrantKey::InternalAsset(root)
+                    if path_is_under(&lease.document, root)
+                        && path_is_under(authority_document, root))
+                && ledger.origins.keys().any(|origin| {
+                    !matches!(origin, GrantOrigin::Preview(_)) && authority_origins.contains(origin)
+                })
+        })
+    }
+
+    fn preview_lease_is_active_and_supported(&self, lease: &PreviewLeaseId) -> bool {
+        let origin = GrantOrigin::Preview(lease.clone());
+        self.grants
+            .values()
+            .any(|ledger| ledger.is_active() && ledger.origins.contains_key(&origin))
+            && self.preview_lease_is_supported(lease)
     }
 
     #[cfg(test)]
@@ -889,8 +918,8 @@ impl AuthorizationState {
                         GrantOrigin::Preview(lease)
                             if path_is_under(key.path(), old_prefix)
                                 || path_is_under(key.path(), new_prefix)
-                                || path_is_under(&lease.document, old_prefix)
-                                || path_is_under(&lease.document, new_prefix) =>
+                                || lease.intersects_prefix(old_prefix)
+                                || lease.intersects_prefix(new_prefix) =>
                         {
                             Some(lease.clone())
                         }
@@ -924,7 +953,9 @@ impl AuthorizationState {
             .values()
             .flat_map(|ledger| {
                 ledger.origins.keys().filter_map(|origin| match origin {
-                    GrantOrigin::Preview(lease) if lease.document == path => Some(lease.clone()),
+                    GrantOrigin::Preview(lease) if lease.references_path(path) => {
+                        Some(lease.clone())
+                    }
                     _ => None,
                 })
             })
@@ -988,7 +1019,9 @@ impl AuthorizationState {
             .flat_map(|(key, ledger)| {
                 ledger.origins.keys().filter_map(|origin| match origin {
                     GrantOrigin::Preview(lease)
-                        if is_affected(key.path()) || is_affected(&lease.document) =>
+                        if is_affected(key.path())
+                            || lease.intersects_prefix(old_prefix)
+                            || lease.intersects_prefix(new_prefix) =>
                     {
                         Some(lease.clone())
                     }
@@ -1009,8 +1042,7 @@ impl AuthorizationState {
             .flat_map(|(key, ledger)| {
                 ledger.origins.keys().filter_map(|origin| match origin {
                     GrantOrigin::Preview(lease)
-                        if path_is_under(key.path(), prefix)
-                            || path_is_under(&lease.document, prefix) =>
+                        if path_is_under(key.path(), prefix) || lease.intersects_prefix(prefix) =>
                     {
                         Some(lease.clone())
                     }
@@ -1045,7 +1077,7 @@ impl AuthorizationState {
                     .filter_map(move |origin| match origin {
                         GrantOrigin::Preview(lease)
                             if path_is_under(key.path(), prefix)
-                                || path_is_under(&lease.document, prefix) =>
+                                || lease.intersects_prefix(prefix) =>
                         {
                             Some(lease.clone())
                         }
@@ -2017,7 +2049,7 @@ impl FileAuthorizationSession {
             .ok_or_else(|| {
                 "File is outside the user-authorized session files and directories".to_string()
             })?;
-        let lease = state.allocate_preview_lease(document.clone())?;
+        let lease = state.allocate_preview_lease(document.clone(), None)?;
         state.grant_once(
             GrantKey::InternalAsset(root.clone()),
             GrantOrigin::Preview(lease.clone()),
@@ -2027,6 +2059,123 @@ impl FileAuthorizationSession {
             root,
             lease,
         })
+    }
+
+    #[cfg(test)]
+    fn preview_scope_for_anchored_file(
+        &self,
+        anchor: impl AsRef<Path>,
+        file: impl AsRef<Path>,
+    ) -> Result<AuthorizedPreviewScope, String> {
+        self.preview_scope_for_anchored_file_with_root(anchor, file, None)
+    }
+
+    fn preview_scope_for_anchored_file_with_root(
+        &self,
+        anchor: impl AsRef<Path>,
+        file: impl AsRef<Path>,
+        workspace_root: Option<&Path>,
+    ) -> Result<AuthorizedPreviewScope, String> {
+        let anchor = normalize_existing_path(anchor)?;
+        let document = normalize_existing_path(file)?;
+        if !anchor.is_file() || !document.is_file() {
+            return Err("Path is not a file".into());
+        }
+        let workspace_root = workspace_root.map(normalize_existing_path).transpose()?;
+        if workspace_root.as_ref().is_some_and(|root| !root.is_dir()) {
+            return Err("Workspace root is not a directory".into());
+        }
+        let mut state = self.lock()?;
+        let anchor_origins = state
+            .grants
+            .iter()
+            .filter(|(_, ledger)| ledger.is_active())
+            .filter_map(|(key, ledger)| match key {
+                GrantKey::ExactReadWrite(path) if path == &anchor => Some(&ledger.origins),
+                GrantKey::DirectoryRead(root) if path_is_under(&anchor, root) => {
+                    Some(&ledger.origins)
+                }
+                _ => None,
+            })
+            .flat_map(HashMap::keys)
+            .filter(|origin| !matches!(origin, GrantOrigin::Preview(_)))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let root = if let Some(root) = workspace_root {
+            if !path_is_under(&anchor, &root) || !path_is_under(&document, &root) {
+                return Err("HTML embed escaped the authorized workspace".to_string());
+            }
+            let workspace_is_shared = state.grants.iter().any(|(key, ledger)| {
+                ledger.is_active()
+                    && matches!(key,
+                        GrantKey::DirectoryRead(grant_root) | GrantKey::InternalAsset(grant_root)
+                            if grant_root == &root)
+                    && ledger
+                        .origins
+                        .keys()
+                        .any(|origin| anchor_origins.contains(origin))
+            });
+            if !workspace_is_shared {
+                return Err(
+                    "HTML embed workspace is not authorized by the Markdown file's active scope"
+                        .to_string(),
+                );
+            }
+            document
+                .parent()
+                .ok_or_else(|| "HTML embed file has no parent directory".to_string())?
+                .to_path_buf()
+        } else {
+            let scope_is_authorized = state
+                .grants
+                .iter()
+                .filter(|(_, ledger)| ledger.is_active())
+                .any(|(key, ledger)| {
+                    matches!(key,
+                        GrantKey::DirectoryRead(root) | GrantKey::InternalAsset(root)
+                            if path_is_under(&anchor, root)
+                                && path_is_under(&document, root)
+                                && ledger
+                                    .origins
+                                    .keys()
+                                    .any(|origin| anchor_origins.contains(origin))
+                    )
+                });
+            if !scope_is_authorized {
+                return Err(
+                    "HTML embed is outside the Markdown file's authorized scope".to_string()
+                );
+            }
+            let root = anchor
+                .parent()
+                .ok_or_else(|| "Markdown file has no parent directory".to_string())?
+                .to_path_buf();
+            if !path_is_under(&document, &root) {
+                return Err("HTML embed escaped the Markdown directory".to_string());
+            }
+            root
+        };
+        let lease = state.allocate_preview_lease(document.clone(), Some(anchor.clone()))?;
+        state.grant_once(
+            GrantKey::InternalAsset(root.clone()),
+            GrantOrigin::Preview(lease.clone()),
+        );
+        Ok(AuthorizedPreviewScope {
+            document,
+            root,
+            lease,
+        })
+    }
+
+    fn preview_lease_support_statuses(
+        &self,
+        leases: &[&PreviewLeaseId],
+    ) -> Result<Vec<bool>, String> {
+        let state = self.lock()?;
+        Ok(leases
+            .iter()
+            .map(|lease| state.preview_lease_is_active_and_supported(lease))
+            .collect())
     }
 
     #[cfg(test)]
@@ -2625,10 +2774,143 @@ pub(crate) fn preview_scope_for_file_inner(
 }
 
 #[cfg(test)]
+pub(crate) fn preview_scope_for_anchored_file_inner(
+    state: &AppState,
+    anchor: impl AsRef<Path>,
+    file: impl AsRef<Path>,
+) -> Result<AuthorizedPreviewScope, String> {
+    state
+        .file_authorization()
+        .preview_scope_for_anchored_file(anchor, file)
+}
+
+pub(crate) fn preview_scope_for_anchored_file_with_root_inner(
+    state: &AppState,
+    anchor: impl AsRef<Path>,
+    file: impl AsRef<Path>,
+    workspace_root: Option<&Path>,
+) -> Result<AuthorizedPreviewScope, String> {
+    state
+        .file_authorization()
+        .preview_scope_for_anchored_file_with_root(anchor, file, workspace_root)
+}
+
+pub(crate) fn preview_lease_support_statuses_inner(
+    state: &AppState,
+    leases: &[&PreviewLeaseId],
+) -> Result<Vec<bool>, String> {
+    state
+        .file_authorization()
+        .preview_lease_support_statuses(leases)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::html_preview_server::prepare_html_preview_inner;
     use tempfile::tempdir;
+
+    #[test]
+    fn anchored_workspace_preview_lease_remains_supported() {
+        let workspace = tempdir().unwrap();
+        let notes = workspace.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        let markdown = notes.join("notes.md");
+        let html = notes.join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+
+        let scope = preview_scope_for_anchored_file_inner(&state, &markdown, &html).unwrap();
+        let authorization = state.file_authorization().lock().unwrap();
+
+        assert_eq!(scope.root(), normalize_existing_path(&notes).unwrap());
+        assert!(!authorization
+            .unsupported_preview_leases()
+            .contains(scope.lease()));
+    }
+
+    #[test]
+    fn workspace_anchored_embed_scope_is_limited_to_the_html_directory() {
+        let workspace = tempdir().unwrap();
+        let notes = workspace.path().join("notes");
+        let shared = workspace.path().join("shared");
+        fs::create_dir(&notes).unwrap();
+        fs::create_dir(&shared).unwrap();
+        let markdown = notes.join("guide.md");
+        let html = shared.join("embed.html");
+        fs::write(&markdown, "# Guide").unwrap();
+        fs::write(&html, "<h1>Embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+
+        let scope = preview_scope_for_anchored_file_with_root_inner(
+            &state,
+            &markdown,
+            &html,
+            Some(workspace.path()),
+        )
+        .unwrap();
+
+        assert_eq!(scope.root(), normalize_existing_path(&shared).unwrap());
+        assert!(!state
+            .file_authorization()
+            .lock()
+            .unwrap()
+            .unsupported_preview_leases()
+            .contains(scope.lease()));
+    }
+
+    #[test]
+    fn standalone_markdown_authorizes_a_sibling_embed_without_html_write_access() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_file_inner(&state, markdown.clone()).unwrap();
+
+        let scope = preview_scope_for_anchored_file_inner(&state, &markdown, &html)
+            .expect("the Markdown document's internal-asset authority should cover siblings");
+
+        assert_eq!(
+            scope.root(),
+            normalize_existing_path(directory.path()).unwrap()
+        );
+        assert!(!state
+            .file_authorization()
+            .lock()
+            .unwrap()
+            .unsupported_preview_leases()
+            .contains(scope.lease()));
+        assert!(ensure_authorized_write_file_inner(&state, &html).is_err());
+    }
+
+    #[test]
+    fn relocating_a_markdown_anchor_invalidates_its_embed_lease() {
+        let workspace = tempdir().unwrap();
+        let markdown = workspace.path().join("notes.md");
+        let renamed_markdown = workspace.path().join("renamed.md");
+        let html = workspace.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Embed</h1>").unwrap();
+        let canonical_markdown = normalize_existing_path(&markdown).unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        let scope = preview_scope_for_anchored_file_inner(&state, &markdown, &html).unwrap();
+        let lease = scope.lease().clone();
+
+        fs::rename(&markdown, &renamed_markdown).unwrap();
+        let canonical_renamed_markdown = normalize_existing_path(&renamed_markdown).unwrap();
+        let invalidated = state
+            .file_authorization()
+            .relocate_path_prefix(&canonical_markdown, &canonical_renamed_markdown)
+            .unwrap();
+
+        assert!(invalidated.contains(&lease));
+    }
 
     #[test]
     fn normalize_new_path_rejects_parent_components() {
@@ -3445,6 +3727,22 @@ mod tests {
             );
         }
 
+        fn assert_preview_prepare_lock_order<T>(operation: impl FnOnce() -> Result<T, String>) {
+            let (result, events) = trace(operation);
+            result.unwrap();
+            assert_eq!(
+                events,
+                [
+                    LockEvent::AuthorizationAcquired,
+                    LockEvent::AuthorizationReleased,
+                    LockEvent::HtmlSitesAcquired,
+                    LockEvent::HtmlSitesReleased,
+                    LockEvent::AuthorizationAcquired,
+                    LockEvent::AuthorizationReleased,
+                ]
+            );
+        }
+
         let prepare_dir = tempdir().unwrap();
         let prepare_document = prepare_dir.path().join("prepare.html");
         fs::write(&prepare_document, "prepare").unwrap();
@@ -3453,7 +3751,7 @@ mod tests {
             .file_authorization()
             .authorize_file(&prepare_document)
             .unwrap();
-        assert_authorization_then_preview(|| {
+        assert_preview_prepare_lock_order(|| {
             prepare_html_preview_inner(&prepare_state, &prepare_document, "prepare")
         });
 
@@ -3576,6 +3874,8 @@ mod tests {
                 lock_order_test_probe::LockEvent::AuthorizationReleased,
                 lock_order_test_probe::LockEvent::HtmlSitesAcquired,
                 lock_order_test_probe::LockEvent::HtmlSitesReleased,
+                lock_order_test_probe::LockEvent::AuthorizationAcquired,
+                lock_order_test_probe::LockEvent::AuthorizationReleased,
                 lock_order_test_probe::LockEvent::AuthorizationAcquired,
                 lock_order_test_probe::LockEvent::AuthorizationReleased,
             ]

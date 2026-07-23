@@ -7,6 +7,7 @@ export type PopoutCapablePane = Exclude<PopoutPane, 'main'>;
 
 const MIN_EDITOR_RATIO = 0.25;
 const MAX_EDITOR_RATIO = 0.75;
+const POPOUT_INSTANCE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export function clampEditorPaneRatio(ratio: number): number {
   if (!Number.isFinite(ratio)) return 0.5;
@@ -46,12 +47,20 @@ export function parsePopoutPane(search: string): PopoutPane {
   return pane === 'editor' || pane === 'preview' ? pane : 'main';
 }
 
+export function parsePopoutInstanceId(search: string): string | null {
+  const instanceId = new URLSearchParams(search).get('instance');
+  return instanceId && POPOUT_INSTANCE_ID_PATTERN.test(instanceId) ? instanceId : null;
+}
+
 export function getPanePopoutLabel(pane: PopoutCapablePane): string {
   return pane === 'editor' ? 'mmd-editor-popout' : 'mmd-preview-popout';
 }
 
-export function getPanePopoutUrl(pane: PopoutCapablePane): string {
-  return `/?pane=${pane}`;
+export function getPanePopoutUrl(pane: PopoutCapablePane, instanceId?: string): string {
+  if (pane !== 'editor' || !instanceId || !POPOUT_INSTANCE_ID_PATTERN.test(instanceId)) {
+    return `/?pane=${pane}`;
+  }
+  return `/?pane=${pane}&instance=${encodeURIComponent(instanceId)}`;
 }
 
 export interface PanePopoutButtonState {

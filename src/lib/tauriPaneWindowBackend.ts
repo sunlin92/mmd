@@ -10,9 +10,9 @@ function paneWindowHandle(webview: WebviewWindow): PaneWindowHandle {
   };
 }
 
-function paneWindowOptions(pane: PopoutCapablePane) {
+function paneWindowOptions(pane: PopoutCapablePane, instanceId?: string) {
   return {
-    url: getPanePopoutUrl(pane),
+    url: getPanePopoutUrl(pane, instanceId),
     title: pane === 'editor' ? 'MMD Editor' : 'MMD Live Preview',
     width: pane === 'editor' ? 760 : 900,
     height: 760,
@@ -27,8 +27,8 @@ export class TauriPaneWindowBackend implements PaneWindowBackend {
     return webview ? paneWindowHandle(webview) : null;
   }
 
-  create(pane: PopoutCapablePane): Promise<PaneWindowHandle> {
-    const webview = new WebviewWindow(getPanePopoutLabel(pane), paneWindowOptions(pane));
+  create(pane: PopoutCapablePane, instanceId?: string): Promise<PaneWindowHandle> {
+    const webview = new WebviewWindow(getPanePopoutLabel(pane), paneWindowOptions(pane, instanceId));
     const handle = paneWindowHandle(webview);
 
     return new Promise((resolve, reject) => {

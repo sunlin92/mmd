@@ -29,7 +29,10 @@ use commands::{
     set_native_locale_preference, set_native_save_menu_enabled, set_native_theme_preference,
     write_file,
 };
-use html_preview_server::prepare_html_preview;
+use html_preview_server::{
+    prepare_html_preview, prepare_markdown_html_embed, release_markdown_html_embed,
+    release_markdown_html_embed_window_inner,
+};
 use state::AppState;
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
@@ -83,6 +86,7 @@ pub fn run() {
                 if let Ok(recent_files) = state.recent_files() {
                     let _ = recent_files.remove_owner(window.label());
                 }
+                let _ = release_markdown_html_embed_window_inner(&state, window.label());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -114,6 +118,8 @@ pub fn run() {
             read_workspace_image,
             resolve_workspace_media,
             prepare_html_preview,
+            prepare_markdown_html_embed,
+            release_markdown_html_embed,
             start_active_document_watch,
             activate_active_document_watch,
             reconcile_active_document_watch,

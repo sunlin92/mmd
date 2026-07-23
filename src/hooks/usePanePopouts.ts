@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { getPanePopoutButtonState, type PopoutCapablePane } from '../lib/paneLayout';
 import { PanePopoutController, PaneWindowAdapter } from '../lib/paneWindow';
+import type { PanePopoutOpenOutcome } from '../lib/paneWindow';
 import { getPopoutOpenErrorMessage } from '../lib/popoutFeedback';
 import { TauriPaneWindowBackend } from '../lib/tauriPaneWindowBackend';
 import { useI18n } from '../lib/i18n';
@@ -59,20 +60,29 @@ export function usePanePopouts({ broadcastPaneState, isPopout, setError, setNoti
     };
   }, [isPopout, setError, updatePopoutState]);
 
-  const openPanePopout = useCallback(async (pane: PopoutCapablePane) => {
+  const openPanePopout = useCallback(async (
+    pane: PopoutCapablePane,
+    instanceId?: string,
+  ): Promise<PanePopoutOpenOutcome> => {
     setError(null);
     setNotice(null);
     try {
-      const outcome = await panePopoutController.open(pane, broadcastPaneState);
+      const outcome = await panePopoutController.open(pane, broadcastPaneState, instanceId);
       if (outcome.status === 'failed') {
         updatePopoutState(pane, false);
         setError(outcome.failure.message);
-        return;
+        return outcome;
       }
       updatePopoutState(pane, true);
+      return outcome;
     } catch (err) {
       updatePopoutState(pane, false);
-      setError(getPopoutOpenErrorMessage(pane, err, locale));
+      const message = getPopoutOpenErrorMessage(pane, err, locale);
+      setError(message);
+      return {
+        status: 'failed',
+        failure: { operation: 'lookup-window', pane, message },
+      };
     }
   }, [broadcastPaneState, locale, setError, setNotice, updatePopoutState]);
 

@@ -12,7 +12,9 @@ import 'katex/dist/katex.min.css';
 import '../../public/styles/typora-theme/typora-jinxiu.css';
 import { mapH2ChildrenWrapHeadingSymbols } from '../lib/headingPunct';
 import { preprocessMarkdown } from '../lib/markdownPreprocess';
+import { isLocalMarkdownHtmlEmbedSource, rehypeMarkdownHtmlEmbeds } from '../lib/markdownHtmlEmbed';
 import AdaptiveMarkdownImage from './AdaptiveMarkdownImage';
+import { MarkdownHtmlFrame } from './MarkdownHtmlFrame';
 import { CodeBlock } from './markdown/CodeBlock';
 import { MermaidDiagram } from './markdown/MermaidDiagram';
 import { classNameToString, normalizeFenceLanguage, parseFenceLangTokenFromClasses } from './markdown/markdownLanguage';
@@ -70,11 +72,38 @@ export default function JinxiuMarkdown({ children, currentFilePath, localAssetsE
       const cn = [paragraphIsSingleUrlLine(c) ? 'jinxiu-qa-p-url-nowrap' : '', paragraphLooksLikeTextDiagram(plain) ? 'jinxiu-text-diagram' : '', className].filter(Boolean).join(' ') || undefined;
       return <p {...props} className={cn}>{c}</p>;
     },
-    a: ({ href, children: c, ...props }) => {
+    a: ({ href, title, children: c, ...props }) => {
+      if (
+        title === 'mmd:embed'
+        && typeof href === 'string'
+        && isLocalMarkdownHtmlEmbedSource(href, {
+          currentFilePath: deferredCurrentFilePath,
+          workspaceRoot: deferredWorkspaceRoot,
+        })
+      ) {
+        return (
+          <MarkdownHtmlFrame
+            currentFilePath={deferredCurrentFilePath}
+            enabled={deferredLocalAssetsEnabled}
+            htmlSrc={href}
+            title={extractText(c).trim() || undefined}
+            workspaceRoot={deferredWorkspaceRoot}
+          />
+        );
+      }
       const external = typeof href === 'string' && (/^https?:\/\//i.test(href) || href.startsWith('//'));
-      return <a href={href} {...props} {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}>{c}</a>;
+      return <a href={href} title={title} {...props} {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}>{c}</a>;
     },
     img: ({ src, alt, title, ...props }) => <AdaptiveMarkdownImage {...props} src={src} alt={alt ?? ''} title={title} currentFilePath={deferredCurrentFilePath} localAssetsEnabled={deferredLocalAssetsEnabled} workspaceRoot={deferredWorkspaceRoot} />,
+    iframe: ({ src, title }) => (
+      <MarkdownHtmlFrame
+        currentFilePath={deferredCurrentFilePath}
+        enabled={deferredLocalAssetsEnabled}
+        htmlSrc={src ?? ''}
+        title={title}
+        workspaceRoot={deferredWorkspaceRoot}
+      />
+    ),
     blockquote: ({ node, children: c, className, ...props }) => {
       const cn = [className, BLOCKQUOTE_TREE_HEURISTIC_RE.test(hastCollectPlainText(node)) ? 'jinxiu-bq-tree' : ''].filter(Boolean).join(' ') || undefined;
       return <blockquote {...props} className={cn}>{c}</blockquote>;
@@ -96,7 +125,7 @@ export default function JinxiuMarkdown({ children, currentFilePath, localAssetsE
     <div className="typora-jinxiu mmd-preview-content">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks, remarkCjkFriendly, remarkMath, remarkGithubAlerts] as never}
-        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]] as never}
+        rehypePlugins={[rehypeMarkdownHtmlEmbeds, [rehypeKatex, { throwOnError: false, strict: false }]] as never}
         components={components}
       >
         {source}

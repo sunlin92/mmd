@@ -326,8 +326,10 @@ export function EditorPane({ activePath, content, documentEpoch, documentId, edi
     ) return;
     const insertionKey = `${mediaInsertion.documentId}:${mediaInsertion.documentEpoch}:${mediaInsertion.requestId}`;
     if (lastHandledMediaInsertionRef.current === insertionKey) return;
-    const position = view.posAtCoords({ x: mediaInsertion.clientX, y: mediaInsertion.clientY })
-      ?? view.state.selection.main.head;
+    const position = mediaInsertion.target.kind === 'coordinates'
+      ? view.posAtCoords({ x: mediaInsertion.target.clientX, y: mediaInsertion.target.clientY })
+        ?? view.state.selection.main.head
+      : view.state.selection.main.head;
     lastHandledMediaInsertionRef.current = insertionKey;
     view.dispatch({
       changes: { from: position, insert: mediaInsertion.markdown },

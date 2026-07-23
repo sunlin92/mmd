@@ -10,6 +10,7 @@ import { APP_FEEDBACK_ERROR_EVENT } from './lib/appFeedback';
 const appMocks = vi.hoisted(() => ({
   editorPane: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   docxPreview: vi.fn<(props: Record<string, unknown>) => null>(() => null),
+  emitTo: vi.fn<(target: string, event: string, payload: unknown) => Promise<void>>(),
   excalidrawPane: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   jinxiuMarkdown: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   paneResizer: vi.fn<(props: Record<string, unknown>) => null>(() => null),
@@ -27,6 +28,7 @@ const appMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
+  emitTo: appMocks.emitTo,
   listen: vi.fn<() => Promise<() => void>>(async () => () => undefined),
 }));
 vi.mock('./hooks/useDocumentSession', () => ({
@@ -241,6 +243,8 @@ describe('App binary document composition', () => {
     root = createRoot(container);
     appMocks.editorPane.mockClear();
     appMocks.docxPreview.mockClear();
+    appMocks.emitTo.mockReset();
+    appMocks.emitTo.mockResolvedValue(undefined);
     appMocks.excalidrawPane.mockClear();
     appMocks.jinxiuMarkdown.mockClear();
     appMocks.paneResizer.mockClear();

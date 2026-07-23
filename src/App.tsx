@@ -8,7 +8,7 @@ import {
   useState,
   type ComponentProps,
 } from 'react';
-import { emit, listen } from '@tauri-apps/api/event';
+import { emit, emitTo, listen } from '@tauri-apps/api/event';
 import { AppToolbar } from './components/AppToolbar';
 import type { DocxPreviewFeedback } from './components/DocxPreview';
 import { EditorPane } from './components/EditorPane';
@@ -42,7 +42,13 @@ import {
   isNativeSaveMenuEnabled,
   NATIVE_MENU_EVENT,
 } from './lib/nativeMenu';
-import { getPaneLayoutStyle, parsePopoutPane } from './lib/paneLayout';
+import {
+  getPaneLayoutStyle,
+  getPanePopoutLabel,
+  parsePopoutInstanceId,
+  parsePopoutPane,
+} from './lib/paneLayout';
+import { loadLazyModuleWithRetry } from './lib/lazyModule';
 import {
   decodeMarkdownOutlineJump,
   extractMarkdownOutline,
@@ -52,8 +58,22 @@ import {
 } from './lib/markdownOutline';
 import {
   createMarkdownMediaReference,
+  decodeMarkdownMediaCursorInsertion,
+  decodeMarkdownMediaInsertionHandshake,
+  decodeMarkdownMediaInsertionReady,
+  decodeMarkdownMediaInsertionReadyRequest,
+  MARKDOWN_MEDIA_INSERTION_EVENT,
+  MARKDOWN_MEDIA_INSERTION_HANDSHAKE_ACK_EVENT,
+  MARKDOWN_MEDIA_INSERTION_HANDSHAKE_EVENT,
+  MARKDOWN_MEDIA_INSERTION_REQUEST_READY_EVENT,
+  MARKDOWN_MEDIA_INSERTION_READY_EVENT,
+  type MarkdownMediaCursorInsertion,
+  type MarkdownMediaInsertionHandshake,
+  type MarkdownMediaInsertionReady,
   type MarkdownMediaInsertion,
+  type MarkdownMediaInsertionTarget,
 } from './lib/markdownMedia';
+import { createPaneProtocolId } from './lib/tauriPaneReplication';
 import {
   DEFAULT_WORKSPACE_SIDEBAR_WIDTH,
   getWorkspaceLayoutClassName,
@@ -68,12 +88,96 @@ import './styles.css';
 const LazyDocxPreview = lazy(() => import('./components/DocxPreview').then((module) => ({
   default: module.DocxPreview,
 })));
-const LazyExcalidrawPane = lazy(() => import('./components/ExcalidrawPane').then((module) => ({
-  default: module.ExcalidrawPane,
-})));
+const LazyExcalidrawPane = lazy(async () => {
+  try {
+    const module = await loadLazyModuleWithRetry(() => import('./components/ExcalidrawPane'));
+    return { default: module.ExcalidrawPane };
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(`Failed to load Excalidraw preview module: ${detail}`);
+  }
+});
 const LazyPdfPreview = lazy(() => import('./components/PdfPreview').then((module) => ({
   default: module.PdfPreview,
 })));
+const MAIN_WINDOW_LABEL = 'main';
+
+interface PendingMarkdownMediaInsertionHandshake {
+  attempt: number;
+  generation: number;
+  handshake: MarkdownMediaInsertionHandshake;
+  retryTimer: ReturnType<typeof globalThis.setTimeout> | null;
+  sending: boolean;
+}
+
+type PendingMarkdownMediaCursorInsertion = Omit<MarkdownMediaCursorInsertion, 'popoutInstanceId'>;
+
+interface MarkdownMediaRetryController {
+  cancelled: boolean;
+  pendingTimers: Map<ReturnType<typeof globalThis.setTimeout>, () => void>;
+}
+
+const MEDIA_EVENT_RETRY_DELAYS_MS = [0, 100, 250] as const;
+const MEDIA_INSERTION_HANDSHAKE_ATTEMPTS = 3;
+const MEDIA_INSERTION_HANDSHAKE_ACK_TIMEOUT_MS = 250;
+
+function createMarkdownMediaRetryController(): MarkdownMediaRetryController {
+  return { cancelled: false, pendingTimers: new Map() };
+}
+
+function cancelMarkdownMediaRetries(controller: MarkdownMediaRetryController): void {
+  controller.cancelled = true;
+  for (const [timer, resolve] of controller.pendingTimers) {
+    globalThis.clearTimeout(timer);
+    resolve();
+  }
+  controller.pendingTimers.clear();
+}
+
+function waitForRetry(
+  delayMs: number,
+  controller: MarkdownMediaRetryController | undefined,
+): Promise<boolean> {
+  if (controller?.cancelled) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const complete = () => resolve(!controller?.cancelled);
+    const timer = globalThis.setTimeout(() => {
+      controller?.pendingTimers.delete(timer);
+      complete();
+    }, delayMs);
+    controller?.pendingTimers.set(timer, complete);
+  });
+}
+
+function cancelMarkdownMediaInsertionHandshake(
+  pending: PendingMarkdownMediaInsertionHandshake | null,
+): void {
+  if (pending?.retryTimer !== null && pending?.retryTimer !== undefined) {
+    globalThis.clearTimeout(pending.retryTimer);
+    pending.retryTimer = null;
+  }
+}
+
+async function emitToWithRetry(
+  target: string,
+  event: string,
+  payload: unknown,
+  isCurrent: () => boolean,
+  retryController?: MarkdownMediaRetryController,
+): Promise<void> {
+  let lastError: unknown;
+  for (const delayMs of MEDIA_EVENT_RETRY_DELAYS_MS) {
+    if (delayMs > 0 && !await waitForRetry(delayMs, retryController)) return;
+    if (retryController?.cancelled || !isCurrent()) return;
+    try {
+      await emitTo(target, event, payload);
+      return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (!retryController?.cancelled && isCurrent()) throw lastError;
+}
 
 interface LazyPreviewWrapperProps {
   loadingLabel: string;
@@ -111,10 +215,30 @@ function currentPopoutPane() {
   return typeof window === 'undefined' ? 'main' : parsePopoutPane(window.location.search);
 }
 
+function currentEditorPopoutInstanceId() {
+  return typeof window === 'undefined' ? null : parsePopoutInstanceId(window.location.search);
+}
+
+function getWorkspaceRelativePath(workspaceRoot: string | null, path: string | null): string | null {
+  if (!workspaceRoot || !path) return null;
+  const normalizedRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+  const normalizedPath = path.replace(/\\/g, '/');
+  const prefix = normalizedRoot === '/' ? '/' : `${normalizedRoot}/`;
+  if (!normalizedPath.startsWith(prefix)) return null;
+  const relativePath = normalizedPath.slice(prefix.length);
+  if (!relativePath || relativePath.split('/').some((segment) => !segment || segment === '.' || segment === '..')) return null;
+  return relativePath;
+}
+
 export default function App() {
   const { locale, t } = useI18n();
   const popoutPane = useMemo(() => currentPopoutPane(), []);
   const isPopout = popoutPane !== 'main';
+  const [editorPopoutInstanceId] = useState(() => (
+    popoutPane === 'editor'
+      ? currentEditorPopoutInstanceId() ?? createPaneProtocolId('markdown-media-popout')
+      : null
+  ));
   const [showUnsavedExitPrompt, setShowUnsavedExitPrompt] = useState(false);
   const [pendingFileSwitchPath, setPendingFileSwitchPath] = useState<string | null>(null);
   const [workspaceEntryOperation, setWorkspaceEntryOperation] = useState<WorkspaceEntryOperation | null>(null);
@@ -128,6 +252,19 @@ export default function App() {
   const nativeSaveMenuSyncRef = useRef<Promise<void>>(Promise.resolve());
   const outlineJumpRequestIdRef = useRef(0);
   const mediaInsertionRequestIdRef = useRef(0);
+  const mediaInsertionHighWaterRef = useRef(new Map<string, number>());
+  const pendingPopoutMediaInsertionsRef = useRef<PendingMarkdownMediaCursorInsertion[]>([]);
+  const popoutMediaInsertionTailRef = useRef<Promise<void>>(Promise.resolve());
+  const popoutMediaInsertionGenerationRef = useRef(0);
+  const editorPopoutReadyRef = useRef<MarkdownMediaInsertionReady | null>(null);
+  const editorPopoutHandshakeRef = useRef<PendingMarkdownMediaInsertionHandshake | null>(null);
+  const startEditorPopoutHandshakeRef = useRef<((ready: MarkdownMediaInsertionReady) => void) | null>(null);
+  const editorPopoutOpenRef = useRef(false);
+  const expectedEditorPopoutInstanceIdRef = useRef<string | null>(null);
+  const pendingEditorPopoutReadyRequestIdRef = useRef<string | null>(null);
+  const editorPopoutOpenRequestRef = useRef<Promise<void> | null>(null);
+  const markdownMediaRetryControllerRef = useRef(createMarkdownMediaRetryController());
+  const mountedRef = useRef(true);
   const paneLayoutStyle = useMemo(() => getPaneLayoutStyle(editorPaneRatio), [editorPaneRatio]);
 
   const {
@@ -289,6 +426,8 @@ export default function App() {
     sidebarWidth: workspaceSidebarWidth,
   });
   const { closePopoutWindows, editorPopoutButton, openPanePopout, previewPopoutButton } = usePanePopouts({ broadcastPaneState, isPopout, setError, setNotice });
+  const editorPopoutOpen = editorPopoutButton?.isPoppedOut === true;
+  editorPopoutOpenRef.current = editorPopoutOpen || editorPopoutOpenRequestRef.current !== null;
   const { forceCloseProgram } = useProgramCloseGuard({
     closePopoutWindows,
     dirty,
@@ -298,6 +437,69 @@ export default function App() {
     setNotice,
     setShowUnsavedExitPrompt,
   });
+
+  const sendCursorInsertionToEditorPopout = useCallback((insertion: MarkdownMediaCursorInsertion) => {
+    const generation = popoutMediaInsertionGenerationRef.current;
+    const delivery = popoutMediaInsertionTailRef.current
+      .catch(() => undefined)
+      .then(() => {
+        return emitToWithRetry(
+          getPanePopoutLabel('editor'),
+          MARKDOWN_MEDIA_INSERTION_EVENT,
+          insertion,
+          () => generation === popoutMediaInsertionGenerationRef.current
+            && editorPopoutOpenRef.current
+            && mountedRef.current,
+          markdownMediaRetryControllerRef.current,
+        );
+      });
+    popoutMediaInsertionTailRef.current = delivery;
+    void delivery.catch((err: unknown) => {
+      if (generation !== popoutMediaInsertionGenerationRef.current || !mountedRef.current) return;
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+    });
+  }, [locale, setError, setNotice]);
+
+  useEffect(() => {
+    const retryController = createMarkdownMediaRetryController();
+    markdownMediaRetryControllerRef.current = retryController;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cancelMarkdownMediaRetries(retryController);
+    };
+  }, []);
+
+  useEffect(() => {
+    popoutMediaInsertionGenerationRef.current += 1;
+    cancelMarkdownMediaInsertionHandshake(editorPopoutHandshakeRef.current);
+    editorPopoutHandshakeRef.current = null;
+    const ready = editorPopoutReadyRef.current;
+    if (
+      ready
+      && (ready.documentId !== documentId || ready.documentEpoch !== documentEpoch)
+    ) editorPopoutReadyRef.current = null;
+    pendingEditorPopoutReadyRequestIdRef.current = null;
+    pendingPopoutMediaInsertionsRef.current = pendingPopoutMediaInsertionsRef.current.filter((insertion) => (
+      insertion.documentId === documentId && insertion.documentEpoch === documentEpoch
+    ));
+  }, [documentEpoch, documentId]);
+
+  useEffect(() => () => {
+    editorPopoutOpenRequestRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (editorPopoutOpen) return;
+    popoutMediaInsertionGenerationRef.current += 1;
+    cancelMarkdownMediaInsertionHandshake(editorPopoutHandshakeRef.current);
+    editorPopoutHandshakeRef.current = null;
+    editorPopoutReadyRef.current = null;
+    expectedEditorPopoutInstanceIdRef.current = null;
+    pendingEditorPopoutReadyRequestIdRef.current = null;
+    pendingPopoutMediaInsertionsRef.current = [];
+  }, [editorPopoutOpen]);
 
   useEffect(() => {
     const handleFeedbackError = (event: Event) => {
@@ -365,6 +567,312 @@ export default function App() {
       unlistenOutlineJump?.();
     };
   }, [documentEpoch, documentId, isPopout, locale, setError]);
+
+  useEffect(() => {
+    if (isPopout) return undefined;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const isHandshakeCurrent = (pending: PendingMarkdownMediaInsertionHandshake) => (
+      !disposed
+      && editorPopoutOpenRef.current
+      && pending.generation === popoutMediaInsertionGenerationRef.current
+      && editorPopoutHandshakeRef.current === pending
+      && pending.handshake.documentId === documentId
+      && pending.handshake.documentEpoch === documentEpoch
+      && pending.handshake.popoutInstanceId === expectedEditorPopoutInstanceIdRef.current
+    );
+    const failHandshake = (pending: PendingMarkdownMediaInsertionHandshake, _error: unknown) => {
+      if (!isHandshakeCurrent(pending)) return;
+      cancelMarkdownMediaInsertionHandshake(pending);
+      editorPopoutHandshakeRef.current = null;
+      setError(t('popoutInsertionUnavailable'));
+      setNotice(null);
+    };
+    function scheduleHandshakeRetry(
+      pending: PendingMarkdownMediaInsertionHandshake,
+      delayMs: number,
+      failure: unknown,
+    ) {
+      cancelMarkdownMediaInsertionHandshake(pending);
+      pending.retryTimer = globalThis.setTimeout(() => {
+        pending.retryTimer = null;
+        if (!isHandshakeCurrent(pending)) return;
+        if (pending.attempt >= MEDIA_INSERTION_HANDSHAKE_ATTEMPTS) {
+          failHandshake(pending, failure);
+          return;
+        }
+        pending.attempt += 1;
+        sendHandshake(pending);
+      }, delayMs);
+    }
+    function sendHandshake(pending: PendingMarkdownMediaInsertionHandshake) {
+      if (!isHandshakeCurrent(pending) || pending.sending) return;
+      pending.sending = true;
+      void emitTo(
+        getPanePopoutLabel('editor'),
+        MARKDOWN_MEDIA_INSERTION_HANDSHAKE_EVENT,
+        pending.handshake,
+      ).then(() => {
+        pending.sending = false;
+        if (!isHandshakeCurrent(pending)) return;
+        scheduleHandshakeRetry(
+          pending,
+          MEDIA_INSERTION_HANDSHAKE_ACK_TIMEOUT_MS,
+          new Error('Markdown media insertion handshake timed out'),
+        );
+      }).catch((err: unknown) => {
+        pending.sending = false;
+        if (!isHandshakeCurrent(pending)) return;
+        scheduleHandshakeRetry(
+          pending,
+          MEDIA_EVENT_RETRY_DELAYS_MS[pending.attempt] ?? MEDIA_INSERTION_HANDSHAKE_ACK_TIMEOUT_MS,
+          err,
+        );
+      });
+    }
+    const startHandshake = (ready: MarkdownMediaInsertionReady) => {
+      if (disposed || !editorPopoutOpenRef.current) return;
+      const current = editorPopoutHandshakeRef.current;
+      if (
+        current
+        && isHandshakeCurrent(current)
+        && current.handshake.documentId === ready.documentId
+        && current.handshake.documentEpoch === ready.documentEpoch
+        && current.handshake.popoutInstanceId === ready.popoutInstanceId
+      ) {
+        if (current.sending || current.attempt >= MEDIA_INSERTION_HANDSHAKE_ATTEMPTS) return;
+        cancelMarkdownMediaInsertionHandshake(current);
+        current.attempt += 1;
+        sendHandshake(current);
+        return;
+      }
+      cancelMarkdownMediaInsertionHandshake(editorPopoutHandshakeRef.current);
+      editorPopoutReadyRef.current = null;
+      const { readyRequestId: _readyRequestId, ...handshakeReady } = ready;
+      const pending: PendingMarkdownMediaInsertionHandshake = {
+        attempt: 1,
+        generation: popoutMediaInsertionGenerationRef.current,
+        handshake: {
+          ...handshakeReady,
+          handshakeId: createPaneProtocolId('markdown-media-handshake'),
+        },
+        retryTimer: null,
+        sending: false,
+      };
+      editorPopoutHandshakeRef.current = pending;
+      sendHandshake(pending);
+    };
+    startEditorPopoutHandshakeRef.current = startHandshake;
+    const handleMediaInsertionReady = (event: { payload: unknown }) => {
+      if (disposed) return;
+      const ready = decodeMarkdownMediaInsertionReady(event.payload);
+      if (
+        !ready
+        || ready.documentId !== documentId
+        || ready.documentEpoch !== documentEpoch
+        || !editorPopoutOpenRef.current
+      ) return;
+      const expectedInstanceId = expectedEditorPopoutInstanceIdRef.current;
+      const pendingReadyRequestId = pendingEditorPopoutReadyRequestIdRef.current;
+      if (expectedInstanceId && ready.popoutInstanceId !== expectedInstanceId) return;
+      if (pendingReadyRequestId && ready.readyRequestId !== pendingReadyRequestId) return;
+      if (!expectedInstanceId) expectedEditorPopoutInstanceIdRef.current = ready.popoutInstanceId;
+      if (pendingReadyRequestId) pendingEditorPopoutReadyRequestIdRef.current = null;
+      startHandshake(ready);
+    };
+    const handleMediaInsertionHandshakeAck = (event: { payload: unknown }) => {
+      if (disposed) return;
+      const handshake = decodeMarkdownMediaInsertionHandshake(event.payload);
+      const pendingHandshake = editorPopoutHandshakeRef.current;
+      if (
+        !handshake
+        || !pendingHandshake
+        || !editorPopoutOpenRef.current
+        || pendingHandshake.generation !== popoutMediaInsertionGenerationRef.current
+        || handshake.handshakeId !== pendingHandshake.handshake.handshakeId
+        || handshake.documentId !== pendingHandshake.handshake.documentId
+        || handshake.documentEpoch !== pendingHandshake.handshake.documentEpoch
+        || handshake.popoutInstanceId !== pendingHandshake.handshake.popoutInstanceId
+        || handshake.popoutInstanceId !== expectedEditorPopoutInstanceIdRef.current
+        || handshake.documentId !== documentId
+        || handshake.documentEpoch !== documentEpoch
+      ) return;
+      cancelMarkdownMediaInsertionHandshake(pendingHandshake);
+      editorPopoutHandshakeRef.current = null;
+      editorPopoutReadyRef.current = {
+        documentId: handshake.documentId,
+        documentEpoch: handshake.documentEpoch,
+        popoutInstanceId: handshake.popoutInstanceId,
+      };
+      const pending = pendingPopoutMediaInsertionsRef.current.filter((insertion) => (
+        insertion.documentId === handshake.documentId && insertion.documentEpoch === handshake.documentEpoch
+      ));
+      pendingPopoutMediaInsertionsRef.current = pendingPopoutMediaInsertionsRef.current.filter((insertion) => (
+        insertion.documentId !== handshake.documentId || insertion.documentEpoch !== handshake.documentEpoch
+      ));
+      for (const insertion of pending) {
+        sendCursorInsertionToEditorPopout({
+          ...insertion,
+          popoutInstanceId: handshake.popoutInstanceId,
+        });
+      }
+    };
+    void Promise.allSettled([
+      listen<unknown>(MARKDOWN_MEDIA_INSERTION_READY_EVENT, handleMediaInsertionReady),
+      listen<unknown>(MARKDOWN_MEDIA_INSERTION_HANDSHAKE_ACK_EVENT, handleMediaInsertionHandshakeAck),
+    ]).then((registrations) => {
+      const registered = registrations.flatMap((registration) => (
+        registration.status === 'fulfilled' ? [registration.value] : []
+      ));
+      const failure = registrations.find((registration) => registration.status === 'rejected');
+      if (disposed || failure) {
+        for (const unlisten of registered) unlisten();
+      } else {
+        unlisteners.push(...registered);
+        if (
+          editorPopoutOpenRef.current
+          && pendingPopoutMediaInsertionsRef.current.some((insertion) => (
+            insertion.documentId === documentId && insertion.documentEpoch === documentEpoch
+          ))
+        ) {
+          const expectedInstanceId = expectedEditorPopoutInstanceIdRef.current;
+          if (expectedInstanceId) {
+            startHandshake({
+              documentEpoch,
+              documentId,
+              popoutInstanceId: expectedInstanceId,
+            });
+          }
+        }
+      }
+      if (!disposed && failure?.status === 'rejected') {
+        setError(normalizeAppError(failure.reason, locale));
+        setNotice(null);
+      }
+    });
+    return () => {
+      disposed = true;
+      if (startEditorPopoutHandshakeRef.current === startHandshake) {
+        startEditorPopoutHandshakeRef.current = null;
+      }
+      const pendingHandshake = editorPopoutHandshakeRef.current;
+      if (
+        pendingHandshake
+        && pendingHandshake.handshake.documentId === documentId
+        && pendingHandshake.handshake.documentEpoch === documentEpoch
+      ) {
+        cancelMarkdownMediaInsertionHandshake(pendingHandshake);
+        editorPopoutHandshakeRef.current = null;
+      }
+      for (const unlisten of unlisteners) unlisten();
+    };
+  }, [documentEpoch, documentId, isPopout, locale, sendCursorInsertionToEditorPopout, setError, setNotice, t]);
+
+  useEffect(() => {
+    if (
+      popoutPane !== 'editor'
+      || activeFileKind !== 'markdown'
+      || authorityStatus !== 'committed'
+      || !editorPopoutInstanceId
+    ) return undefined;
+    const popoutInstanceId = editorPopoutInstanceId;
+    let disposed = false;
+    let handshakeReceived = false;
+    const unlisteners: Array<() => void> = [];
+    const announceReady = (readyRequestId?: string) => emitToWithRetry(
+      MAIN_WINDOW_LABEL,
+      MARKDOWN_MEDIA_INSERTION_READY_EVENT,
+      readyRequestId
+        ? { documentEpoch, documentId, popoutInstanceId, readyRequestId }
+        : { documentEpoch, documentId, popoutInstanceId },
+      () => !disposed,
+      markdownMediaRetryControllerRef.current,
+    ).catch((err: unknown) => {
+      if (disposed) return;
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+    });
+    const handleMediaInsertion = (event: { payload: unknown }) => {
+      if (disposed) return;
+      const insertion = decodeMarkdownMediaCursorInsertion(event.payload);
+      if (
+        !insertion
+        || insertion.documentId !== documentId
+        || insertion.documentEpoch !== documentEpoch
+        || insertion.popoutInstanceId !== popoutInstanceId
+        || activeFileKind !== 'markdown'
+        || authorityStatus !== 'committed'
+      ) return;
+      const requestKey = `${insertion.documentId}:${insertion.documentEpoch}`;
+      const highestRequestId = mediaInsertionHighWaterRef.current.get(requestKey) ?? 0;
+      const currentRelativePath = getWorkspaceRelativePath(workspaceRoot, activePath);
+      if (insertion.requestId <= highestRequestId || currentRelativePath !== insertion.documentRelativePath) return;
+      const markdown = createMarkdownMediaReference(insertion.asset, { relative_path: currentRelativePath });
+      if (!markdown) return;
+      mediaInsertionHighWaterRef.current.set(requestKey, insertion.requestId);
+      setMediaInsertion({
+        documentEpoch: insertion.documentEpoch,
+        documentId: insertion.documentId,
+        markdown,
+        requestId: insertion.requestId,
+        target: { kind: 'cursor' },
+      });
+    };
+    const handleMediaInsertionHandshake = (event: { payload: unknown }) => {
+      if (disposed) return;
+      const handshake = decodeMarkdownMediaInsertionHandshake(event.payload);
+      if (
+        !handshake
+        || handshake.documentId !== documentId
+        || handshake.documentEpoch !== documentEpoch
+        || handshake.popoutInstanceId !== popoutInstanceId
+        || activeFileKind !== 'markdown'
+        || authorityStatus !== 'committed'
+      ) return;
+      handshakeReceived = true;
+      void emitToWithRetry(
+        MAIN_WINDOW_LABEL,
+        MARKDOWN_MEDIA_INSERTION_HANDSHAKE_ACK_EVENT,
+        handshake,
+        () => !disposed,
+        markdownMediaRetryControllerRef.current,
+      ).catch((err: unknown) => {
+        if (disposed) return;
+        setError(normalizeAppError(err, locale));
+        setNotice(null);
+      });
+    };
+    const handleMediaInsertionReadyRequest = (event: { payload: unknown }) => {
+      if (disposed) return;
+      const request = decodeMarkdownMediaInsertionReadyRequest(event.payload);
+      if (!request || request.documentId !== documentId || request.documentEpoch !== documentEpoch) return;
+      void announceReady(request.readyRequestId);
+    };
+    void Promise.allSettled([
+      listen<unknown>(MARKDOWN_MEDIA_INSERTION_EVENT, handleMediaInsertion),
+      listen<unknown>(MARKDOWN_MEDIA_INSERTION_HANDSHAKE_EVENT, handleMediaInsertionHandshake),
+      listen<unknown>(MARKDOWN_MEDIA_INSERTION_REQUEST_READY_EVENT, handleMediaInsertionReadyRequest),
+    ]).then((registrations) => {
+      const registered = registrations.flatMap((registration) => (
+        registration.status === 'fulfilled' ? [registration.value] : []
+      ));
+      const failure = registrations.find((registration) => registration.status === 'rejected');
+      if (disposed || failure) {
+        for (const unlisten of registered) unlisten();
+      } else {
+        unlisteners.push(...registered);
+        if (!handshakeReceived) void announceReady();
+      }
+      if (!disposed && failure?.status === 'rejected') {
+        setError(normalizeAppError(failure.reason, locale));
+        setNotice(null);
+      }
+    });
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners) unlisten();
+    };
+  }, [activeFileKind, activePath, authorityStatus, documentEpoch, documentId, editorPopoutInstanceId, locale, popoutPane, setError, setNotice, workspaceRoot]);
 
   useEffect(() => {
     if (isPopout) return undefined;
@@ -492,9 +1000,74 @@ export default function App() {
     });
   }, [documentEpoch, documentId, locale, setError, setNotice]);
 
+  const requestEditorPopoutReady = useCallback(() => {
+    if (pendingEditorPopoutReadyRequestIdRef.current) return;
+    const readyRequestId = createPaneProtocolId('markdown-media-ready-request');
+    pendingEditorPopoutReadyRequestIdRef.current = readyRequestId;
+    editorPopoutReadyRef.current = null;
+    cancelMarkdownMediaInsertionHandshake(editorPopoutHandshakeRef.current);
+    editorPopoutHandshakeRef.current = null;
+    editorPopoutOpenRef.current = true;
+    void emitToWithRetry(
+      getPanePopoutLabel('editor'),
+      MARKDOWN_MEDIA_INSERTION_REQUEST_READY_EVENT,
+      { documentEpoch, documentId, readyRequestId },
+      () => mountedRef.current,
+      markdownMediaRetryControllerRef.current,
+    ).catch((err: unknown) => {
+      if (!mountedRef.current) return;
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+    });
+  }, [documentEpoch, documentId, locale, setError, setNotice]);
+
+  const handleEditorPopoutOpen = useCallback(() => {
+    if (editorPopoutOpen) {
+      void openPanePopout('editor').then((outcome) => {
+        if (outcome.status !== 'existing') return;
+        const ready = editorPopoutReadyRef.current;
+        const expectedInstanceId = expectedEditorPopoutInstanceIdRef.current;
+        if (
+          ready?.documentId === documentId
+          && ready.documentEpoch === documentEpoch
+        ) return;
+        if (expectedInstanceId || pendingEditorPopoutReadyRequestIdRef.current) return;
+        requestEditorPopoutReady();
+      });
+      return;
+    }
+    if (editorPopoutOpenRequestRef.current) return;
+    const instanceId = createPaneProtocolId('markdown-media-popout');
+    expectedEditorPopoutInstanceIdRef.current = instanceId;
+    pendingEditorPopoutReadyRequestIdRef.current = null;
+    const openRequest = openPanePopout('editor', instanceId).then((outcome) => {
+      if (expectedEditorPopoutInstanceIdRef.current !== instanceId) return;
+      if (outcome.status !== 'failed') editorPopoutOpenRef.current = true;
+      if (outcome.status === 'existing') {
+        // An existing popout owns its URL-derived instance ID, not this speculative one.
+        expectedEditorPopoutInstanceIdRef.current = null;
+        const ready = editorPopoutReadyRef.current;
+        if (ready?.documentId === documentId && ready.documentEpoch === documentEpoch) {
+          expectedEditorPopoutInstanceIdRef.current = ready.popoutInstanceId;
+          startEditorPopoutHandshakeRef.current?.(ready);
+        } else {
+          requestEditorPopoutReady();
+        }
+      } else if (outcome.status === 'failed') {
+        expectedEditorPopoutInstanceIdRef.current = null;
+        editorPopoutOpenRef.current = false;
+      }
+    }).finally(() => {
+      if (editorPopoutOpenRequestRef.current === openRequest) {
+        editorPopoutOpenRequestRef.current = null;
+      }
+    });
+    editorPopoutOpenRequestRef.current = openRequest;
+  }, [documentEpoch, documentId, editorPopoutOpen, openPanePopout, requestEditorPopoutReady]);
+
   const handleWorkspaceAssetInsert = useCallback((
     asset: WorkspaceFileEntry,
-    position: { clientX: number; clientY: number },
+    target: MarkdownMediaInsertionTarget,
   ) => {
     if (
       activeFileKind !== 'markdown'
@@ -504,14 +1077,56 @@ export default function App() {
     const markdown = createMarkdownMediaReference(asset, activeWorkspaceMarkdownFile);
     if (!markdown) return;
     mediaInsertionRequestIdRef.current += 1;
-    setMediaInsertion({
-      ...position,
+    const insertion: MarkdownMediaInsertion = {
       documentEpoch,
       documentId,
       markdown,
       requestId: mediaInsertionRequestIdRef.current,
-    });
-  }, [activeFileKind, activeWorkspaceMarkdownFile, authorityStatus, documentEpoch, documentId]);
+      target,
+    };
+    if (target.kind === 'cursor' && editorPopoutOpenRef.current) {
+      const popoutInsertion: PendingMarkdownMediaCursorInsertion = {
+        asset: {
+          kind: asset.kind,
+          name: asset.name,
+          relative_path: asset.relative_path,
+        },
+        documentRelativePath: activeWorkspaceMarkdownFile.relative_path,
+        documentEpoch,
+        documentId,
+        requestId: insertion.requestId,
+      };
+      const ready = editorPopoutReadyRef.current;
+      if (ready?.documentId === documentId && ready.documentEpoch === documentEpoch) {
+        sendCursorInsertionToEditorPopout({
+          ...popoutInsertion,
+          popoutInstanceId: ready.popoutInstanceId,
+        });
+      } else {
+        pendingPopoutMediaInsertionsRef.current.push(popoutInsertion);
+        const expectedInstanceId = expectedEditorPopoutInstanceIdRef.current;
+        if (expectedInstanceId) {
+          startEditorPopoutHandshakeRef.current?.({
+            documentEpoch,
+            documentId,
+            popoutInstanceId: expectedInstanceId,
+          });
+        } else if (!pendingEditorPopoutReadyRequestIdRef.current) {
+          requestEditorPopoutReady();
+        }
+      }
+      return;
+    }
+    setMediaInsertion(insertion);
+  }, [
+    activeFileKind,
+    activeWorkspaceMarkdownFile,
+    authorityStatus,
+    documentEpoch,
+    documentId,
+    requestEditorPopoutReady,
+    sendCursorInsertionToEditorPopout,
+  ]);
 
   if (popoutPane === 'editor') {
     return (
@@ -538,7 +1153,7 @@ export default function App() {
           ? <WorkspaceImagePreview key={activePath} enabled={documentAssetsEnabled} path={activePath} popout previewRevision={previewRevision} />
           : isMediaFile && activePath
             ? <WorkspaceMediaPreview key={activePath} enabled={documentAssetsEnabled} kind={mediaKind} mimeType={mediaMimeType} path={activePath} popout previewRevision={previewRevision} />
-            : <EditorPane activePath={activePath} content={content} documentEpoch={documentEpoch} documentId={documentId} editable={authorityStatus === 'committed'} fileKind={editorFileKind} outlineJump={currentOutlineJump} onContentChange={updateContent} popout />}
+            : <EditorPane activePath={activePath} content={content} documentEpoch={documentEpoch} documentId={documentId} editable={authorityStatus === 'committed'} fileKind={editorFileKind} mediaInsertion={currentMediaInsertion} outlineJump={currentOutlineJump} onContentChange={updateContent} popout />}
       </PopoutPaneShell>
     );
   }
@@ -690,7 +1305,7 @@ export default function App() {
             popoutButton={editorPopoutButton}
             onContentChange={updateContent}
             onInvalidScene={handleExcalidrawError}
-            onPopout={() => void openPanePopout('editor')}
+            onPopout={handleEditorPopoutOpen}
           />
         ) : isDocumentFile ? (
           <PreviewPane
@@ -737,7 +1352,7 @@ export default function App() {
               paneRef={editorPaneRef}
               popoutButton={editorPopoutButton}
               onContentChange={updateContent}
-              onPopout={() => void openPanePopout('editor')}
+              onPopout={handleEditorPopoutOpen}
             />
 
             <PaneResizer

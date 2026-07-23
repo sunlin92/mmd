@@ -89,7 +89,7 @@ describe('WorkspaceImagePreview', () => {
       const event = feedback.mock.calls[0][0];
       expect(event).toBeInstanceOf(CustomEvent);
       expect((event as CustomEvent<string>).detail).toBe(
-        'The image could not be displayed. Check its relative path and file access.',
+        'Image preview could not be displayed',
       );
     } finally {
       window.removeEventListener('mmd:app-feedback-error', feedback);

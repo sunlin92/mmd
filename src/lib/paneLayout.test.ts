@@ -5,6 +5,7 @@ import {
   getPanePopoutButtonState,
   getPanePopoutLabel,
   getPanePopoutUrl,
+  parsePopoutInstanceId,
   parsePopoutPane,
   resizeEditorPaneRatio,
   resizeEditorPaneRatioFromKey,
@@ -47,6 +48,16 @@ describe('editor and preview pane layout', () => {
     expect(parsePopoutPane('?pane=other')).toBe('main');
     expect(getPanePopoutLabel('editor')).toBe('mmd-editor-popout');
     expect(getPanePopoutUrl('preview')).toBe('/?pane=preview');
+  });
+
+  it('builds and parses validated editor popout instance IDs', () => {
+    expect(getPanePopoutUrl('editor', 'editor:1/2')).toBe('/?pane=editor');
+    expect(getPanePopoutUrl('editor', 'editor:1.2')).toBe('/?pane=editor&instance=editor%3A1.2');
+    expect(getPanePopoutUrl('preview', 'editor:1.2')).toBe('/?pane=preview');
+    expect(parsePopoutInstanceId('?instance=editor%3A1.2')).toBe('editor:1.2');
+    expect(parsePopoutInstanceId('?instance=')).toBeNull();
+    expect(parsePopoutInstanceId('?instance=editor%2F1')).toBeNull();
+    expect(parsePopoutInstanceId(`?instance=${'a'.repeat(129)}`)).toBeNull();
   });
 
   it('labels popout buttons differently when the pane is already popped out', () => {

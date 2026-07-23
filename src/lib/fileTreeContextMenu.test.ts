@@ -17,6 +17,30 @@ describe('file tree context menu model', () => {
     expect(getFileTreeContextMenuItems(target).map((item) => item.action)).toEqual(['open', 'rename', 'move', 'delete']);
   });
 
+  it.each([
+    ['image', 'cover.png'],
+    ['audio', 'intro.mp3'],
+    ['html', 'demo.html'],
+    ['excalidraw', 'diagram.excalidraw'],
+  ] as const)('shows cursor insertion for a %s file when Markdown insertion is enabled', (fileKind, name) => {
+    const target: FileTreeContextTarget = { fileKind, kind: 'file', name, path: `/workspace/${name}` };
+    expect(getFileTreeContextMenuItems(target, { canInsertWorkspaceAsset: true }).map((item) => item.action)).toEqual([
+      'open',
+      'insert-at-cursor',
+      'rename',
+      'move',
+      'delete',
+    ]);
+  });
+
+  it('omits cursor insertion when insertion is disabled or the target is unsupported', () => {
+    const image: FileTreeContextTarget = { fileKind: 'image', kind: 'file', name: 'cover.png', path: '/workspace/cover.png' };
+    const markdown: FileTreeContextTarget = { fileKind: 'markdown', kind: 'file', name: 'guide.md', path: '/workspace/guide.md' };
+
+    expect(getFileTreeContextMenuItems(image).some((item) => item.action === 'insert-at-cursor')).toBe(false);
+    expect(getFileTreeContextMenuItems(markdown, { canInsertWorkspaceAsset: true }).some((item) => item.action === 'insert-at-cursor')).toBe(false);
+  });
+
   it('omits rename for read-only PDF and DOCX documents', () => {
     for (const fileKind of ['pdf', 'docx'] as const) {
       const target: FileTreeContextTarget = {

@@ -4,6 +4,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MarkdownOutlineItem } from '../lib/markdownOutline';
+import type { MarkdownMediaInsertionTarget } from '../lib/markdownMedia';
 import type { WorkspaceFileEntry } from '../types';
 import { FileSidebar } from './FileSidebar';
 
@@ -194,6 +195,106 @@ describe('FileSidebar native workspace interactions', () => {
     expect(menu?.style.top).toBe('240px');
   });
 
+  it('inserts a context-menu image at the current editor cursor', () => {
+    const onInsertWorkspaceAsset = vi.fn<(
+      asset: WorkspaceFileEntry,
+      target: MarkdownMediaInsertionTarget,
+    ) => void>();
+    act(() => root.render(
+      <FileSidebar
+        activePath="/workspace/draft.md"
+        collapsed={false}
+        collapsedFolders={new Set()}
+        fileTree={[{
+          absolutePath: '/workspace/cover.png',
+          kind: 'file',
+          name: 'cover.png',
+          path: '/workspace/cover.png',
+          relativePath: 'cover.png',
+          file: { kind: 'image', name: 'cover.png', path: '/workspace/cover.png', relative_path: 'cover.png' },
+        }]}
+        onCollapseChange={vi.fn<() => void>()}
+        onCreateFile={vi.fn<() => void>()}
+        onCreateFolder={vi.fn<() => void>()}
+        onDeleteEntry={vi.fn<() => void>()}
+        onInsertWorkspaceAsset={onInsertWorkspaceAsset}
+        onMoveEntry={vi.fn<() => void>()}
+        onOpenFile={vi.fn<() => void>()}
+        onRefreshWorkspace={vi.fn<() => void>()}
+        onRenameEntry={vi.fn<() => void>()}
+        onRequestMove={vi.fn<() => void>()}
+        onToggleFolder={vi.fn<() => void>()}
+        workspaceRoot="/workspace"
+      />,
+    ));
+
+    const row = container.querySelector<HTMLElement>('[data-tree-entry-path="/workspace/cover.png"]');
+    act(() => row?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })));
+    const insertItem = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+      .find((button) => button.textContent?.includes('Insert at Current Cursor'));
+    expect(insertItem).not.toBeUndefined();
+    act(() => insertItem?.click());
+
+    expect(onInsertWorkspaceAsset).toHaveBeenCalledWith({
+      kind: 'image',
+      name: 'cover.png',
+      path: '/workspace/cover.png',
+      relative_path: 'cover.png',
+    }, { kind: 'cursor' });
+  });
+
+  it.each([
+    ['html', 'demo.html'],
+    ['excalidraw', 'diagram.excalidraw'],
+  ] as const)('inserts a context-menu %s file at the current editor cursor', (fileKind, name) => {
+    const onInsertWorkspaceAsset = vi.fn<(
+      asset: WorkspaceFileEntry,
+      target: MarkdownMediaInsertionTarget,
+    ) => void>();
+    const path = `/workspace/${name}`;
+    act(() => root.render(
+      <FileSidebar
+        activePath="/workspace/draft.md"
+        collapsed={false}
+        collapsedFolders={new Set()}
+        fileTree={[{
+          absolutePath: path,
+          kind: 'file',
+          name,
+          path,
+          relativePath: name,
+          file: { kind: fileKind, name, path, relative_path: name },
+        }]}
+        onCollapseChange={vi.fn<() => void>()}
+        onCreateFile={vi.fn<() => void>()}
+        onCreateFolder={vi.fn<() => void>()}
+        onDeleteEntry={vi.fn<() => void>()}
+        onInsertWorkspaceAsset={onInsertWorkspaceAsset}
+        onMoveEntry={vi.fn<() => void>()}
+        onOpenFile={vi.fn<() => void>()}
+        onRefreshWorkspace={vi.fn<() => void>()}
+        onRenameEntry={vi.fn<() => void>()}
+        onRequestMove={vi.fn<() => void>()}
+        onToggleFolder={vi.fn<() => void>()}
+        workspaceRoot="/workspace"
+      />,
+    ));
+
+    const row = container.querySelector<HTMLElement>(`[data-tree-entry-path="${path}"]`);
+    act(() => row?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })));
+    const insertItem = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+      .find((button) => button.textContent?.includes('Insert at Current Cursor'));
+    expect(insertItem).not.toBeUndefined();
+    act(() => insertItem?.click());
+
+    expect(onInsertWorkspaceAsset).toHaveBeenCalledWith({
+      kind: fileKind,
+      name,
+      path,
+      relative_path: name,
+    }, { kind: 'cursor' });
+  });
+
   it('insets the add menu from the sidebar divider and leaves a trigger gap', () => {
     const getBoundingClientRect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
       .mockImplementation(function mockRect(this: HTMLElement) {
@@ -274,7 +375,7 @@ describe('FileSidebar native workspace interactions', () => {
   ] as const)('sends a workspace %s dropped on the Markdown editor to the insert callback', (fileKind, name, relativePath) => {
     const onInsertWorkspaceAsset = vi.fn<(
       asset: WorkspaceFileEntry,
-      position: { clientX: number; clientY: number },
+      target: MarkdownMediaInsertionTarget,
     ) => void>();
     const onMoveEntry = vi.fn<(path: string, destinationParentPath: string) => void>();
     const path = `/workspace/${relativePath}`;
@@ -337,8 +438,70 @@ describe('FileSidebar native workspace interactions', () => {
       name,
       path,
       relative_path: relativePath,
-    }, { clientX: 80, clientY: 20 });
+    }, { kind: 'coordinates', clientX: 80, clientY: 20 });
     expect(onMoveEntry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['html', 'demo.html'],
+    ['excalidraw', 'diagram.excalidraw'],
+  ] as const)('does not treat a dragged %s file as Markdown media', (fileKind, name) => {
+    const onInsertWorkspaceAsset = vi.fn<(
+      asset: WorkspaceFileEntry,
+      target: MarkdownMediaInsertionTarget,
+    ) => void>();
+    const onMoveEntry = vi.fn<(path: string, destinationParentPath: string) => void>();
+    const path = `/workspace/${name}`;
+    const dropTarget = document.createElement('div');
+    dropTarget.dataset.markdownMediaDropTarget = 'true';
+    document.body.append(dropTarget);
+    act(() => root.render(
+      <FileSidebar
+        activePath="/workspace/draft.md"
+        collapsed={false}
+        collapsedFolders={new Set()}
+        fileTree={[{
+          absolutePath: path,
+          kind: 'file',
+          name,
+          path,
+          relativePath: name,
+          file: { kind: fileKind, name, path, relative_path: name },
+        }]}
+        onCollapseChange={vi.fn<() => void>()}
+        onCreateFile={vi.fn<() => void>()}
+        onCreateFolder={vi.fn<() => void>()}
+        onDeleteEntry={vi.fn<() => void>()}
+        onInsertWorkspaceAsset={onInsertWorkspaceAsset}
+        onMoveEntry={onMoveEntry}
+        onOpenFile={vi.fn<() => void>()}
+        onRefreshWorkspace={vi.fn<() => void>()}
+        onRenameEntry={vi.fn<() => void>()}
+        onRequestMove={vi.fn<() => void>()}
+        onToggleFolder={vi.fn<() => void>()}
+        workspaceRoot="/workspace"
+      />,
+    ));
+
+    const source = container.querySelector<HTMLElement>(`[data-tree-entry-path="${path}"]`);
+    const originalElementFromPoint = document.elementFromPoint;
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: vi.fn<() => Element | null>(() => dropTarget),
+    });
+    try {
+      act(() => dispatchPointerEvent(source!, 'pointerdown', 20, 80));
+      act(() => dispatchPointerEvent(window, 'pointermove', 80, 20));
+      act(() => dispatchPointerEvent(window, 'pointerup', 80, 20));
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      });
+      dropTarget.remove();
+    }
+
+    expect(onInsertWorkspaceAsset).not.toHaveBeenCalled();
   });
 
   it('switches to a hierarchical document outline and selects its heading', () => {

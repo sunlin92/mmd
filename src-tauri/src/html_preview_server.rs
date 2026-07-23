@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
+    ops::{Deref, DerefMut},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -12,15 +13,14 @@ use std::{
 };
 
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use serde::Serialize;
 use tauri::State;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-#[cfg(test)]
-use std::ops::{Deref, DerefMut};
-
 use crate::{
     path_auth::{
-        normalize_existing_path, path_is_under, preview_scope_for_file_inner,
+        normalize_existing_path, path_is_under, preview_lease_support_statuses_inner,
+        preview_scope_for_anchored_file_with_root_inner, preview_scope_for_file_inner,
         retire_preview_lease_inner, retire_preview_leases_inner, AuthorizedPreviewScope,
         PreviewLeaseId, PreviewRetirementError,
     },
@@ -30,8 +30,11 @@ use crate::{
 
 const PREVIEW_WORKERS: usize = 4;
 const MAX_PREVIEW_SITES: usize = 8;
+const MAX_EMBED_OWNER_ID: u64 = 9_007_199_254_740_991;
 const POISONED_PREVIEW_SITES_ERROR: &str =
     "HTML preview server state was poisoned; all preview sites were stopped";
+const PREVIEW_AUTHORIZATION_CHANGED_ERROR: &str =
+    "HTML preview authorization changed before the site was committed";
 
 #[cfg(test)]
 mod site_start_test_probe {
@@ -82,18 +85,166 @@ mod site_start_test_probe {
     }
 }
 
+#[cfg(test)]
+mod preview_commit_test_probe {
+    use std::cell::RefCell;
+
+    use crate::path_auth::PreviewLeaseId;
+    use crate::state::AppState;
+
+    type BeforeCommitOperation = Box<dyn FnOnce(&AppState, &PreviewLeaseId)>;
+
+    thread_local! {
+        static BEFORE_COMMIT: RefCell<Option<BeforeCommitOperation>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_next_commit(operation: impl FnOnce(&AppState, &PreviewLeaseId) + 'static) {
+        BEFORE_COMMIT.with(|pending| {
+            assert!(
+                pending.borrow().is_none(),
+                "preview pre-commit operations cannot be nested"
+            );
+            *pending.borrow_mut() = Some(Box::new(operation));
+        });
+    }
+
+    pub(super) fn run(state: &AppState, lease: &PreviewLeaseId) {
+        let operation = BEFORE_COMMIT.with(|pending| pending.borrow_mut().take());
+        if let Some(operation) = operation {
+            operation(state, lease);
+        }
+    }
+}
+
 struct HtmlPreviewSite {
     url: String,
     root: PathBuf,
-    content: Arc<Mutex<String>>,
+    content: HtmlPreviewContent,
     server: Arc<Server>,
     stop: Arc<AtomicBool>,
     lease: PreviewLeaseId,
 }
 
+struct EmbeddedPreviewSite {
+    site: HtmlPreviewSite,
+    owners: HashMap<u64, String>,
+}
+
+impl EmbeddedPreviewSite {
+    fn new(site: HtmlPreviewSite, owner_id: u64, owner_window: &str) -> Self {
+        Self {
+            site,
+            owners: HashMap::from([(owner_id, owner_window.to_string())]),
+        }
+    }
+}
+
+impl Deref for EmbeddedPreviewSite {
+    type Target = HtmlPreviewSite;
+
+    fn deref(&self) -> &Self::Target {
+        &self.site
+    }
+}
+
+impl DerefMut for EmbeddedPreviewSite {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.site
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MarkdownHtmlEmbedHandle {
+    url: String,
+    owner_id: u64,
+}
+
+#[derive(Clone)]
+enum HtmlPreviewContent {
+    LiveDraft(Arc<Mutex<String>>),
+    Disk,
+}
+
+#[cfg(test)]
+impl HtmlPreviewContent {
+    fn shares_state_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::LiveDraft(left), Self::LiveDraft(right)) => Arc::ptr_eq(left, right),
+            (Self::Disk, Self::Disk) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HtmlEmbedSiteKey {
+    anchor: PathBuf,
+    document: PathBuf,
+}
+
+#[derive(Default)]
+struct HtmlPreviewSites {
+    drafts: HashMap<PathBuf, HtmlPreviewSite>,
+    embeds: HashMap<HtmlEmbedSiteKey, EmbeddedPreviewSite>,
+    next_embed_owner_id: u64,
+}
+
+impl HtmlPreviewSites {
+    fn len_all(&self) -> usize {
+        self.drafts.len() + self.embeds.len()
+    }
+
+    fn clear_all(&mut self) {
+        self.drafts.clear();
+        self.embeds.clear();
+    }
+
+    fn drain_leases(&mut self) -> HashSet<PreviewLeaseId> {
+        self.drafts
+            .drain()
+            .map(|(_, site)| site.lease.clone())
+            .chain(self.embeds.drain().map(|(_, site)| site.lease.clone()))
+            .collect()
+    }
+
+    fn allocate_embed_owner_id(&mut self) -> Result<u64, String> {
+        let owner_id = self.next_embed_owner_id;
+        if owner_id > MAX_EMBED_OWNER_ID {
+            return Err("HTML embed owner identifier space is exhausted".to_string());
+        }
+        self.next_embed_owner_id = owner_id
+            .checked_add(1)
+            .ok_or_else(|| "HTML embed owner identifier space is exhausted".to_string())?;
+        Ok(owner_id)
+    }
+}
+
+impl Deref for HtmlPreviewSites {
+    type Target = HashMap<PathBuf, HtmlPreviewSite>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.drafts
+    }
+}
+
+impl DerefMut for HtmlPreviewSites {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.drafts
+    }
+}
+
 struct HtmlPreviewCommit {
     document: PathBuf,
     url: String,
+    active_lease: PreviewLeaseId,
+    retired_leases: HashSet<PreviewLeaseId>,
+}
+
+struct HtmlEmbedPreviewCommit {
+    key: HtmlEmbedSiteKey,
+    url: String,
+    owner_id: u64,
     active_lease: PreviewLeaseId,
     retired_leases: HashSet<PreviewLeaseId>,
 }
@@ -123,22 +274,22 @@ impl HtmlPreviewSitesRecoveryError {
 
 #[derive(Default)]
 pub(crate) struct HtmlPreviewServerState {
-    sites: Mutex<HashMap<PathBuf, HtmlPreviewSite>>,
+    sites: Mutex<HtmlPreviewSites>,
     #[cfg(test)]
     next_site_start_error: Mutex<Option<String>>,
 }
 
 #[cfg(test)]
 struct HtmlPreviewSitesGuard<'a> {
-    inner: Option<MutexGuard<'a, HashMap<PathBuf, HtmlPreviewSite>>>,
+    inner: Option<MutexGuard<'a, HtmlPreviewSites>>,
 }
 
 #[cfg(not(test))]
-type HtmlPreviewSitesGuard<'a> = MutexGuard<'a, HashMap<PathBuf, HtmlPreviewSite>>;
+type HtmlPreviewSitesGuard<'a> = MutexGuard<'a, HtmlPreviewSites>;
 
 #[cfg(test)]
 impl<'a> HtmlPreviewSitesGuard<'a> {
-    fn new(inner: MutexGuard<'a, HashMap<PathBuf, HtmlPreviewSite>>) -> Self {
+    fn new(inner: MutexGuard<'a, HtmlPreviewSites>) -> Self {
         crate::path_auth::lock_order_test_probe::html_sites_acquired();
         Self { inner: Some(inner) }
     }
@@ -146,7 +297,7 @@ impl<'a> HtmlPreviewSitesGuard<'a> {
 
 #[cfg(test)]
 impl Deref for HtmlPreviewSitesGuard<'_> {
-    type Target = HashMap<PathBuf, HtmlPreviewSite>;
+    type Target = HtmlPreviewSites;
 
     fn deref(&self) -> &Self::Target {
         self.inner.as_deref().expect("HTML sites guard is active")
@@ -180,7 +331,7 @@ impl HtmlPreviewServerState {
                 let mut sites = HtmlPreviewSitesGuard::new(guard);
                 #[cfg(not(test))]
                 let mut sites = guard;
-                let drained_leases = sites.drain().map(|(_, site)| site.lease.clone()).collect();
+                let drained_leases = sites.drain_leases();
                 drop(sites);
                 self.sites.clear_poison();
                 return Err(HtmlPreviewSitesRecoveryError { drained_leases });
@@ -203,33 +354,67 @@ impl HtmlPreviewServerState {
         if leases.is_empty() {
             return Ok(());
         }
-        self.lock_sites()?
-            .retain(|_, site| !leases.contains(&site.lease));
+        let mut sites = self.lock_sites()?;
+        sites.retain(|_, site| !leases.contains(&site.lease));
+        sites.embeds.retain(|_, site| !leases.contains(&site.lease));
         Ok(())
     }
 
-    #[cfg(test)]
     fn remove_committed_generation(
         &self,
         document: &Path,
         active_lease: &PreviewLeaseId,
-    ) -> Result<(), String> {
-        let mut sites = self
-            .lock_sites()
-            .map_err(HtmlPreviewSitesRecoveryError::into_message)?;
+    ) -> Result<HashSet<PreviewLeaseId>, HtmlPreviewSitesRecoveryError> {
+        let mut sites = self.lock_sites()?;
         if sites
             .get(document)
             .is_some_and(|site| &site.lease == active_lease)
         {
-            sites.remove(document);
+            return Ok(sites
+                .remove(document)
+                .map(|site| HashSet::from([site.lease.clone()]))
+                .unwrap_or_default());
         }
-        Ok(())
+        Ok(HashSet::new())
+    }
+
+    fn rollback_committed_embed_owner(
+        &self,
+        key: &HtmlEmbedSiteKey,
+        owner_id: u64,
+        active_lease: &PreviewLeaseId,
+        remove_generation: bool,
+    ) -> Result<HashSet<PreviewLeaseId>, HtmlPreviewSitesRecoveryError> {
+        let mut sites = self.lock_sites()?;
+        let should_remove = if let Some(site) = sites
+            .embeds
+            .get_mut(key)
+            .filter(|site| &site.lease == active_lease)
+        {
+            if remove_generation {
+                true
+            } else {
+                site.owners.remove(&owner_id);
+                site.owners.is_empty()
+            }
+        } else {
+            false
+        };
+        Ok(if should_remove {
+            sites
+                .embeds
+                .remove(key)
+                .map(|site| HashSet::from([site.lease.clone()]))
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        })
     }
 
     pub(crate) fn stop_all_sites(&self) -> Result<(), String> {
         self.lock_sites()
             .map_err(HtmlPreviewSitesRecoveryError::into_message)?
-            .clear();
+            .clear_all();
         Ok(())
     }
 
@@ -237,6 +422,21 @@ impl HtmlPreviewServerState {
         &self,
         scope: AuthorizedPreviewScope,
         initial_content: String,
+    ) -> Result<HtmlPreviewSite, String> {
+        self.start_site_with_content(
+            scope,
+            HtmlPreviewContent::LiveDraft(Arc::new(Mutex::new(initial_content))),
+        )
+    }
+
+    fn start_disk_site(&self, scope: AuthorizedPreviewScope) -> Result<HtmlPreviewSite, String> {
+        self.start_site_with_content(scope, HtmlPreviewContent::Disk)
+    }
+
+    fn start_site_with_content(
+        &self,
+        scope: AuthorizedPreviewScope,
+        content: HtmlPreviewContent,
     ) -> Result<HtmlPreviewSite, String> {
         #[cfg(test)]
         if let Some(error) = self
@@ -248,7 +448,7 @@ impl HtmlPreviewServerState {
             return Err(error);
         }
 
-        HtmlPreviewSite::start(scope, initial_content)
+        HtmlPreviewSite::start(scope, content)
     }
 
     #[cfg(test)]
@@ -273,12 +473,32 @@ impl HtmlPreviewServerState {
 
     #[cfg(test)]
     fn site_lease_snapshot(&self) -> Result<HashSet<PreviewLeaseId>, String> {
-        Ok(self
+        let sites = self
             .lock_sites()
-            .map_err(HtmlPreviewSitesRecoveryError::into_message)?
+            .map_err(HtmlPreviewSitesRecoveryError::into_message)?;
+        Ok(sites
             .values()
             .map(|site| site.lease.clone())
+            .chain(sites.embeds.values().map(|site| site.lease.clone()))
             .collect())
+    }
+
+    #[cfg(test)]
+    fn embed_stop_flag_for_test(
+        &self,
+        anchor: impl AsRef<Path>,
+        document: impl AsRef<Path>,
+    ) -> Result<Arc<AtomicBool>, String> {
+        let key = HtmlEmbedSiteKey {
+            anchor: normalize_existing_path(anchor)?,
+            document: normalize_existing_path(document)?,
+        };
+        self.lock_sites()
+            .map_err(HtmlPreviewSitesRecoveryError::into_message)?
+            .embeds
+            .get(&key)
+            .map(|site| Arc::clone(&site.stop))
+            .ok_or_else(|| "Embedded preview site is not active".to_string())
     }
 }
 
@@ -414,12 +634,112 @@ fn request_is_local(request: &Request, authority: &str) -> bool {
     local_client && valid_host
 }
 
+#[cfg(target_os = "macos")]
+fn opened_file_path(file: &File) -> io::Result<PathBuf> {
+    use std::{
+        ffi::CStr,
+        os::{fd::AsRawFd, unix::ffi::OsStringExt},
+    };
+
+    const F_GETPATH: std::ffi::c_int = 50;
+    const PATH_BUFFER_SIZE: usize = 4096;
+
+    unsafe extern "C" {
+        fn fcntl(fd: std::ffi::c_int, command: std::ffi::c_int, ...) -> std::ffi::c_int;
+    }
+
+    let mut path = [0_u8; PATH_BUFFER_SIZE];
+    if unsafe { fcntl(file.as_raw_fd(), F_GETPATH, path.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = CStr::from_bytes_until_nul(&path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "opened path is not terminated"))?;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(
+        path.to_bytes().to_vec(),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn opened_file_path(file: &File) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(windows)]
+fn opened_file_path(file: &File) -> io::Result<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::{ffi::OsStringExt, io::AsRawHandle},
+        ptr::null_mut,
+    };
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let required = unsafe { GetFinalPathNameByHandleW(handle, null_mut(), 0, 0) };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buffer = vec![0_u16; required as usize + 1];
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    if written == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written as usize >= buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened path changed while it was queried",
+        ));
+    }
+    buffer.truncate(written as usize);
+    Ok(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn opened_file_path(_file: &File) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "opened-file path verification is unavailable on this platform",
+    ))
+}
+
+fn open_authorized_file_with(
+    requested: &Path,
+    root: &Path,
+    after_open: impl FnOnce(),
+    after_opened_path: impl FnOnce(),
+) -> io::Result<(File, std::fs::Metadata, PathBuf)> {
+    let file = File::open(requested)?;
+    after_open();
+    let opened_path = opened_file_path(&file)?;
+    after_opened_path();
+    let canonical = normalize_existing_path(&opened_path)
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    let retained_path = opened_file_path(&file)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || retained_path != canonical || !path_is_under(&canonical, root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "opened preview file escaped its authorized root",
+        ));
+    }
+    Ok((file, metadata, canonical))
+}
+
+fn open_authorized_file(
+    requested: &Path,
+    root: &Path,
+) -> io::Result<(File, std::fs::Metadata, PathBuf)> {
+    open_authorized_file_with(requested, root, || {}, || {})
+}
+
 fn route_request(
     request: Request,
     authority: &str,
     root: &Path,
     document: &Path,
-    content: &Mutex<String>,
+    content: &HtmlPreviewContent,
 ) {
     if !request_is_local(&request, authority) {
         respond_bytes(
@@ -481,8 +801,8 @@ fn route_request(
         return;
     }
     let requested = root.join(relative);
-    let canonical = match normalize_existing_path(&requested) {
-        Ok(path) if path_is_under(&path, root) && path.is_file() => path,
+    let (file, metadata, canonical) = match open_authorized_file(&requested, root) {
+        Ok(opened) => opened,
         _ => {
             respond_bytes(
                 request,
@@ -495,39 +815,31 @@ fn route_request(
     };
 
     if canonical == document {
-        let live_content = match content.lock() {
-            Ok(content) => content.clone(),
-            Err(_) => {
-                respond_bytes(
-                    request,
-                    500,
-                    "text/plain; charset=utf-8",
-                    b"Preview unavailable".to_vec(),
-                );
-                return;
-            }
-        };
-        respond_bytes(
-            request,
-            200,
-            "text/html; charset=utf-8",
-            live_content.into_bytes(),
-        );
-        return;
+        if let HtmlPreviewContent::LiveDraft(content) = content {
+            let live_content = match content.lock() {
+                Ok(content) => content.clone(),
+                Err(_) => {
+                    respond_bytes(
+                        request,
+                        500,
+                        "text/plain; charset=utf-8",
+                        b"Preview unavailable".to_vec(),
+                    );
+                    return;
+                }
+            };
+            respond_bytes(
+                request,
+                200,
+                "text/html; charset=utf-8",
+                live_content.into_bytes(),
+            );
+            return;
+        }
     }
 
-    match File::open(&canonical).and_then(|file| file.metadata().map(|metadata| (file, metadata))) {
-        Ok((file, metadata)) => {
-            let mime = mime_guess::from_path(&canonical).first_or_octet_stream();
-            respond_file(request, mime.as_ref(), file, metadata.len() as usize);
-        }
-        Err(_) => respond_bytes(
-            request,
-            404,
-            "text/plain; charset=utf-8",
-            b"Not found".to_vec(),
-        ),
-    }
+    let mime = mime_guess::from_path(&canonical).first_or_octet_stream();
+    respond_file(request, mime.as_ref(), file, metadata.len() as usize);
 }
 
 fn encoded_relative_path(root: &Path, document: &Path) -> Result<String, String> {
@@ -548,16 +860,16 @@ fn encoded_relative_path(root: &Path, document: &Path) -> Result<String, String>
 }
 
 impl HtmlPreviewSite {
-    fn start(scope: AuthorizedPreviewScope, initial_content: String) -> Result<Self, String> {
+    fn start(scope: AuthorizedPreviewScope, content: HtmlPreviewContent) -> Result<Self, String> {
         let (document, root, lease) = scope.into_parts();
-        Self::start_parts(document, root, lease, initial_content)
+        Self::start_parts(document, root, lease, content)
     }
 
     fn start_parts(
         document: PathBuf,
         root: PathBuf,
         lease: PreviewLeaseId,
-        initial_content: String,
+        content: HtmlPreviewContent,
     ) -> Result<Self, String> {
         let encoded_path = encoded_relative_path(&root, &document)?;
         #[cfg(test)]
@@ -571,14 +883,13 @@ impl HtmlPreviewSite {
             .to_ip()
             .ok_or_else(|| "HTML preview server did not bind to an IP address".to_string())?;
         let authority = address.to_string();
-        let content = Arc::new(Mutex::new(initial_content));
         let stop = Arc::new(AtomicBool::new(false));
 
         for worker_index in 0..PREVIEW_WORKERS {
             let worker_server = Arc::clone(&server);
             let worker_root = root.clone();
             let worker_document = document.clone();
-            let worker_content = Arc::clone(&content);
+            let worker_content = content.clone();
             let worker_stop = Arc::clone(&stop);
             let worker_authority = authority.clone();
             let worker_builder =
@@ -625,12 +936,18 @@ impl HtmlPreviewSite {
         content: &str,
         lease: PreviewLeaseId,
     ) -> Result<(String, PreviewLeaseId), String> {
-        *self
-            .content
+        let HtmlPreviewContent::LiveDraft(live_content) = &self.content else {
+            return Err("Disk-backed HTML preview cannot be updated in memory".to_string());
+        };
+        *live_content
             .lock()
             .map_err(|_| "HTML preview state is poisoned".to_string())? = content.to_string();
+        Ok(self.replace_lease(lease))
+    }
+
+    fn replace_lease(&mut self, lease: PreviewLeaseId) -> (String, PreviewLeaseId) {
         let retired_lease = std::mem::replace(&mut self.lease, lease);
-        Ok((self.url.clone(), retired_lease))
+        (self.url.clone(), retired_lease)
     }
 }
 
@@ -643,6 +960,25 @@ impl Drop for HtmlPreviewSite {
     }
 }
 
+fn retire_rollback_leases(
+    state: &AppState,
+    leases: &HashSet<PreviewLeaseId>,
+) -> Result<(), String> {
+    match retire_preview_leases_inner(state, leases) {
+        Ok(()) => Ok(()),
+        Err(PreviewRetirementError::AuthorizationUnavailable(error)) => {
+            let _ = state.html_preview_server.stop_all_sites();
+            Err(error)
+        }
+        #[cfg(test)]
+        Err(PreviewRetirementError::Recoverable(error)) => {
+            retire_preview_leases_inner(state, leases)
+                .map_err(PreviewRetirementError::into_message)?;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn prepare_html_preview_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -650,9 +986,19 @@ pub(crate) fn prepare_html_preview_inner(
 ) -> Result<String, String> {
     let path = path.as_ref().to_path_buf();
     let scope = preview_scope_for_file_inner(state, path)?;
+    prepare_html_preview_with_scope_inner(state, scope, content)
+}
+
+fn prepare_html_preview_with_scope_inner(
+    state: &AppState,
+    scope: AuthorizedPreviewScope,
+    content: &str,
+) -> Result<String, String> {
     let reserved_lease = scope.lease().clone();
     let active_lease = reserved_lease.clone();
     let document = scope.document().to_path_buf();
+    #[cfg(test)]
+    preview_commit_test_probe::run(state, &reserved_lease);
     let site_transaction: Result<HtmlPreviewCommit, HtmlPreviewSiteTransactionError> = (|| {
         if WorkspaceFileKind::classify(scope.document()) != Some(WorkspaceFileKind::Html) {
             return Err(HtmlPreviewSiteTransactionError::Operation(
@@ -685,22 +1031,18 @@ pub(crate) fn prepare_html_preview_inner(
                 .map_err(HtmlPreviewSiteTransactionError::Operation)?;
             (url, Some(retired_lease))
         } else {
+            if sites.len_all() >= MAX_PREVIEW_SITES {
+                return Err(HtmlPreviewSiteTransactionError::Operation(
+                    "Too many active HTML preview sites".to_string(),
+                ));
+            }
             let site = state
                 .html_preview_server
                 .start_site(scope, content.to_string())
                 .map_err(HtmlPreviewSiteTransactionError::Operation)?;
-            let retired_lease = if sites.len() >= MAX_PREVIEW_SITES {
-                if let Some(oldest) = sites.keys().next().cloned() {
-                    sites.remove(&oldest).map(|site| site.lease.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             let url = site.url.clone();
             sites.insert(document.clone(), site);
-            (url, retired_lease)
+            (url, None)
         };
         Ok(HtmlPreviewCommit {
             document,
@@ -742,6 +1084,35 @@ pub(crate) fn prepare_html_preview_inner(
         active_lease: _active_lease,
         retired_leases,
     } = commit;
+    let lease_is_valid = match preview_lease_support_statuses_inner(state, &[&_active_lease]) {
+        Ok(statuses) => statuses[0],
+        Err(error) => {
+            let _ = state.html_preview_server.stop_all_sites();
+            return Err(error);
+        }
+    };
+    if !lease_is_valid {
+        let mut rollback_leases = retired_leases;
+        rollback_leases.insert(_active_lease.clone());
+        let rollback_error = match state
+            .html_preview_server
+            .remove_committed_generation(&_document, &_active_lease)
+        {
+            Ok(removed_leases) => {
+                rollback_leases.extend(removed_leases);
+                None
+            }
+            Err(recovery) => {
+                let (error, drained_leases) = recovery.into_parts();
+                rollback_leases.extend(drained_leases);
+                Some(error)
+            }
+        };
+        retire_rollback_leases(state, &rollback_leases)?;
+        return Err(
+            rollback_error.unwrap_or_else(|| PREVIEW_AUTHORIZATION_CHANGED_ERROR.to_string())
+        );
+    }
     match retire_preview_leases_inner(state, &retired_leases) {
         Ok(()) => Ok(url),
         Err(PreviewRetirementError::AuthorizationUnavailable(error)) => {
@@ -750,16 +1121,405 @@ pub(crate) fn prepare_html_preview_inner(
         }
         #[cfg(test)]
         Err(PreviewRetirementError::Recoverable(error)) => {
-            state
+            let mut rollback_leases = state
                 .html_preview_server
-                .remove_committed_generation(&_document, &_active_lease)?;
-            let mut rollback_leases = retired_leases;
+                .remove_committed_generation(&_document, &_active_lease)
+                .map_err(HtmlPreviewSitesRecoveryError::into_message)?;
+            rollback_leases.extend(retired_leases);
             rollback_leases.insert(_active_lease);
             retire_preview_leases_inner(state, &rollback_leases)
                 .map_err(|error| error.into_message())?;
             Err(error)
         }
     }
+}
+
+fn prepare_html_embed_with_scope_inner(
+    state: &AppState,
+    scope: AuthorizedPreviewScope,
+    anchor: PathBuf,
+    owner_window: &str,
+) -> Result<MarkdownHtmlEmbedHandle, String> {
+    let reserved_lease = scope.lease().clone();
+    let key = HtmlEmbedSiteKey {
+        anchor,
+        document: scope.document().to_path_buf(),
+    };
+    #[cfg(test)]
+    preview_commit_test_probe::run(state, &reserved_lease);
+    let site_transaction: Result<HtmlEmbedPreviewCommit, HtmlPreviewSiteTransactionError> =
+        (|| {
+            if WorkspaceFileKind::classify(scope.document()) != Some(WorkspaceFileKind::Html) {
+                return Err(HtmlPreviewSiteTransactionError::Operation(
+                    "HTML preview requires an HTML file".into(),
+                ));
+            }
+            let mut sites = state
+                .html_preview_server
+                .lock_sites()
+                .map_err(HtmlPreviewSiteTransactionError::SitesRecovery)?;
+            let owner_id = sites
+                .allocate_embed_owner_id()
+                .map_err(HtmlPreviewSiteTransactionError::Operation)?;
+            let (url, active_lease, retired_leases) = if let Some(site) = sites.embeds.get_mut(&key)
+            {
+                if site.root.as_path() != scope.root() {
+                    return Err(HtmlPreviewSiteTransactionError::Operation(
+                        "HTML embed scope changed while the site was active".to_string(),
+                    ));
+                }
+                site.owners.insert(owner_id, owner_window.to_string());
+                (
+                    site.url.clone(),
+                    site.lease.clone(),
+                    HashSet::from([reserved_lease.clone()]),
+                )
+            } else {
+                if sites.len_all() >= MAX_PREVIEW_SITES {
+                    return Err(HtmlPreviewSiteTransactionError::Operation(
+                        "Too many active HTML preview sites".to_string(),
+                    ));
+                }
+                let site = state
+                    .html_preview_server
+                    .start_disk_site(scope)
+                    .map_err(HtmlPreviewSiteTransactionError::Operation)?;
+                let url = site.url.clone();
+                sites.embeds.insert(
+                    key.clone(),
+                    EmbeddedPreviewSite::new(site, owner_id, owner_window),
+                );
+                (url, reserved_lease.clone(), HashSet::new())
+            };
+            Ok(HtmlEmbedPreviewCommit {
+                key,
+                url,
+                owner_id,
+                active_lease,
+                retired_leases,
+            })
+        })();
+    let commit = match site_transaction {
+        Ok(committed) => committed,
+        Err(HtmlPreviewSiteTransactionError::Operation(error)) => {
+            match retire_preview_lease_inner(state, &reserved_lease) {
+                Ok(()) => return Err(error),
+                Err(PreviewRetirementError::AuthorizationUnavailable(error)) => {
+                    let _ = state.html_preview_server.stop_all_sites();
+                    return Err(error);
+                }
+                #[cfg(test)]
+                Err(PreviewRetirementError::Recoverable(error)) => return Err(error),
+            }
+        }
+        Err(HtmlPreviewSiteTransactionError::SitesRecovery(recovery)) => {
+            let (error, mut rollback_leases) = recovery.into_parts();
+            rollback_leases.insert(reserved_lease.clone());
+            match retire_preview_leases_inner(state, &rollback_leases) {
+                Ok(()) => return Err(error),
+                Err(PreviewRetirementError::AuthorizationUnavailable(error)) => {
+                    let _ = state.html_preview_server.stop_all_sites();
+                    return Err(error);
+                }
+                #[cfg(test)]
+                Err(PreviewRetirementError::Recoverable(error)) => return Err(error),
+            }
+        }
+    };
+    let HtmlEmbedPreviewCommit {
+        key: _key,
+        url,
+        owner_id: _owner_id,
+        active_lease: _active_lease,
+        retired_leases,
+    } = commit;
+    let lease_statuses =
+        match preview_lease_support_statuses_inner(state, &[&reserved_lease, &_active_lease]) {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                let _ = state.html_preview_server.stop_all_sites();
+                return Err(error);
+            }
+        };
+    let reserved_lease_is_valid = lease_statuses[0];
+    let active_lease_is_valid = lease_statuses[1];
+    if !reserved_lease_is_valid || !active_lease_is_valid {
+        let mut rollback_leases = retired_leases;
+        rollback_leases.insert(reserved_lease);
+        let rollback_error = match state.html_preview_server.rollback_committed_embed_owner(
+            &_key,
+            _owner_id,
+            &_active_lease,
+            !active_lease_is_valid,
+        ) {
+            Ok(removed_leases) => {
+                rollback_leases.extend(removed_leases);
+                None
+            }
+            Err(recovery) => {
+                let (error, drained_leases) = recovery.into_parts();
+                rollback_leases.extend(drained_leases);
+                Some(error)
+            }
+        };
+        retire_rollback_leases(state, &rollback_leases)?;
+        return Err(
+            rollback_error.unwrap_or_else(|| PREVIEW_AUTHORIZATION_CHANGED_ERROR.to_string())
+        );
+    }
+    match retire_preview_leases_inner(state, &retired_leases) {
+        Ok(()) => Ok(MarkdownHtmlEmbedHandle {
+            url,
+            owner_id: _owner_id,
+        }),
+        Err(PreviewRetirementError::AuthorizationUnavailable(error)) => {
+            let _ = state.html_preview_server.stop_all_sites();
+            Err(error)
+        }
+        #[cfg(test)]
+        Err(PreviewRetirementError::Recoverable(error)) => {
+            let mut rollback_leases = state
+                .html_preview_server
+                .rollback_committed_embed_owner(&_key, _owner_id, &_active_lease, false)
+                .map_err(HtmlPreviewSitesRecoveryError::into_message)?;
+            rollback_leases.extend(retired_leases);
+            retire_preview_leases_inner(state, &rollback_leases)
+                .map_err(|error| error.into_message())?;
+            Err(error)
+        }
+    }
+}
+
+fn decode_embed_path(input: &str) -> Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err("Invalid percent-encoded HTML embed path".into());
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .map_err(|_| "Invalid HTML embed path".to_string())?;
+            decoded.push(
+                u8::from_str_radix(hex, 16)
+                    .map_err(|_| "Invalid percent-encoded HTML embed path".to_string())?,
+            );
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| "HTML embed path is not valid UTF-8".into())
+}
+
+fn relative_html_embed_path(html_src: &str) -> Result<PathBuf, String> {
+    let source = html_src.trim();
+    if source.is_empty() {
+        return Err("HTML embed path is empty".into());
+    }
+    if source.contains(['?', '#']) {
+        return Err("HTML embed paths cannot contain a query or fragment".into());
+    }
+    let decoded = decode_embed_path(source)?;
+    if decoded.contains(['?', '#']) {
+        return Err("HTML embed paths cannot contain a query or fragment".into());
+    }
+    let lower = decoded.to_ascii_lowercase();
+    let has_scheme = lower.find(':').is_some_and(|colon| {
+        colon > 0
+            && lower[..colon].bytes().enumerate().all(|(index, byte)| {
+                if index == 0 {
+                    byte.is_ascii_alphabetic()
+                } else {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+                }
+            })
+    });
+    if has_scheme || lower.starts_with("//") {
+        return Err("Only relative local HTML embed paths are supported".into());
+    }
+    if decoded.contains('\\') {
+        return Err("Backslashes are not allowed in HTML embed paths".into());
+    }
+    let path = PathBuf::from(&decoded);
+    if path.is_absolute() || decoded.starts_with('/') || decoded.starts_with('~') {
+        return Err("Absolute HTML embed paths are not allowed".into());
+    }
+    let encoded_source = source.to_ascii_lowercase();
+    if encoded_source.contains("%2f") || encoded_source.contains("%5c") {
+        return Err("Percent-encoded path separators are not allowed".into());
+    }
+    let has_encoded_parent = source.split('/').any(|segment| {
+        segment != ".."
+            && decode_embed_path(segment).is_ok_and(|decoded_segment| decoded_segment == "..")
+    });
+    if has_encoded_parent {
+        return Err("Percent-encoded path traversal is not allowed".into());
+    }
+    if WorkspaceFileKind::classify(&path) != Some(WorkspaceFileKind::Html) {
+        return Err("HTML embed requires an .html, .htm, or .xhtml file".into());
+    }
+    Ok(path)
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_markdown_html_embed_inner(
+    state: &AppState,
+    markdown_path: impl AsRef<Path>,
+    html_src: &str,
+    owner_window: &str,
+) -> Result<MarkdownHtmlEmbedHandle, String> {
+    acquire_markdown_html_embed_with_root_inner(state, markdown_path, html_src, owner_window, None)
+}
+
+fn acquire_markdown_html_embed_with_root_inner(
+    state: &AppState,
+    markdown_path: impl AsRef<Path>,
+    html_src: &str,
+    owner_window: &str,
+    workspace_root: Option<&Path>,
+) -> Result<MarkdownHtmlEmbedHandle, String> {
+    let relative = relative_html_embed_path(html_src)?;
+    let markdown = normalize_existing_path(markdown_path)
+        .map_err(|_| "HTML embed requires an authorized Markdown file".to_string())?;
+    if !markdown.is_file()
+        || WorkspaceFileKind::classify(&markdown) != Some(WorkspaceFileKind::Markdown)
+    {
+        return Err("HTML embed requires an authorized Markdown file".into());
+    }
+    let markdown_parent = markdown
+        .parent()
+        .ok_or_else(|| "Markdown file has no parent directory".to_string())?;
+    let target = normalize_existing_path(markdown_parent.join(relative))
+        .map_err(|_| "HTML embed target is unavailable".to_string())?;
+    if !target.is_file() {
+        return Err("HTML embed target is not a file".into());
+    }
+    if workspace_root.is_none() && !path_is_under(&target, markdown_parent) {
+        return Err("HTML embed target escaped the Markdown directory".into());
+    }
+    let scope =
+        preview_scope_for_anchored_file_with_root_inner(state, &markdown, &target, workspace_root)?;
+    prepare_html_embed_with_scope_inner(state, scope, markdown, owner_window)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_markdown_html_embed_inner(
+    state: &AppState,
+    markdown_path: impl AsRef<Path>,
+    html_src: &str,
+) -> Result<String, String> {
+    acquire_markdown_html_embed_inner(state, markdown_path, html_src, "test")
+        .map(|handle| handle.url)
+}
+
+#[cfg(test)]
+fn prepare_markdown_html_embed_in_workspace_inner(
+    state: &AppState,
+    markdown_path: impl AsRef<Path>,
+    html_src: &str,
+    workspace_root: impl AsRef<Path>,
+) -> Result<String, String> {
+    acquire_markdown_html_embed_with_root_inner(
+        state,
+        markdown_path,
+        html_src,
+        "test",
+        Some(workspace_root.as_ref()),
+    )
+    .map(|handle| handle.url)
+}
+
+fn retire_released_embed_leases(
+    state: &AppState,
+    leases: &HashSet<PreviewLeaseId>,
+) -> Result<(), String> {
+    if leases.is_empty() {
+        return Ok(());
+    }
+    match retire_preview_leases_inner(state, leases) {
+        Ok(()) => Ok(()),
+        Err(PreviewRetirementError::AuthorizationUnavailable(error)) => {
+            let _ = state.html_preview_server.stop_all_sites();
+            Err(error)
+        }
+        #[cfg(test)]
+        Err(PreviewRetirementError::Recoverable(error)) => {
+            retire_preview_leases_inner(state, leases)
+                .map_err(PreviewRetirementError::into_message)?;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn release_markdown_html_embed_inner(
+    state: &AppState,
+    owner_id: u64,
+    owner_window: &str,
+) -> Result<(), String> {
+    let retired_lease = {
+        let mut sites = match state.html_preview_server.lock_sites() {
+            Ok(sites) => sites,
+            Err(recovery) => {
+                let (error, drained_leases) = recovery.into_parts();
+                retire_released_embed_leases(state, &drained_leases)?;
+                return Err(error);
+            }
+        };
+        let Some(key) = sites.embeds.iter().find_map(|(key, site)| {
+            site.owners
+                .get(&owner_id)
+                .filter(|window| window.as_str() == owner_window)
+                .map(|_| key.clone())
+        }) else {
+            return Ok(());
+        };
+        let should_remove = {
+            let site = sites
+                .embeds
+                .get_mut(&key)
+                .expect("owner lookup found an embedded preview site");
+            site.owners.remove(&owner_id);
+            site.owners.is_empty()
+        };
+        should_remove
+            .then(|| sites.embeds.remove(&key).map(|site| site.lease.clone()))
+            .flatten()
+    };
+
+    retire_released_embed_leases(state, &retired_lease.into_iter().collect())
+}
+
+pub(crate) fn release_markdown_html_embed_window_inner(
+    state: &AppState,
+    owner_window: &str,
+) -> Result<(), String> {
+    let retired_leases = {
+        let mut sites = match state.html_preview_server.lock_sites() {
+            Ok(sites) => sites,
+            Err(recovery) => {
+                let (error, drained_leases) = recovery.into_parts();
+                retire_released_embed_leases(state, &drained_leases)?;
+                return Err(error);
+            }
+        };
+        for site in sites.embeds.values_mut() {
+            site.owners.retain(|_, window| window != owner_window);
+        }
+        let empty_sites = sites
+            .embeds
+            .iter()
+            .filter_map(|(key, site)| site.owners.is_empty().then_some(key.clone()))
+            .collect::<Vec<_>>();
+        empty_sites
+            .into_iter()
+            .filter_map(|key| sites.embeds.remove(&key).map(|site| site.lease.clone()))
+            .collect::<HashSet<_>>()
+    };
+
+    retire_released_embed_leases(state, &retired_leases)
 }
 
 #[tauri::command]
@@ -771,13 +1531,40 @@ pub(crate) fn prepare_html_preview(
     prepare_html_preview_inner(&state, path, &content)
 }
 
+#[tauri::command]
+pub(crate) fn prepare_markdown_html_embed(
+    markdown_path: String,
+    html_src: String,
+    workspace_root: Option<String>,
+    webview_window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<MarkdownHtmlEmbedHandle, String> {
+    acquire_markdown_html_embed_with_root_inner(
+        &state,
+        markdown_path,
+        &html_src,
+        webview_window.label(),
+        workspace_root.as_deref().map(Path::new),
+    )
+}
+
+#[tauri::command]
+pub(crate) fn release_markdown_html_embed(
+    owner_id: u64,
+    webview_window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    release_markdown_html_embed_inner(&state, owner_id, webview_window.label())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs,
         io::{Read, Write},
         net::TcpStream,
+        sync::atomic::Ordering,
     };
 
     use tempfile::tempdir;
@@ -787,15 +1574,21 @@ mod tests {
         models::{MutationKind, MutationOutcome},
         path_auth::{
             authorize_directory_root_inner, authorize_file_inner,
-            ensure_authorized_existing_file_inner, is_authorized_image_path,
-            normalize_existing_path, relocate_authorized_path_prefix_inner,
-            revoke_authorized_file_inner, revoke_authorized_path_prefix_inner,
+            ensure_authorized_existing_file_inner, ensure_authorized_write_file_inner,
+            is_authorized_image_path, normalize_existing_path,
+            relocate_authorized_path_prefix_inner, revoke_authorized_file_inner,
+            revoke_authorized_path_prefix_inner,
         },
         state::AppState,
         workspace_file_kind::WorkspaceFileKind,
     };
 
-    use super::{prepare_html_preview_inner, MAX_PREVIEW_SITES};
+    use super::{
+        acquire_markdown_html_embed_inner, prepare_html_preview_inner,
+        prepare_markdown_html_embed_in_workspace_inner, prepare_markdown_html_embed_inner,
+        release_markdown_html_embed_inner, release_markdown_html_embed_window_inner,
+        MAX_PREVIEW_SITES,
+    };
 
     fn http_request(url: &str, method: &str, headers: &[(&str, &str)]) -> Vec<u8> {
         let address_and_path = url.strip_prefix("http://").unwrap();
@@ -872,6 +1665,716 @@ mod tests {
             prepare_html_preview_inner(&state, &html, "<h1>Updated again</h1>").unwrap();
         assert_eq!(updated_url, url);
         assert!(http_get(&updated_url).contains("<h1>Updated again</h1>"));
+    }
+
+    #[test]
+    fn prepares_relative_html_embed_from_authorized_markdown() {
+        let dir = tempdir().unwrap();
+        let markdown = dir.path().join("notes.md");
+        let embed_dir = dir.path().join("embed");
+        fs::create_dir(&embed_dir).unwrap();
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(
+            embed_dir.join("index.html"),
+            "<h1>Embedded</h1><script src=\"app.js\"></script>",
+        )
+        .unwrap();
+        fs::write(embed_dir.join("app.js"), "window.embedded = true;").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+
+        let url = prepare_markdown_html_embed_inner(&state, &markdown, "embed/index.html")
+            .expect("authorized relative HTML should be prepared");
+
+        let response = http_get(&url);
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("<h1>Embedded</h1>"));
+        let asset_url = format!("{}/app.js", url.rsplit_once('/').unwrap().0);
+        assert!(http_get(&asset_url).contains("window.embedded = true;"));
+    }
+
+    #[test]
+    fn nested_markdown_embeds_parent_html_within_authorized_workspace() {
+        let workspace = tempdir().unwrap();
+        let notes = workspace.path().join("notes");
+        let shared = workspace.path().join("shared");
+        fs::create_dir(&notes).unwrap();
+        fs::create_dir(&shared).unwrap();
+        let markdown = notes.join("guide.md");
+        fs::write(&markdown, "# Guide").unwrap();
+        fs::write(
+            shared.join("embed.html"),
+            "<h1>Workspace embed</h1><script src=\"app.js\"></script>",
+        )
+        .unwrap();
+        fs::write(shared.join("app.js"), "window.workspaceEmbed = true;").unwrap();
+        fs::write(
+            workspace.path().join("unrelated.js"),
+            "window.unrelated = true;",
+        )
+        .unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+
+        let url = prepare_markdown_html_embed_in_workspace_inner(
+            &state,
+            &markdown,
+            "../shared/embed.html",
+            workspace.path(),
+        )
+        .expect("a parent-relative embed inside the authorized workspace should be prepared");
+
+        assert!(http_get(&url).contains("<h1>Workspace embed</h1>"));
+        let asset_url = format!("{}/app.js", url.rsplit_once('/').unwrap().0);
+        assert!(http_get(&asset_url).contains("window.workspaceEmbed = true;"));
+        let authority = url
+            .strip_prefix("http://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        assert!(http_get(&format!("http://{authority}/unrelated.js")).starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn parent_relative_html_embed_cannot_escape_authorized_workspace() {
+        let container = tempdir().unwrap();
+        let workspace = container.path().join("workspace");
+        let notes = workspace.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let markdown = notes.join("guide.md");
+        fs::write(&markdown, "# Guide").unwrap();
+        fs::write(container.path().join("outside.html"), "outside").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.clone()).unwrap();
+
+        let error = prepare_markdown_html_embed_in_workspace_inner(
+            &state,
+            &markdown,
+            "../../outside.html",
+            &workspace,
+        )
+        .expect_err("a parent-relative embed must remain inside its authorized workspace");
+
+        assert!(error.contains("workspace"));
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn standalone_preview_does_not_commit_a_lease_revoked_before_site_commit() {
+        let workspace = tempdir().unwrap();
+        let html = workspace.path().join("preview.html");
+        fs::write(&html, "<h1>Saved</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        let canonical_root = normalize_existing_path(workspace.path()).unwrap();
+
+        super::preview_commit_test_probe::before_next_commit(move |state, _lease| {
+            revoke_authorized_path_prefix_inner(state, &canonical_root).unwrap();
+        });
+
+        let error = prepare_html_preview_inner(&state, &html, "<h1>Draft</h1>")
+            .expect_err("a revoked preview lease must not be committed");
+
+        assert_eq!(
+            error,
+            "HTML preview authorization changed before the site was committed"
+        );
+        assert!(state
+            .html_preview_server
+            .site_documents()
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn markdown_embed_does_not_commit_a_lease_revoked_before_site_commit() {
+        let workspace = tempdir().unwrap();
+        let markdown = workspace.path().join("notes.md");
+        let html = workspace.path().join("embed.html");
+        fs::write(&markdown, "<iframe src=\"embed.html\"></iframe>").unwrap();
+        fs::write(&html, "<button>Click</button>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        let canonical_root = normalize_existing_path(workspace.path()).unwrap();
+
+        super::preview_commit_test_probe::before_next_commit(move |state, _lease| {
+            revoke_authorized_path_prefix_inner(state, &canonical_root).unwrap();
+        });
+
+        let error = acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main")
+            .expect_err("a revoked embed lease must not be committed");
+
+        assert_eq!(
+            error,
+            "HTML preview authorization changed before the site was committed"
+        );
+        assert!(state
+            .html_preview_server
+            .site_lease_snapshot()
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reused_embed_removes_revoked_active_generation_before_returning_new_owner() {
+        let workspace = tempdir().unwrap();
+        let markdown = workspace.path().join("notes.md");
+        let html = workspace.path().join("embed.html");
+        fs::write(&markdown, "<iframe src=\"embed.html\"></iframe>").unwrap();
+        fs::write(&html, "<button>Click</button>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        let first =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let key = super::HtmlEmbedSiteKey {
+            anchor: normalize_existing_path(&markdown).unwrap(),
+            document: normalize_existing_path(&html).unwrap(),
+        };
+        let (active_lease, stop) = {
+            let sites = state.html_preview_server.sites.lock().unwrap();
+            let site = sites.embeds.get(&key).unwrap();
+            (site.lease.clone(), site.stop.clone())
+        };
+
+        super::preview_commit_test_probe::before_next_commit(move |state, _reserved_lease| {
+            crate::path_auth::retire_preview_lease_inner(state, &active_lease)
+                .map_err(crate::path_auth::PreviewRetirementError::into_message)
+                .unwrap();
+        });
+
+        let error = acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main")
+            .expect_err("a revoked active embed generation must not gain a new owner");
+
+        assert_eq!(error, super::PREVIEW_AUTHORIZATION_CHANGED_ERROR);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(state
+            .html_preview_server
+            .site_lease_snapshot()
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+        release_markdown_html_embed_inner(&state, first.owner_id, "main").unwrap();
+    }
+
+    #[test]
+    fn reused_embed_rolls_back_only_new_owner_when_reserved_lease_was_revoked() {
+        let workspace = tempdir().unwrap();
+        let markdown = workspace.path().join("notes.md");
+        let html = workspace.path().join("embed.html");
+        fs::write(&markdown, "<iframe src=\"embed.html\"></iframe>").unwrap();
+        fs::write(&html, "<button>Click</button>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        let first =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let key = super::HtmlEmbedSiteKey {
+            anchor: normalize_existing_path(&markdown).unwrap(),
+            document: normalize_existing_path(&html).unwrap(),
+        };
+        let active_lease = state
+            .html_preview_server
+            .sites
+            .lock()
+            .unwrap()
+            .embeds
+            .get(&key)
+            .unwrap()
+            .lease
+            .clone();
+
+        super::preview_commit_test_probe::before_next_commit(|state, reserved_lease| {
+            crate::path_auth::retire_preview_lease_inner(state, reserved_lease)
+                .map_err(crate::path_auth::PreviewRetirementError::into_message)
+                .unwrap();
+        });
+
+        let error = acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main")
+            .expect_err("a revoked reserved embed lease must roll back its owner");
+
+        assert_eq!(error, super::PREVIEW_AUTHORIZATION_CHANGED_ERROR);
+        {
+            let sites = state.html_preview_server.sites.lock().unwrap();
+            let retained = sites.embeds.get(&key).unwrap();
+            assert_eq!(retained.lease, active_lease);
+            assert_eq!(
+                retained.owners,
+                HashMap::from([(first.owner_id, "main".into())])
+            );
+        }
+        assert_eq!(
+            state.file_authorization().preview_lease_snapshot().unwrap(),
+            HashSet::from([active_lease])
+        );
+        release_markdown_html_embed_inner(&state, first.owner_id, "main").unwrap();
+    }
+
+    #[test]
+    fn markdown_embed_serves_only_files_under_the_markdown_parent() {
+        let workspace = tempdir().unwrap();
+        let notes = workspace.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        let markdown = notes.join("guide.md");
+        let html = notes.join("embed.html");
+        fs::write(&markdown, "# Guide").unwrap();
+        fs::write(&html, "<script src=\"/shared.js\"></script>").unwrap();
+        fs::write(notes.join("shared.js"), "window.shared = true;").unwrap();
+        fs::write(workspace.path().join("secret.js"), "window.secret = true;").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+
+        let url = prepare_markdown_html_embed_inner(&state, &markdown, "embed.html").unwrap();
+        let authority = url
+            .strip_prefix("http://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+
+        assert!(http_get(&format!("http://{authority}/shared.js")).contains("window.shared"));
+        assert!(http_get(&format!("http://{authority}/secret.js")).starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn standalone_preview_and_markdown_embed_of_the_same_html_coexist() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Saved embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+
+        let standalone_url =
+            prepare_html_preview_inner(&state, &html, "<h1>Unsaved draft</h1>").unwrap();
+        let embed_url = prepare_markdown_html_embed_inner(&state, &markdown, "embed.html").unwrap();
+
+        assert_ne!(standalone_url, embed_url);
+        assert!(http_get(&standalone_url).contains("<h1>Unsaved draft</h1>"));
+        assert!(http_get(&embed_url).contains("<h1>Saved embed</h1>"));
+    }
+
+    #[test]
+    fn markdown_embed_reads_the_current_html_from_disk_for_each_request() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>First version</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+
+        let url = prepare_markdown_html_embed_inner(&state, &markdown, "embed.html").unwrap();
+        assert!(http_get(&url).contains("<h1>First version</h1>"));
+
+        fs::write(&html, "<h1>Second version</h1>").unwrap();
+
+        assert!(http_get(&url).contains("<h1>Second version</h1>"));
+    }
+
+    #[test]
+    fn markdown_embed_site_lives_until_its_final_owner_releases_it() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Shared embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+
+        let first =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let second =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        assert_eq!(first.url, second.url);
+        assert_ne!(first.owner_id, second.owner_id);
+        let stop = state
+            .html_preview_server
+            .embed_stop_flag_for_test(&markdown, &html)
+            .unwrap();
+
+        release_markdown_html_embed_inner(&state, first.owner_id, "main").unwrap();
+
+        assert!(!stop.load(std::sync::atomic::Ordering::Acquire));
+        assert!(http_get(&second.url).contains("<h1>Shared embed</h1>"));
+        assert_eq!(
+            state
+                .file_authorization()
+                .preview_lease_snapshot()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        release_markdown_html_embed_inner(&state, second.owner_id, "main").unwrap();
+
+        assert!(stop.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn mismatched_window_cannot_release_an_embed_owner() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Shared embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+        let handle =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let key = super::HtmlEmbedSiteKey {
+            anchor: normalize_existing_path(&markdown).unwrap(),
+            document: normalize_existing_path(&html).unwrap(),
+        };
+        let (lease, stop) = {
+            let sites = state.html_preview_server.sites.lock().unwrap();
+            let site = sites.embeds.get(&key).unwrap();
+            (site.lease.clone(), site.stop.clone())
+        };
+
+        assert!(
+            release_markdown_html_embed_inner(&state, handle.owner_id, "guessed-window",).is_ok()
+        );
+
+        {
+            let sites = state.html_preview_server.sites.lock().unwrap();
+            let site = sites.embeds.get(&key).unwrap();
+            assert_eq!(site.lease, lease);
+            assert_eq!(
+                site.owners,
+                HashMap::from([(handle.owner_id, "main".into())])
+            );
+        }
+        assert!(!stop.load(Ordering::Acquire));
+        assert_eq!(
+            state.file_authorization().preview_lease_snapshot().unwrap(),
+            HashSet::from([lease])
+        );
+
+        release_markdown_html_embed_inner(&state, handle.owner_id, "main").unwrap();
+    }
+
+    #[test]
+    fn window_cleanup_removes_only_that_windows_owners_until_the_final_window_closes() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Shared embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+        let main_first =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let main_second =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let popout =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "popout").unwrap();
+        let key = super::HtmlEmbedSiteKey {
+            anchor: normalize_existing_path(&markdown).unwrap(),
+            document: normalize_existing_path(&html).unwrap(),
+        };
+        let (lease, stop) = {
+            let sites = state.html_preview_server.sites.lock().unwrap();
+            let site = sites.embeds.get(&key).unwrap();
+            (site.lease.clone(), site.stop.clone())
+        };
+
+        release_markdown_html_embed_window_inner(&state, "main").unwrap();
+
+        {
+            let sites = state.html_preview_server.sites.lock().unwrap();
+            let site = sites.embeds.get(&key).unwrap();
+            assert_eq!(site.lease, lease);
+            assert_eq!(
+                site.owners,
+                HashMap::from([(popout.owner_id, "popout".into())])
+            );
+            assert!(!site.owners.contains_key(&main_first.owner_id));
+            assert!(!site.owners.contains_key(&main_second.owner_id));
+        }
+        assert!(!stop.load(Ordering::Acquire));
+        assert_eq!(
+            state.file_authorization().preview_lease_snapshot().unwrap(),
+            HashSet::from([lease])
+        );
+
+        release_markdown_html_embed_window_inner(&state, "popout").unwrap();
+
+        assert!(stop.load(Ordering::Acquire));
+        assert!(state
+            .html_preview_server
+            .sites
+            .lock()
+            .unwrap()
+            .embeds
+            .is_empty());
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn poisoned_site_map_window_cleanup_stops_drained_sites_and_retires_their_leases() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Shared embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+        acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let stop = state
+            .html_preview_server
+            .embed_stop_flag_for_test(&markdown, &html)
+            .unwrap();
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _sites = state.html_preview_server.sites.lock().unwrap();
+            panic!("injected HTML site map poison before window cleanup");
+        }));
+        assert!(poison.is_err());
+        assert!(state.html_preview_server.sites.is_poisoned());
+
+        let _cleanup_result = release_markdown_html_embed_window_inner(&state, "main");
+
+        assert!(!state.html_preview_server.sites.is_poisoned());
+        assert!(state
+            .html_preview_server
+            .sites
+            .lock()
+            .unwrap()
+            .embeds
+            .is_empty());
+        assert!(stop.load(Ordering::Acquire));
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn renaming_the_markdown_anchor_stops_its_active_embed_site() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("notes.md");
+        let renamed_markdown = directory.path().join("renamed.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Embed</h1>").unwrap();
+        let canonical_markdown = normalize_existing_path(&markdown).unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+        let handle =
+            acquire_markdown_html_embed_inner(&state, &markdown, "embed.html", "main").unwrap();
+        let stop = state
+            .html_preview_server
+            .embed_stop_flag_for_test(&markdown, &html)
+            .unwrap();
+
+        fs::rename(&markdown, &renamed_markdown).unwrap();
+        let canonical_renamed_markdown = normalize_existing_path(&renamed_markdown).unwrap();
+        relocate_authorized_path_prefix_inner(
+            &state,
+            &canonical_markdown,
+            &canonical_renamed_markdown,
+        )
+        .unwrap();
+
+        assert!(stop.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+        release_markdown_html_embed_inner(&state, handle.owner_id, "main").unwrap();
+    }
+
+    #[test]
+    fn two_markdown_anchors_have_independent_embed_lifetimes() {
+        let directory = tempdir().unwrap();
+        let first_markdown = directory.path().join("first.md");
+        let renamed_first_markdown = directory.path().join("renamed-first.md");
+        let second_markdown = directory.path().join("second.md");
+        let html = directory.path().join("embed.html");
+        fs::write(&first_markdown, "# First").unwrap();
+        fs::write(&second_markdown, "# Second").unwrap();
+        fs::write(&html, "<h1>Shared embed</h1>").unwrap();
+        let canonical_first_markdown = normalize_existing_path(&first_markdown).unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, directory.path().to_path_buf()).unwrap();
+        let first =
+            acquire_markdown_html_embed_inner(&state, &first_markdown, "embed.html", "main")
+                .unwrap();
+        let second =
+            acquire_markdown_html_embed_inner(&state, &second_markdown, "embed.html", "main")
+                .unwrap();
+        assert_ne!(first.url, second.url);
+        let first_stop = state
+            .html_preview_server
+            .embed_stop_flag_for_test(&first_markdown, &html)
+            .unwrap();
+        let second_stop = state
+            .html_preview_server
+            .embed_stop_flag_for_test(&second_markdown, &html)
+            .unwrap();
+
+        fs::rename(&first_markdown, &renamed_first_markdown).unwrap();
+        let canonical_renamed = normalize_existing_path(&renamed_first_markdown).unwrap();
+        relocate_authorized_path_prefix_inner(
+            &state,
+            &canonical_first_markdown,
+            &canonical_renamed,
+        )
+        .unwrap();
+
+        assert!(first_stop.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!second_stop.load(std::sync::atomic::Ordering::Acquire));
+        assert!(http_get(&second.url).contains("<h1>Shared embed</h1>"));
+        assert_eq!(
+            state
+                .file_authorization()
+                .preview_lease_snapshot()
+                .unwrap()
+                .len(),
+            1
+        );
+        release_markdown_html_embed_inner(&state, second.owner_id, "main").unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_markdown_html_embed_sources_before_allocating_a_lease() {
+        let dir = tempdir().unwrap();
+        let markdown = dir.path().join("notes.md");
+        fs::write(&markdown, "# Notes").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+
+        for source in [
+            "",
+            "https://example.com/embed.html",
+            "//example.com/embed.html",
+            "/tmp/embed.html",
+            "C:\\embed.html",
+            "../embed.html",
+            "%2e%2e/embed.html",
+            "embed%2findex.html",
+            "embed\\index.html",
+            "embed.txt",
+            "embed.html?mode=preview",
+            "embed.html#section",
+        ] {
+            assert!(
+                prepare_markdown_html_embed_inner(&state, &markdown, source).is_err(),
+                "unsafe source was accepted: {source}"
+            );
+            assert!(state
+                .file_authorization()
+                .preview_lease_snapshot()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_missing_unauthorized_and_symlink_escape_html_embeds() {
+        let dir = tempdir().unwrap();
+        let markdown = dir.path().join("notes.md");
+        let existing = dir.path().join("existing.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&existing, "existing").unwrap();
+
+        let unauthorized_state = AppState::default();
+        assert!(
+            prepare_markdown_html_embed_inner(&unauthorized_state, &markdown, "existing.html")
+                .is_err()
+        );
+
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+        assert!(prepare_markdown_html_embed_inner(&state, &markdown, "missing.html").is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = tempdir().unwrap();
+            let target = outside.path().join("outside.html");
+            fs::write(&target, "outside").unwrap();
+            symlink(&target, dir.path().join("linked.html")).unwrap();
+            let error =
+                prepare_markdown_html_embed_inner(&state, &markdown, "linked.html").unwrap_err();
+            assert!(error.contains("escaped the Markdown directory"));
+        }
+
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn serves_non_utf8_html_bytes_without_a_prepare_time_decode() {
+        let dir = tempdir().unwrap();
+        let markdown = dir.path().join("notes.md");
+        let html = dir.path().join("invalid.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, [0xff, 0xfe]).unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+
+        let handle =
+            acquire_markdown_html_embed_inner(&state, &markdown, "invalid.html", "main").unwrap();
+        let response = http_request(&handle.url, "GET", &[]);
+
+        assert_eq!(response_body(&response), [0xff, 0xfe]);
+        release_markdown_html_embed_inner(&state, handle.owner_id, "main").unwrap();
+        assert!(state
+            .file_authorization()
+            .preview_lease_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn standalone_markdown_can_embed_a_sibling_without_html_write_authority() {
+        let dir = tempdir().unwrap();
+        let markdown = dir.path().join("notes.md");
+        let html = dir.path().join("embed.html");
+        fs::write(&markdown, "# Notes").unwrap();
+        fs::write(&html, "<h1>Embed</h1>").unwrap();
+        let state = AppState::default();
+        authorize_file_inner(&state, markdown.clone()).unwrap();
+
+        let url = prepare_markdown_html_embed_inner(&state, &markdown, "embed.html").unwrap();
+
+        assert!(http_get(&url).contains("<h1>Embed</h1>"));
+        assert!(ensure_authorized_write_file_inner(&state, &html).is_err());
     }
 
     #[test]
@@ -1010,6 +2513,8 @@ mod tests {
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesReleased,
                 crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationAcquired,
                 crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationReleased,
+                crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationAcquired,
+                crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationReleased,
             ]
         );
     }
@@ -1085,10 +2590,7 @@ mod tests {
             assert_eq!(retained.lease, old_lease);
             assert!(std::sync::Arc::ptr_eq(&retained.stop, &old_stop));
             assert!(std::sync::Arc::ptr_eq(&retained.server, &old_server));
-            assert!(std::sync::Arc::ptr_eq(
-                &retained.content,
-                &old_content_state
-            ));
+            assert!(retained.content.shares_state_with(&old_content_state));
         }
         assert!(!old_stop.load(std::sync::atomic::Ordering::Acquire));
         assert!(http_get(&old_url).contains("<h1>old preview</h1>"));
@@ -1175,7 +2677,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_eviction_revokes_exact_evicted_preview_lease() {
+    fn capacity_rejection_preserves_every_active_preview_site() {
         let workspace = tempdir().unwrap();
         let documents = (0..=MAX_PREVIEW_SITES)
             .map(|index| {
@@ -1187,9 +2689,14 @@ mod tests {
         let state = AppState::default();
         authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
 
-        for (index, document) in documents.iter().take(MAX_PREVIEW_SITES).enumerate() {
-            prepare_html_preview_inner(&state, document, &format!("live site {index}")).unwrap();
-        }
+        let active_urls = documents
+            .iter()
+            .take(MAX_PREVIEW_SITES)
+            .enumerate()
+            .map(|(index, document)| {
+                prepare_html_preview_inner(&state, document, &format!("live site {index}")).unwrap()
+            })
+            .collect::<Vec<_>>();
 
         let authorization_before = state.file_authorization().preview_lease_snapshot().unwrap();
         let sites_before = state.html_preview_server.site_lease_snapshot().unwrap();
@@ -1204,47 +2711,31 @@ mod tests {
         };
 
         let new_document = normalize_existing_path(&documents[MAX_PREVIEW_SITES]).unwrap();
-        let (new_url, events) = crate::path_auth::lock_order_test_probe::trace(|| {
+        let (result, events) = crate::path_auth::lock_order_test_probe::trace(|| {
             prepare_html_preview_inner(
                 &state,
                 &new_document,
                 &format!("live site {MAX_PREVIEW_SITES}"),
             )
         });
-        let new_url = new_url.unwrap();
+        let error = result.expect_err("capacity must reject a new preview site");
         let sites_after = state.html_preview_server.site_lease_snapshot().unwrap();
         let authorization_after = state.file_authorization().preview_lease_snapshot().unwrap();
-        let evicted = sites_before
-            .difference(&sites_after)
-            .cloned()
-            .collect::<Vec<_>>();
-        let added = sites_after
-            .difference(&sites_before)
-            .cloned()
-            .collect::<Vec<_>>();
 
-        assert_eq!(evicted.len(), 1, "capacity must evict exactly one site");
-        assert_eq!(added.len(), 1, "capacity must add exactly one site");
-        let evicted_lease = &evicted[0];
-        let new_lease = &added[0];
-        assert_eq!(
-            authorization_after, sites_after,
-            "capacity eviction retained authorization for the evicted preview lease"
-        );
-        assert!(!authorization_after.contains(evicted_lease));
-        let evicted_stop = worker_stops_before
+        assert!(error.contains("Too many active HTML preview sites"));
+        assert_eq!(sites_after, sites_before);
+        assert_eq!(authorization_after, authorization_before);
+        assert!(!state
+            .html_preview_server
+            .site_documents()
+            .unwrap()
+            .contains(&new_document));
+        assert!(worker_stops_before
             .iter()
-            .find_map(|(lease, stop)| (lease == evicted_lease).then_some(stop))
-            .unwrap();
-        assert!(evicted_stop.load(std::sync::atomic::Ordering::Acquire));
-        {
-            let sites = state.html_preview_server.sites.lock().unwrap();
-            let new_site = sites.get(&new_document).unwrap();
-            assert_eq!(&new_site.lease, new_lease);
-            assert_eq!(new_site.url, new_url);
-            assert!(!new_site.stop.load(std::sync::atomic::Ordering::Acquire));
+            .all(|(_, stop)| !stop.load(std::sync::atomic::Ordering::Acquire)));
+        for (index, url) in active_urls.iter().enumerate() {
+            assert!(http_get(url).contains(&format!("live site {index}")));
         }
-        assert!(http_get(&new_url).contains(&format!("live site {MAX_PREVIEW_SITES}")));
         assert_eq!(
             events,
             [
@@ -1333,10 +2824,7 @@ mod tests {
             assert_eq!(retained.lease, unrelated_lease);
             assert!(std::sync::Arc::ptr_eq(&retained.stop, &unrelated_stop));
             assert!(std::sync::Arc::ptr_eq(&retained.server, &unrelated_server));
-            assert!(std::sync::Arc::ptr_eq(
-                &retained.content,
-                &unrelated_content
-            ));
+            assert!(retained.content.shares_state_with(&unrelated_content));
         }
         assert!(!unrelated_stop.load(std::sync::atomic::Ordering::Acquire));
         assert!(http_get(&unrelated_url).contains("stable unrelated content"));
@@ -1356,6 +2844,8 @@ mod tests {
                 crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationReleased,
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesAcquired,
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesReleased,
+                crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationAcquired,
+                crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationReleased,
                 crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationAcquired,
                 crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationReleased,
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesAcquired,
@@ -1423,6 +2913,8 @@ mod tests {
                 crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationReleased,
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesAcquired,
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesReleased,
+                crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationAcquired,
+                crate::path_auth::lock_order_test_probe::LockEvent::AuthorizationReleased,
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesAcquired,
                 crate::path_auth::lock_order_test_probe::LockEvent::HtmlSitesReleased,
             ]
@@ -1831,7 +3323,9 @@ mod tests {
                 document,
                 root,
                 lease.clone(),
-                "uncommitted content".to_string(),
+                super::HtmlPreviewContent::LiveDraft(std::sync::Arc::new(std::sync::Mutex::new(
+                    "uncommitted content".to_string(),
+                ))),
             )
         });
         let error = match result {
@@ -1911,6 +3405,61 @@ mod tests {
         let linked_url = format!("{}/secret-link.txt", url.rsplit_once('/').unwrap().0);
 
         assert!(http_get(&linked_url).starts_with("HTTP/1.1 404"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_an_opened_file_when_the_request_path_is_swapped_after_open() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret.js");
+        let requested = root.path().join("asset.js");
+        fs::write(&secret, "window.secret = true;").unwrap();
+        symlink(&secret, &requested).unwrap();
+        let canonical_root = normalize_existing_path(root.path()).unwrap();
+
+        let result = super::open_authorized_file_with(
+            &requested,
+            &canonical_root,
+            || {
+                fs::remove_file(&requested).unwrap();
+                fs::write(&requested, "window.inside = true;").unwrap();
+            },
+            || {},
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_an_opened_file_when_its_reported_path_is_swapped_before_validation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let inside = root.path().join("inside.js");
+        let secret = outside.path().join("secret.js");
+        let retained_secret = outside.path().join("retained-secret.js");
+        let requested = root.path().join("asset.js");
+        fs::write(&inside, "window.inside = true;").unwrap();
+        fs::write(&secret, "window.secret = true;").unwrap();
+        symlink(&secret, &requested).unwrap();
+        let canonical_root = normalize_existing_path(root.path()).unwrap();
+
+        let result = super::open_authorized_file_with(
+            &requested,
+            &canonical_root,
+            || {},
+            || {
+                fs::rename(&secret, &retained_secret).unwrap();
+                symlink(&inside, &secret).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
