@@ -646,6 +646,53 @@ describe('EditorPane', () => {
       .toContain('Error');
   });
 
+  it('wraps the selection active when the physical Slash key opens Markdown formats', () => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="alpha beta"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+
+    act(() => view.dispatch({ selection: { anchor: 0, head: 5 } }));
+    const shortcut = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      code: 'Slash',
+      ctrlKey: true,
+      key: '?',
+      keyCode: 191,
+      shiftKey: true,
+    });
+    act(() => {
+      view.contentDOM.dispatchEvent(shortcut);
+    });
+
+    expect(shortcut.defaultPrevented).toBe(true);
+    expect(view.state.doc.toString()).toBe('alpha beta');
+    expect(view.state.selection.main).toMatchObject({ from: 0, to: 5 });
+    expect(onContentChange).not.toHaveBeenCalled();
+
+    act(() => {
+      container.querySelector<HTMLButtonElement>('[data-command-id="bold"]')?.click();
+    });
+
+    expect(view.state.doc.toString()).toBe('**alpha** beta');
+    expect(view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to))
+      .toBe('alpha');
+    expect(onContentChange).toHaveBeenCalledOnce();
+    expect(onContentChange).toHaveBeenCalledWith('**alpha** beta');
+  });
+
   it('chooses format commands with arrow keys and Enter', () => {
     const onContentChange = vi.fn<(content: string) => void>();
     act(() => {

@@ -110,6 +110,13 @@ function isSameEditorStatus(current: EditorStatus, next: EditorStatus): boolean 
     && current.words === next.words;
 }
 
+function isMarkdownFormatShortcut(event: KeyboardEvent): boolean {
+  return event.ctrlKey
+    && !event.altKey
+    && !event.metaKey
+    && (event.code === 'Slash' || event.key === '/' || (event.key === '?' && event.shiftKey));
+}
+
 export function EditorPane({ activePath, content, documentEpoch, documentId, editable = true, fileKind = 'markdown', mediaInsertion, onContentChange, outlineJump, onPopout, paneRef, popoutButton, popout = false }: EditorPaneProps) {
   const { t } = useI18n();
   const editorLabel = fileKind === 'html' ? t('htmlSourceEditor') : t('markdownSourceEditor');
@@ -218,15 +225,16 @@ export function EditorPane({ activePath, content, documentEpoch, documentId, edi
           syntaxHighlighting(defaultHighlightStyle),
           syntaxHighlighting(sourceSyntaxHighlighter),
           EditorView.lineWrapping,
-          keymap.of([
-            {
-              key: 'Ctrl-/',
-              run: () => {
-                if (!editableRef.current || fileKindRef.current !== 'markdown') return false;
-                setFormatDialogOpen(true);
-                return true;
-              },
+          EditorView.domEventHandlers({
+            keydown: (event) => {
+              if (!isMarkdownFormatShortcut(event)) return false;
+              if (!editableRef.current || fileKindRef.current !== 'markdown') return false;
+              event.preventDefault();
+              setFormatDialogOpen(true);
+              return true;
             },
+          }),
+          keymap.of([
             ...defaultKeymap,
             ...historyKeymap,
             ...searchKeymap,
