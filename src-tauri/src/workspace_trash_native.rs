@@ -1348,15 +1348,29 @@ mod platform {
         source_identity: NativeSourceIdentity,
     ) -> MoveToTrash<NativeTrashReceipt, NativeTrashError> {
         let source = source.to_path_buf();
-        match thread::spawn(move || unsafe { move_on_sta(source, kind, source_identity) }).join() {
-            Ok(result) => result,
-            Err(_) => MoveToTrash::Rejected {
-                error: NativeTrashError::new(
-                    "start Windows Trash operation",
-                    "STA thread panicked",
-                ),
-            },
+        let result =
+            match thread::spawn(move || unsafe { move_on_sta(source, kind, source_identity) })
+                .join()
+            {
+                Ok(result) => result,
+                Err(_) => MoveToTrash::Rejected {
+                    error: NativeTrashError::new(
+                        "start Windows Trash operation",
+                        "STA thread panicked",
+                    ),
+                },
+            };
+        #[cfg(feature = "packaged-lifecycle-e2e")]
+        match &result {
+            MoveToTrash::Rejected { error } => {
+                eprintln!("Packaged lifecycle Windows Trash rejected: {error}");
+            }
+            MoveToTrash::PossiblyMoved { error, .. } => {
+                eprintln!("Packaged lifecycle Windows Trash was not proven: {error}");
+            }
+            MoveToTrash::Placed { .. } => {}
         }
+        result
     }
 
     unsafe fn move_on_sta(

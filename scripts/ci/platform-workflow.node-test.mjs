@@ -7,6 +7,11 @@ const workflowPath = fileURLToPath(
   new URL('../../.github/workflows/platform-ci.yml', import.meta.url),
 );
 const releaseWorkflowPath = fileURLToPath(new URL('../../.github/workflows/release.yml', import.meta.url));
+const windowsSmokePath = fileURLToPath(new URL('./smoke-windows.ps1', import.meta.url));
+const packagedRunnerPath = fileURLToPath(new URL('./packaged-lifecycle-runner.mjs', import.meta.url));
+const nativeTrashPath = fileURLToPath(
+  new URL('../../src-tauri/src/workspace_trash_native.rs', import.meta.url),
+);
 const smokePaths = [
   new URL('./smoke-macos.sh', import.meta.url),
   new URL('./smoke-linux.sh', import.meta.url),
@@ -118,4 +123,61 @@ test('passes canonical workflow identity to installed packages and runs both Lin
   assert.match(value, /smoke-linux\.sh artifact \$\{\{ matrix\.target \}\}/);
   assert.match(value, /MMD_ci_amd64\.deb/);
   assert.match(value, /MMD_ci_amd64\.AppImage/);
+});
+
+test('uses the Windows user-local temp volume for packaged Trash fixtures', async () => {
+  const value = await readFile(windowsSmokePath, 'utf8');
+  const runner = await readFile(packagedRunnerPath, 'utf8');
+  const selectLocalTemp = value.indexOf(
+    '[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)',
+  );
+  const assignLifecycleTemp = value.indexOf(
+    "$lifecycleTemp = Join-Path $localAppData 'Temp'",
+  );
+  const compareSystemVolume = value.indexOf('if ($lifecycleVolume -ine $systemVolume)');
+  const createLifecycleTemp = value.indexOf(
+    'New-Item -ItemType Directory -Path $lifecycleTemp -Force',
+  );
+  const runPackagedLifecycle = value.indexOf('packaged-lifecycle-runner.mjs');
+
+  assert.notEqual(selectLocalTemp, -1, 'Windows smoke must select LocalApplicationData');
+  assert.notEqual(assignLifecycleTemp, -1, 'Windows smoke must use LocalApplicationData\\Temp');
+  assert.notEqual(compareSystemVolume, -1, 'Windows smoke must enforce the system volume');
+  assert.notEqual(createLifecycleTemp, -1, 'Windows smoke must create the lifecycle temp');
+  assert.ok(
+    selectLocalTemp < assignLifecycleTemp
+      && assignLifecycleTemp < compareSystemVolume
+      && compareSystemVolume < createLifecycleTemp
+      && createLifecycleTemp < runPackagedLifecycle,
+    'the system-volume lifecycle temp must be prepared before the packaged app starts',
+  );
+  assert.match(value, /\$systemVolume = \[IO\.Path\]::GetPathRoot\(\[Environment\]::SystemDirectory\)/);
+  assert.match(value, /\$lifecycleVolume = \[IO\.Path\]::GetPathRoot\(\$lifecycleTemp\)/);
+  assert.match(value, /\$env:TEMP = \$lifecycleTemp/);
+  assert.match(value, /\$env:TMP = \$lifecycleTemp/);
+  assert.match(value, /\$env:TMPDIR = \$lifecycleTemp/);
+  assert.match(runner, /Packaged lifecycle challenge root:/);
+});
+
+test('keeps raw Windows Trash diagnostics behind packaged lifecycle instrumentation', async () => {
+  const value = await readFile(nativeTrashPath, 'utf8');
+  const gatedDiagnostics = [
+    '        #[cfg(feature = "packaged-lifecycle-e2e")]',
+    '        match &result {',
+    '            MoveToTrash::Rejected { error } => {',
+    '                eprintln!("Packaged lifecycle Windows Trash rejected: {error}");',
+    '            }',
+    '            MoveToTrash::PossiblyMoved { error, .. } => {',
+    '                eprintln!("Packaged lifecycle Windows Trash was not proven: {error}");',
+    '            }',
+    '            MoveToTrash::Placed { .. } => {}',
+    '        }',
+    '        result',
+    '    }',
+  ].join('\n');
+
+  assert.ok(
+    value.includes(gatedDiagnostics),
+    'raw Windows Trash diagnostics must remain inside the packaged lifecycle feature gate',
+  );
 });

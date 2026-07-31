@@ -29,6 +29,21 @@ if (-not $installDirectory -or -not $mainBinary) { throw 'Tauri NSIS install met
 $appPath = Join-Path $installDirectory $mainBinary
 if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) { throw "Installed application is missing: $appPath" }
 
+$localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+if ([string]::IsNullOrWhiteSpace($localAppData)) {
+  throw 'Windows LocalApplicationData is unavailable'
+}
+$lifecycleTemp = Join-Path $localAppData 'Temp'
+$systemVolume = [IO.Path]::GetPathRoot([Environment]::SystemDirectory)
+$lifecycleVolume = [IO.Path]::GetPathRoot($lifecycleTemp)
+if ($lifecycleVolume -ine $systemVolume) {
+  throw "Windows packaged lifecycle temp must use the system volume: $lifecycleTemp"
+}
+New-Item -ItemType Directory -Path $lifecycleTemp -Force | Out-Null
+$env:TEMP = $lifecycleTemp
+$env:TMP = $lifecycleTemp
+$env:TMPDIR = $lifecycleTemp
+
 $challenge = Join-Path $env:RUNNER_TEMP 'mmd-packaged-lifecycle-nsis.json'
 node scripts/ci/packaged-lifecycle-runner.mjs `
   --evidence (Join-Path $ArtifactDirectory 'm2-lifecycle-evidence.json') `

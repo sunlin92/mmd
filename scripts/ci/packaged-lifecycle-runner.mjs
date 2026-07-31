@@ -218,6 +218,7 @@ if (issue.status !== 0) throw new Error(issue.stderr || 'failed to issue package
 
 const challenge = JSON.parse(await readFile(challengeOutput, 'utf8'));
 if (challenge.target !== target) throw new Error('packaged lifecycle challenge target mismatch');
+console.log(`Packaged lifecycle challenge root: ${challenge.root}`);
 const challengeTemp = path.dirname(path.dirname(challenge.root));
 const child = spawn(command[0], command.slice(1), {
   env: {
