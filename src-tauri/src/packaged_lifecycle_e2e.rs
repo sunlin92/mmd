@@ -175,14 +175,50 @@ fn secure_existing_container(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+fn current_process_token_information(
+    information_class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+) -> io::Result<Vec<usize>> {
+    use std::{mem, ptr};
+    use windows_sys::Win32::{Foundation::HANDLE, Security::GetTokenInformation};
+
+    // The process-token pseudo handle is supported by Windows 8 and later.
+    const CURRENT_PROCESS_TOKEN: HANDLE = (-4_isize) as HANDLE;
+    let mut token_size = 0u32;
+    unsafe {
+        GetTokenInformation(
+            CURRENT_PROCESS_TOKEN,
+            information_class,
+            ptr::null_mut(),
+            0,
+            &mut token_size,
+        );
+    }
+    if token_size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let word_size = mem::size_of::<usize>();
+    let mut token = vec![0usize; (token_size as usize).div_ceil(word_size)];
+    if unsafe {
+        GetTokenInformation(
+            CURRENT_PROCESS_TOKEN,
+            information_class,
+            token.as_mut_ptr().cast(),
+            token_size,
+            &mut token_size,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(token)
+}
+
+#[cfg(windows)]
 fn verify_windows_directory_owner(path: &Path) -> io::Result<()> {
     use std::{mem, os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::{
-        Foundation::HANDLE,
-        Security::{
-            EqualSid, GetFileSecurityW, GetSecurityDescriptorOwner, GetTokenInformation, TokenUser,
-            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_USER,
-        },
+    use windows_sys::Win32::Security::{
+        EqualSid, GetFileSecurityW, GetSecurityDescriptorOwner, TokenOwner, TokenUser,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_OWNER, TOKEN_USER,
     };
 
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -225,39 +261,16 @@ fn verify_windows_directory_owner(path: &Path) -> io::Result<()> {
         ));
     }
 
-    // The process-token pseudo handle is supported by Windows 8 and later.
-    const CURRENT_PROCESS_TOKEN: HANDLE = (-4_isize) as HANDLE;
-    let mut token_size = 0u32;
-    unsafe {
-        GetTokenInformation(
-            CURRENT_PROCESS_TOKEN,
-            TokenUser,
-            ptr::null_mut(),
-            0,
-            &mut token_size,
-        );
-    }
-    if token_size == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut token = vec![0usize; (token_size as usize).div_ceil(word_size)];
-    if unsafe {
-        GetTokenInformation(
-            CURRENT_PROCESS_TOKEN,
-            TokenUser,
-            token.as_mut_ptr().cast(),
-            token_size,
-            &mut token_size,
-        )
-    } == 0
+    let token_user = current_process_token_information(TokenUser)?;
+    let token_user = unsafe { &*token_user.as_ptr().cast::<TOKEN_USER>() };
+    let token_owner = current_process_token_information(TokenOwner)?;
+    let token_owner = unsafe { &*token_owner.as_ptr().cast::<TOKEN_OWNER>() };
+    if unsafe { EqualSid(owner, token_user.User.Sid) } == 0
+        && unsafe { EqualSid(owner, token_owner.Owner) } == 0
     {
-        return Err(io::Error::last_os_error());
-    }
-    let token_user = unsafe { &*token.as_ptr().cast::<TOKEN_USER>() };
-    if unsafe { EqualSid(owner, token_user.User.Sid) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "private directory is owned by a different user",
+            "private directory owner is outside the current process token",
         ));
     }
     Ok(())
@@ -588,6 +601,17 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "Packaged lifecycle E2E workspace already exists");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_a_private_container_created_with_the_process_default_owner() {
+        let temp = TempDir::new().unwrap();
+        let container = temp.path().join(CONTAINER_ROOT_NAME);
+
+        create_private_workspace(&container).unwrap();
+
+        assert_eq!(ensure_fixed_container_root(temp.path()).unwrap(), container);
     }
 
     #[cfg(unix)]
