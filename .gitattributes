@@ -1,2 +1,3 @@
 # Preserve synchronized third-party license text byte-for-byte.
-public/vendor/notices/** -whitespace
+scripts/licenses/** -text
+public/vendor/notices/** -text -whitespace

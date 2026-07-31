@@ -74,6 +74,13 @@ afterEach(async () => {
 });
 
 describe('third-party notice synchronization', () => {
+  it('prevents Git from rewriting pinned license bytes on Windows', async () => {
+    const attributes = await readFile(path.join(projectRoot, '.gitattributes'), 'utf8');
+
+    expect(attributes).toContain('scripts/licenses/** -text');
+    expect(attributes).toContain('public/vendor/notices/** -text -whitespace');
+  });
+
   it('keeps logical notice paths portable across operating systems', () => {
     expect(path.win32.join('dompurify', 'LICENSE')).toBe('dompurify\\LICENSE');
     expect(joinPortableNoticePath('dompurify', 'LICENSE')).toBe('dompurify/LICENSE');

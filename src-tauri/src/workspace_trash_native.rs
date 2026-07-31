@@ -43,6 +43,8 @@ enum NativeSourceIdentity {
         device: u64,
         inode: u64,
         kind: TrashEntryKind,
+        #[cfg(target_os = "linux")]
+        inode_lease: LinuxInodeLease,
     },
     #[cfg(windows)]
     Windows {
@@ -51,6 +53,23 @@ enum NativeSourceIdentity {
         kind: TrashEntryKind,
     },
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct LinuxInodeLease {
+    _file: std::sync::Arc<fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for LinuxInodeLease {
+    fn eq(&self, _other: &Self) -> bool {
+        // dev/inode/kind carry equality; the open handle only prevents inode reuse.
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for LinuxInodeLease {}
 
 impl NativeSourceIdentity {
     fn kind(&self) -> TrashEntryKind {
@@ -146,10 +165,35 @@ fn capture_source_identity(
         .map_err(|error| NativeTrashError::new("inspect trash source identity", error))?;
     validate_source_type(&metadata, kind)?;
     use std::os::unix::fs::MetadataExt;
+    #[cfg(target_os = "linux")]
+    let inode_lease = {
+        use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, sync::Arc};
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| NativeTrashError::new("pin trash source identity", error))?;
+        let pinned = file.metadata().map_err(|error| {
+            NativeTrashError::new("inspect pinned trash source identity", error)
+        })?;
+        validate_source_type(&pinned, kind)?;
+        if pinned.dev() != metadata.dev() || pinned.ino() != metadata.ino() {
+            return Err(NativeTrashError::new(
+                "pin trash source identity",
+                "source changed while its filesystem identity was being retained",
+            ));
+        }
+        LinuxInodeLease {
+            _file: Arc::new(file),
+        }
+    };
     Ok(NativeSourceIdentity::Unix {
         device: metadata.dev(),
         inode: metadata.ino(),
         kind,
+        #[cfg(target_os = "linux")]
+        inode_lease,
     })
 }
 
@@ -938,13 +982,12 @@ mod platform {
         fn preserves_reserved_metadata_cleanup_failure_with_primary_error() {
             let temp = tempfile::tempdir().unwrap();
             let missing = temp.path().join("missing.trashinfo");
-            let error = error_with_reserved_info_cleanup(
-                "rename source into trash",
-                io::Error::from_raw_os_error(libc::EXDEV),
-                &missing,
-            );
+            let primary = io::Error::from_raw_os_error(libc::EXDEV);
+            let primary_message = primary.to_string();
+            let error =
+                error_with_reserved_info_cleanup("rename source into trash", primary, &missing);
 
-            assert!(error.message.contains("Cross-device link"));
+            assert!(error.message.contains(&primary_message));
             assert!(error
                 .message
                 .contains("failed to remove reserved recovery metadata"));
