@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access, readFile, rename, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const lifecycleScript = fileURLToPath(new URL('./lifecycle-evidence.mjs', import.meta.url));
@@ -85,6 +86,34 @@ async function writeAtomic(file, contents) {
   await rename(temporary, file);
 }
 
+function sanitizeReceiptError(message) {
+  let sanitized = '';
+  for (const character of message) {
+    const codePoint = character.codePointAt(0);
+    sanitized += codePoint < 32 || (codePoint >= 127 && codePoint <= 159) ? ' ' : character;
+    if (sanitized.length >= 500) break;
+  }
+  return sanitized.replace(/\s+/g, ' ').trim() || 'unspecified packaged lifecycle failure';
+}
+
+async function failedReceiptError(file, challenge) {
+  let receipt;
+  try {
+    receipt = JSON.parse(await readFile(file, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error instanceof SyntaxError) return null;
+    throw error;
+  }
+  if (receipt.schema !== 2
+      || receipt.gate !== 'packaged-lifecycle-e2e'
+      || receipt.status !== 'failed'
+      || typeof receipt.error !== 'string') return null;
+  for (const field of ['target', 'runId', 'runAttempt', 'commit', 'packageVariant']) {
+    if (receipt[field] !== challenge[field]) return null;
+  }
+  return sanitizeReceiptError(receipt.error);
+}
+
 async function settlesWithin(completion, milliseconds) {
   return await Promise.race([
     completion.then(() => true),
@@ -92,12 +121,13 @@ async function settlesWithin(completion, milliseconds) {
   ]);
 }
 
-function processGroupExists(pid) {
+function processGroupState(pid) {
   try {
     process.kill(-pid, 0);
-    return true;
+    return 'present';
   } catch (error) {
-    if (error.code === 'ESRCH') return false;
+    if (error.code === 'ESRCH') return 'absent';
+    if (error.code === 'EPERM') return 'inaccessible';
     throw error;
   }
 }
@@ -105,25 +135,28 @@ function processGroupExists(pid) {
 async function waitForProcessGroupExit(pid, milliseconds) {
   const deadline = Date.now() + milliseconds;
   while (Date.now() < deadline) {
-    if (!processGroupExists(pid)) return true;
+    if (processGroupState(pid) === 'absent') return true;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  return !processGroupExists(pid);
+  return processGroupState(pid) === 'absent';
 }
 
 function signalProcessGroup(pid, signal) {
   try {
     process.kill(-pid, signal);
+    return 'sent';
   } catch (error) {
-    if (error.code !== 'ESRCH') throw error;
+    if (error.code === 'ESRCH') return 'absent';
+    if (error.code === 'EPERM') return 'inaccessible';
+    throw error;
   }
 }
 
 async function stopPosixProcessGroup(child) {
   if (await waitForProcessGroupExit(child.pid, STOP_GRACE_MS)) return;
-  signalProcessGroup(child.pid, 'SIGTERM');
+  if (signalProcessGroup(child.pid, 'SIGTERM') === 'absent') return;
   if (await waitForProcessGroupExit(child.pid, STOP_TERM_MS)) return;
-  signalProcessGroup(child.pid, 'SIGKILL');
+  if (signalProcessGroup(child.pid, 'SIGKILL') === 'absent') return;
   if (!(await waitForProcessGroupExit(child.pid, STOP_KILL_MS))) {
     throw new Error(`packaged application process group ${child.pid} did not exit after SIGKILL`);
   }
@@ -173,9 +206,13 @@ if (issue.status !== 0) throw new Error(issue.stderr || 'failed to issue package
 
 const challenge = JSON.parse(await readFile(challengeOutput, 'utf8'));
 if (challenge.target !== target) throw new Error('packaged lifecycle challenge target mismatch');
+const challengeTemp = path.dirname(path.dirname(challenge.root));
 const child = spawn(command[0], command.slice(1), {
   env: {
     ...process.env,
+    TMP: challengeTemp,
+    TEMP: challengeTemp,
+    TMPDIR: challengeTemp,
     MMD_PACKAGED_LIFECYCLE_E2E_NONCE: challenge.nonce,
     MMD_PACKAGED_LIFECYCLE_E2E_RUN_ID: challenge.runId,
     MMD_PACKAGED_LIFECYCLE_E2E_RUN_ATTEMPT: challenge.runAttempt,
@@ -191,6 +228,8 @@ const childObservation = observeChild(child);
 
 try {
   await waitUntil(async () => {
+    const failure = await failedReceiptError(challenge.receiptPath, challenge);
+    if (failure) throw new Error(`packaged lifecycle failed before control ready receipt: ${failure}`);
     if (!(await exists(challenge.controlPath))) return false;
     return await readFile(challenge.controlPath, 'utf8') === 'ready\n';
   }, childObservation.completion, 'control ready receipt');

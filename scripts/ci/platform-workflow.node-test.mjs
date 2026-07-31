@@ -68,7 +68,10 @@ test('builds instrumented packages and promotes only post-smoke verified artifac
   const smoke = await smokes();
 
   assert.match(value, /VITE_MMD_PACKAGED_LIFECYCLE_E2E:\s*'1'/);
-  assert.equal(value.match(/--features packaged-lifecycle-e2e/g)?.length, 2);
+  assert.equal(
+    value.match(/npm run tauri -- build[^\n]+--features packaged-lifecycle-e2e/g)?.length,
+    2,
+  );
   assert.match(smoke, /packaged-lifecycle-runner\.mjs/);
   assert.match(smoke, /verify-packaged/);
   assert.match(value, /name: \$\{\{ matrix\.artifact \}\}-base/);
@@ -77,6 +80,23 @@ test('builds instrumented packages and promotes only post-smoke verified artifac
   assert.ok(
     value.lastIndexOf('uses: actions/upload-artifact@') > value.indexOf('smoke-linux.sh'),
     'verified artifact must be uploaded after packaged smoke verification',
+  );
+});
+
+test('runs packaged lifecycle feature tests on every native target before packaging', async () => {
+  const value = await workflow();
+  const featureTest =
+    'cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release --features packaged-lifecycle-e2e packaged_lifecycle_e2e::tests';
+  const featureTestIndex = value.indexOf(featureTest);
+  const macosBuildIndex = value.indexOf('- name: Build macOS package');
+  const nonMacosBuildIndex = value.indexOf('- name: Build non-macOS package');
+
+  assert.equal(value.split(featureTest).length - 1, 1);
+  assert.ok(featureTestIndex !== -1, 'native matrix must run the packaged lifecycle feature tests');
+  assert.ok(featureTestIndex < macosBuildIndex, 'feature tests must run before the macOS package build');
+  assert.ok(
+    featureTestIndex < nonMacosBuildIndex,
+    'feature tests must run before the non-macOS package build',
   );
 });
 
