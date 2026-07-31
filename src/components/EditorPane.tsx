@@ -9,6 +9,7 @@ import { drawSelection, EditorView, keymap, lineNumbers } from '@codemirror/view
 import { tagHighlighter, tags } from '@lezer/highlight';
 import { vim } from '@replit/codemirror-vim';
 import { applyMarkdownFormatCommand, type MarkdownFormatCommandId } from '../lib/markdownFormatCommands';
+import { markdownCompletionExtension } from '../lib/markdownCompletion';
 import type { MarkdownOutlineJump } from '../lib/markdownOutline';
 import type { MarkdownMediaInsertion } from '../lib/markdownMedia';
 import type { PanePopoutButtonState } from '../lib/paneLayout';
@@ -34,6 +35,7 @@ interface EditorPaneProps {
   paneRef?: Ref<HTMLElement>;
   popoutButton?: PanePopoutButtonState;
   popout?: boolean;
+  spellcheckEnabled?: boolean;
 }
 
 const externalSyncAnnotation = Annotation.define<boolean>();
@@ -71,12 +73,16 @@ const sourceSyntaxHighlighter = tagHighlighter([
   { tag: tags.comment, class: 'tok-comment' },
 ]);
 
-function editorConfiguration(fileKind: Extract<WorkspaceFileKind, 'markdown' | 'html'>, label: string): Extension {
+function editorConfiguration(
+  fileKind: Extract<WorkspaceFileKind, 'markdown' | 'html'>,
+  label: string,
+  spellcheckEnabled: boolean,
+): Extension {
   return [
     fileKind === 'html' ? html() : markdown(),
     EditorView.contentAttributes.of({
       'aria-label': label,
-      spellcheck: 'false',
+      spellcheck: String(spellcheckEnabled),
     }),
   ];
 }
@@ -124,7 +130,7 @@ function isMarkdownFormatShortcut(event: KeyboardEvent): boolean {
     && (event.code === 'Slash' || event.key === '/' || (event.key === '?' && event.shiftKey));
 }
 
-export function EditorPane({ activePath, content, documentEpoch, documentId, editable = true, fileKind = 'markdown', mediaInsertion, onContentChange, outlineJump, onPopout, paneRef, popoutButton, popout = false }: EditorPaneProps) {
+export function EditorPane({ activePath, content, documentEpoch, documentId, editable = true, fileKind = 'markdown', mediaInsertion, onContentChange, outlineJump, onPopout, paneRef, popoutButton, popout = false, spellcheckEnabled = true }: EditorPaneProps) {
   const { t } = useI18n();
   const editorLabel = fileKind === 'html' ? t('htmlSourceEditor') : t('markdownSourceEditor');
   const [vimModeEnabled, setVimModeEnabled] = useState(false);
@@ -141,6 +147,7 @@ export function EditorPane({ activePath, content, documentEpoch, documentId, edi
   const vimModeCompartmentRef = useRef<Compartment | null>(null);
   const configuredFileKindRef = useRef(fileKind);
   const configuredEditorLabelRef = useRef(editorLabel);
+  const configuredSpellcheckEnabledRef = useRef(spellcheckEnabled);
   const configuredEditableRef = useRef(editable);
   const configuredVimModeRef = useRef(vimModeEnabled);
   const contentRef = useRef(content);
@@ -188,6 +195,7 @@ export function EditorPane({ activePath, content, documentEpoch, documentId, edi
     const vimModeCompartment = new Compartment();
     const initialFileKind = fileKindRef.current;
     const initialEditorLabel = configuredEditorLabelRef.current;
+    const initialSpellcheckEnabled = configuredSpellcheckEnabledRef.current;
     const initialEditable = editableRef.current;
     const initialVimMode = vimModeEnabledRef.current;
     let deferredDocumentStatsTask: DeferredDocumentStatsTask = null;
@@ -268,7 +276,14 @@ export function EditorPane({ activePath, content, documentEpoch, documentId, edi
             ...historyKeymap,
             ...searchKeymap,
           ]),
-          configurationCompartment.of(editorConfiguration(initialFileKind, initialEditorLabel)),
+          markdownCompletionExtension(() => (
+            editableRef.current && fileKindRef.current === 'markdown'
+          )),
+          configurationCompartment.of(editorConfiguration(
+            initialFileKind,
+            initialEditorLabel,
+            initialSpellcheckEnabled,
+          )),
           accessCompartment.of(editorAccessConfiguration(initialEditable)),
           EditorState.transactionFilter.of((transaction) => (
             transaction.docChanged
@@ -298,6 +313,7 @@ export function EditorPane({ activePath, content, documentEpoch, documentId, edi
     vimModeCompartmentRef.current = vimModeCompartment;
     configuredFileKindRef.current = initialFileKind;
     configuredEditorLabelRef.current = initialEditorLabel;
+    configuredSpellcheckEnabledRef.current = initialSpellcheckEnabled;
     configuredEditableRef.current = initialEditable;
     configuredVimModeRef.current = initialVimMode;
     setEditorStatus(getEditorStatus(view.state));
@@ -394,11 +410,26 @@ export function EditorPane({ activePath, content, documentEpoch, documentId, edi
   useEffect(() => {
     const view = editorViewRef.current;
     const configurationCompartment = configurationCompartmentRef.current;
-    if (!view || !configurationCompartment || (configuredFileKindRef.current === fileKind && configuredEditorLabelRef.current === editorLabel)) return;
-    view.dispatch({ effects: configurationCompartment.reconfigure(editorConfiguration(fileKind, editorLabel)) });
+    if (
+      !view
+      || !configurationCompartment
+      || (
+        configuredFileKindRef.current === fileKind
+        && configuredEditorLabelRef.current === editorLabel
+        && configuredSpellcheckEnabledRef.current === spellcheckEnabled
+      )
+    ) return;
+    view.dispatch({
+      effects: configurationCompartment.reconfigure(editorConfiguration(
+        fileKind,
+        editorLabel,
+        spellcheckEnabled,
+      )),
+    });
     configuredFileKindRef.current = fileKind;
     configuredEditorLabelRef.current = editorLabel;
-  }, [documentEpoch, documentId, editorLabel, fileKind]);
+    configuredSpellcheckEnabledRef.current = spellcheckEnabled;
+  }, [documentEpoch, documentId, editorLabel, fileKind, spellcheckEnabled]);
 
   useEffect(() => {
     if (editable && fileKind === 'markdown') return;

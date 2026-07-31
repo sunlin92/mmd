@@ -14,12 +14,13 @@ import {
   SearchQuery,
   setSearchQuery,
 } from '@codemirror/search';
-import { EditorState } from '@codemirror/state';
+import { EditorSelection, EditorState } from '@codemirror/state';
 import { EditorView, runScopeHandlers } from '@codemirror/view';
 import { tags } from '@lezer/highlight';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getPanePopoutButtonState } from '../lib/paneLayout';
 import { applyEffectiveTheme, SKIN_IDS } from '../lib/theme';
+import { markdownCompletionExtension } from '../lib/markdownCompletion';
 import { EditorPane } from './EditorPane';
 
 if (typeof Range.prototype.getClientRects !== 'function') {
@@ -82,6 +83,279 @@ describe('EditorPane', () => {
       .toBe(true);
     expect(container.querySelector('[role="textbox"]')?.getAttribute('aria-label'))
       .toBe('Markdown source editor');
+  });
+
+  it('reconfigures spellcheck without replacing the active editor session', () => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    const render = (spellcheckEnabled: boolean) => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="draft"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+          spellcheckEnabled={spellcheckEnabled}
+        />,
+      );
+    };
+
+    act(() => render(false));
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    expect(view.contentDOM.getAttribute('spellcheck')).toBe('false');
+
+    act(() => {
+      view.dispatch({ selection: { anchor: 3 } });
+      render(true);
+    });
+
+    expect(EditorView.findFromDOM(container.querySelector<HTMLElement>('.cm-editor')!)).toBe(view);
+    expect(view.contentDOM.getAttribute('spellcheck')).toBe('true');
+    expect(view.state.doc.toString()).toBe('draft');
+    expect(view.state.selection.main.head).toBe(3);
+    expect(onContentChange).not.toHaveBeenCalled();
+  });
+
+  it('applies Markdown completion as one undoable editor transaction', () => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const xmlHttpRequest = vi.fn<() => XMLHttpRequest>();
+    vi.stubGlobal('fetch', fetch);
+    vi.stubGlobal('XMLHttpRequest', xmlHttpRequest);
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content=""
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    const runInputHandlers = (from: number, to: number, text: string) => (
+      view.state.facet(EditorView.inputHandler).some((handler) => handler(view, from, to, text, () => view.state.update({
+        changes: { from, to, insert: text },
+        selection: { anchor: from + text.length },
+        userEvent: 'input.type',
+      })))
+    );
+
+    let handled = false;
+    act(() => {
+      handled = runInputHandlers(0, 0, '[');
+    });
+
+    expect(handled).toBe(true);
+    expect(view.state.doc.toString()).toBe('[]()');
+    expect(view.state.selection.main).toMatchObject({ from: 1, to: 1 });
+    expect(onContentChange).toHaveBeenCalledOnce();
+    expect(onContentChange).toHaveBeenCalledWith('[]()');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(xmlHttpRequest).not.toHaveBeenCalled();
+
+    act(() => expect(undo(view)).toBe(true));
+    expect(view.state.doc.toString()).toBe('');
+    expect(view.state.selection.main).toMatchObject({ from: 0, to: 0 });
+  });
+
+  it('applies alert completion as one undoable transaction with its marker selected', () => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="> ["
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: view.state.doc.length } }));
+    const handler = view.state.facet(EditorView.inputHandler).find((inputHandler) => (
+      inputHandler(view, 3, 3, '!', () => view.state.update({
+        changes: { from: 3, insert: '!' },
+        selection: { anchor: 4 },
+        userEvent: 'input.type',
+      }))
+    ));
+
+    expect(handler).toBeDefined();
+    expect(view.state.doc.toString()).toBe('> [!TIP]\n> ');
+    expect(view.state.selection.main).toMatchObject({ from: 4, to: 7 });
+    expect(onContentChange).toHaveBeenCalledOnce();
+    act(() => expect(undo(view)).toBe(true));
+    expect(view.state.doc.toString()).toBe('> [');
+    expect(view.state.selection.main).toMatchObject({ from: 3, to: 3 });
+  });
+
+  it('keeps the cursor after generated markers so normal content and alerts can follow', () => {
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content=""
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={vi.fn<(content: string) => void>()}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    const type = (text: string) => {
+      const { from, to } = view.state.selection.main;
+      const insert = () => view.state.update({
+        changes: { from, to, insert: text },
+        selection: { anchor: from + text.length },
+        userEvent: 'input.type',
+      });
+      const handled = view.state.facet(EditorView.inputHandler).some((handler) => (
+        handler(view, from, to, text, insert)
+      ));
+      if (!handled) view.dispatch(insert());
+    };
+
+    act(() => type('>'));
+    expect(view.state.doc.toString()).toBe('> ');
+    expect(view.state.selection.main).toMatchObject({ from: 2, to: 2 });
+    act(() => type('['));
+    expect(view.state.doc.toString()).toBe('> [');
+    act(() => type('!'));
+    expect(view.state.doc.toString()).toBe('> [!TIP]\n> ');
+    expect(view.state.selection.main).toMatchObject({ from: 4, to: 7 });
+  });
+
+  it('continues lists through the Markdown completion Enter binding and restores them with undo', () => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="- item"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: view.state.doc.length } }));
+    const enter = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter' });
+
+    let handled = false;
+    act(() => {
+      handled = runScopeHandlers(view, enter, 'editor');
+    });
+
+    expect(handled).toBe(true);
+    expect(view.state.doc.toString()).toBe('- item\n- ');
+    expect(view.state.selection.main).toMatchObject({ from: 9, to: 9 });
+    expect(onContentChange).toHaveBeenCalledOnce();
+    act(() => expect(undo(view)).toBe(true));
+    expect(view.state.doc.toString()).toBe('- item');
+    expect(view.state.selection.main).toMatchObject({ from: 6, to: 6 });
+  });
+
+  it('leaves pasted, composing, selected, and multi-cursor input to CodeMirror defaults', () => {
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="selected"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={vi.fn<(content: string) => void>()}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    const applyInputWithDefault = (from: number, to: number, text: string) => {
+      const insert = () => view.state.update({
+        changes: { from, to, insert: text },
+        selection: { anchor: from + text.length },
+        userEvent: 'input.type',
+      });
+      const handled = view.state.facet(EditorView.inputHandler).some((handler) => (
+        handler(view, from, to, text, insert)
+      ));
+      if (!handled) view.dispatch(insert());
+      return handled;
+    };
+    act(() => view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } }));
+    let selectedHandled = false;
+    act(() => {
+      selectedHandled = applyInputWithDefault(0, view.state.doc.length, '[');
+    });
+    expect(selectedHandled).toBe(false);
+    expect(view.state.doc.toString()).toBe('[');
+
+    vi.useFakeTimers();
+    act(() => view.dispatch({ selection: { anchor: view.state.doc.length } }));
+    act(() => view.contentDOM.dispatchEvent(new Event('paste', { bubbles: true })));
+    let pastedHandled = false;
+    act(() => {
+      pastedHandled = applyInputWithDefault(view.state.doc.length, view.state.doc.length, '[');
+    });
+    expect(pastedHandled).toBe(false);
+    expect(view.state.doc.toString()).toBe('[[');
+
+    act(() => view.contentDOM.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    let composingHandled = false;
+    act(() => {
+      composingHandled = applyInputWithDefault(view.state.doc.length, view.state.doc.length, '[');
+    });
+    expect(composingHandled).toBe(false);
+    expect(view.state.doc.toString()).toBe('[[[');
+    act(() => view.contentDOM.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true })));
+    act(() => vi.runAllTimers());
+    let typedHandled = false;
+    act(() => {
+      typedHandled = applyInputWithDefault(view.state.doc.length, view.state.doc.length, '[');
+    });
+    expect(typedHandled).toBe(true);
+    expect(view.state.doc.toString()).toBe('[[[[]()');
+
+    const completionHost = document.createElement('div');
+    document.body.append(completionHost);
+    const completionView = new EditorView({
+      parent: completionHost,
+      state: EditorState.create({
+        doc: 'xy',
+        extensions: [
+          EditorState.allowMultipleSelections.of(true),
+          markdownCompletionExtension(() => true),
+        ],
+      }),
+    });
+    completionView.dispatch({ selection: EditorSelection.create([
+      EditorSelection.cursor(0),
+      EditorSelection.cursor(completionView.state.doc.length),
+    ]) });
+    const completionHandler = completionView.state.facet(EditorView.inputHandler)[0];
+    if (!completionHandler) throw new Error('Expected Markdown completion input handler');
+    const multiCursorHandled = completionHandler(completionView, 0, 0, '[', () => completionView.state.update({
+        changes: { from: 0, insert: '[' },
+        selection: { anchor: 1 },
+        userEvent: 'input.type',
+      }));
+    expect(multiCursorHandled).toBe(false);
+    completionView.destroy();
+    completionHost.remove();
   });
 
   it('preserves the active editor session while every application skin is applied', () => {

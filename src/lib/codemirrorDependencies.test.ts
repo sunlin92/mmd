@@ -23,4 +23,10 @@ describe('CodeMirror dependency pins', () => {
         .toBe(version);
     }
   });
+
+  it('keeps Markdown input assistance on the already pinned local primitives', () => {
+    expect(Object.prototype.hasOwnProperty.call(packageManifest.dependencies, '@codemirror/autocomplete')).toBe(false);
+    expect(packageManifest.dependencies['@codemirror/state']).toBe(expectedCodeMirrorVersions['@codemirror/state']);
+    expect(packageManifest.dependencies['@codemirror/view']).toBe(expectedCodeMirrorVersions['@codemirror/view']);
+  });
 });

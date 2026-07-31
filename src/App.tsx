@@ -1200,7 +1200,7 @@ export default function App() {
           ? <WorkspaceImagePreview key={activePath} enabled={documentAssetsEnabled} path={activePath} popout previewRevision={previewRevision} />
           : isMediaFile && activePath
             ? <WorkspaceMediaPreview key={activePath} enabled={documentAssetsEnabled} kind={mediaKind} mimeType={mediaMimeType} path={activePath} popout previewRevision={previewRevision} />
-            : <EditorPane activePath={activePath} content={content} documentEpoch={documentEpoch} documentId={documentId} editable={authorityStatus === 'committed'} fileKind={editorFileKind} mediaInsertion={currentMediaInsertion} outlineJump={currentOutlineJump} onContentChange={updateContent} popout />}
+            : <EditorPane activePath={activePath} content={content} documentEpoch={documentEpoch} documentId={documentId} editable={authorityStatus === 'committed'} fileKind={editorFileKind} mediaInsertion={currentMediaInsertion} outlineJump={currentOutlineJump} onContentChange={updateContent} popout spellcheckEnabled={settingsState.settings?.spellcheckEnabled ?? true} />}
       </PopoutPaneShell>
     );
   }
@@ -1459,6 +1459,7 @@ export default function App() {
               popoutButton={editorPopoutButton}
               onContentChange={updateContent}
               onPopout={handleEditorPopoutOpen}
+              spellcheckEnabled={settingsState.settings?.spellcheckEnabled ?? true}
             />
 
             <PaneResizer
