@@ -81,6 +81,35 @@ function minimalPe(metadataByte) {
   return bytes;
 }
 
+function minimalElf(metadataByte, text = 'CODE') {
+  const bytes = Buffer.alloc(512);
+  bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0], 0);
+  bytes.writeUInt16LE(2, 16);
+  bytes.writeUInt16LE(62, 18);
+  bytes.writeUInt32LE(1, 20);
+  bytes.writeBigUInt64LE(64n, 40);
+  bytes.writeUInt16LE(64, 52);
+  bytes.writeUInt16LE(64, 58);
+  bytes.writeUInt16LE(3, 60);
+  bytes.writeUInt16LE(1, 62);
+
+  bytes.writeUInt32LE(1, 128);
+  bytes.writeUInt32LE(3, 132);
+  bytes.writeBigUInt64LE(300n, 152);
+  bytes.writeBigUInt64LE(17n, 160);
+
+  bytes.writeUInt32LE(11, 192);
+  bytes.writeUInt32LE(1, 196);
+  bytes.writeBigUInt64LE(6n, 200);
+  bytes.writeBigUInt64LE(400n, 216);
+  bytes.writeBigUInt64LE(4n, 224);
+
+  bytes[280] = metadataByte;
+  bytes.write('\0.shstrtab\0.text\0', 300, 'ascii');
+  bytes.write(text, 400, 'ascii');
+  return bytes;
+}
+
 function digest(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -474,4 +503,60 @@ test('accepts PE binaries with identical text despite different signing metadata
   ]);
 
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('accepts ELF binaries with identical executable text despite different package metadata', async (t) => {
+  const { root, artifact } = await fixture(t);
+  const source = path.join(root, 'source-elf');
+  const packaged = path.join(root, 'packaged-elf');
+  const output = path.join(root, 'evidence.json');
+  await Promise.all([writeFile(source, minimalElf(1)), writeFile(packaged, minimalElf(2))]);
+  const [cas, trash] = await gateReceipts(root);
+
+  const result = run([
+    'finalize', '--target', 'test-target', '--identity-format', 'elf-text',
+    '--source-binary', source, '--packaged-binary', packaged, '--package', artifact,
+    '--receipt', cas, '--receipt', trash, '--output', output,
+  ]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const evidence = JSON.parse(await readFile(output, 'utf8'));
+  assert.equal(evidence.mainBinary.source.identity.algorithm, 'elf-.text-sha256');
+  assert.equal(evidence.mainBinary.packaged[0].identity.algorithm, 'elf-.text-sha256');
+});
+
+test('rejects ELF binaries whose executable text differs', async (t) => {
+  const { root, artifact } = await fixture(t);
+  const source = path.join(root, 'source-elf');
+  const packaged = path.join(root, 'packaged-elf');
+  await Promise.all([writeFile(source, minimalElf(1)), writeFile(packaged, minimalElf(1, 'FAIL'))]);
+  const [cas, trash] = await gateReceipts(root);
+
+  const result = run([
+    'finalize', '--target', 'test-target', '--identity-format', 'elf-text',
+    '--source-binary', source, '--packaged-binary', packaged, '--package', artifact,
+    '--receipt', cas, '--receipt', trash, '--output', path.join(root, 'evidence.json'),
+  ]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /packaged main binary identity mismatch/);
+});
+
+test('rejects malformed ELF section tables instead of weakening identity checks', async (t) => {
+  const { root, artifact } = await fixture(t);
+  const source = path.join(root, 'source-elf');
+  const packaged = path.join(root, 'packaged-elf');
+  const malformed = minimalElf(1);
+  malformed.writeBigUInt64LE(480n, 40);
+  await Promise.all([writeFile(source, malformed), writeFile(packaged, minimalElf(1))]);
+  const [cas, trash] = await gateReceipts(root);
+
+  const result = run([
+    'finalize', '--target', 'test-target', '--identity-format', 'elf-text',
+    '--source-binary', source, '--packaged-binary', packaged, '--package', artifact,
+    '--receipt', cas, '--receipt', trash, '--output', path.join(root, 'evidence.json'),
+  ]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /invalid ELF section table range/);
 });

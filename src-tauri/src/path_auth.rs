@@ -657,6 +657,9 @@ fn reject_symlink_components_below_root(path: &Path, root: &Path) -> Result<(), 
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&current)
             .map_err(|error| format!("Cannot access workspace entry: {error}"))?;
         if metadata.file_type().is_symlink() {
@@ -3845,6 +3848,71 @@ mod tests {
 
         assert_eq!(selected_outer, canonical_outer);
         assert_eq!(selected_inner, canonical_inner);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_verbatim_drive_workspace_entry_supports_mutation_validation() {
+        let workspace = tempdir().unwrap();
+        let document = workspace.path().join("document.md");
+        fs::write(&document, "# document").unwrap();
+        let canonical_root = normalize_existing_path(workspace.path()).unwrap();
+        let canonical_document = normalize_existing_path(&document).unwrap();
+        assert!(matches!(
+            canonical_root.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        let state = AppState::default();
+        let authorized_workspace = state
+            .file_authorization()
+            .authorize_directory_root(&canonical_root)
+            .unwrap();
+
+        let (entry, selected_root) = state
+            .file_authorization()
+            .workspace_entry_for_mutation(authorized_workspace.token(), &canonical_document)
+            .unwrap();
+
+        assert_eq!(entry, canonical_document);
+        assert_eq!(selected_root, canonical_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_verbatim_drive_workspace_entry_still_rejects_symlinks() {
+        use std::os::windows::fs::symlink_file;
+
+        let workspace = tempdir().unwrap();
+        let target = workspace.path().join("target.md");
+        let link = workspace.path().join("linked.md");
+        fs::write(&target, "# target").unwrap();
+        symlink_file(&target, &link).unwrap();
+        let canonical_root = normalize_existing_path(workspace.path()).unwrap();
+        assert!(matches!(
+            canonical_root.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        let state = AppState::default();
+        let authorized_workspace = state
+            .file_authorization()
+            .authorize_directory_root(&canonical_root)
+            .unwrap();
+
+        let error = state
+            .file_authorization()
+            .workspace_entry_for_mutation(
+                authorized_workspace.token(),
+                canonical_root.join("linked.md"),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Symbolic links cannot be modified as workspace entries"
+        );
+        assert_eq!(fs::read(target).unwrap(), b"# target");
     }
 
     #[test]

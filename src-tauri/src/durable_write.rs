@@ -1069,12 +1069,15 @@ fn durable_write_inner_with_all_hooks(
     }
     // Threat boundary: random private staging names are recovery internals, not authority
     // tokens. Public Linux/macOS/Windows replacement APIs still consume a pathname, so a
-    // hostile same-UID process can substitute that leaf after revalidation. The verified
-    // stage handle stays open; the independent intended image is never published; and the
-    // native exchange preserves the actual boundary-displaced bytes. Post-mutation handle,
-    // destination, and displaced digests therefore reject such a race as Indeterminate.
+    // hostile same-UID process can substitute that leaf after revalidation. Unix keeps the
+    // verified stage handle open. ReplaceFileW requires an exclusive open of the replacement,
+    // so Windows releases that handle immediately before the native call and relies on the
+    // independent intended image plus destination and displaced digests. These post-mutation
+    // checks reject a substituted staged path as Indeterminate on every platform.
     // Destination races remain fully in scope and are never dismissed by this boundary.
     let displaced_hint = atomic_displaced_path(&staged_path);
+    #[cfg(windows)]
+    drop(staged_file);
     let displaced_path = match atomic_replace_with_backup(&staged_path, &destination) {
         Ok(path) => path,
         Err(error) => {
@@ -1123,21 +1126,30 @@ fn durable_write_inner_with_all_hooks(
             "The destination parent changed while replacement was in progress.",
         ));
     }
-    match open_file_matches_bytes(&mut staged_file, bytes) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(DurableWriteOutcome::Indeterminate {
-                message: "The verified staged handle changed during replacement.".to_string(),
-                recovery_paths: existing_recovery_paths(vec![intended_recovery, displaced_path]),
-            });
-        }
-        Err(error) => {
-            return Ok(DurableWriteOutcome::Indeterminate {
-                message: format!(
-                    "The verified staged handle could not be revalidated after replacement: {error}"
-                ),
-                recovery_paths: existing_recovery_paths(vec![intended_recovery, displaced_path]),
-            });
+    #[cfg(not(windows))]
+    {
+        match open_file_matches_bytes(&mut staged_file, bytes) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(DurableWriteOutcome::Indeterminate {
+                    message: "The verified staged handle changed during replacement.".to_string(),
+                    recovery_paths: existing_recovery_paths(vec![
+                        intended_recovery,
+                        displaced_path,
+                    ]),
+                });
+            }
+            Err(error) => {
+                return Ok(DurableWriteOutcome::Indeterminate {
+                    message: format!(
+                        "The verified staged handle could not be revalidated after replacement: {error}"
+                    ),
+                    recovery_paths: existing_recovery_paths(vec![
+                        intended_recovery,
+                        displaced_path,
+                    ]),
+                });
+            }
         }
     }
     if fault == Some(DurableWriteFault::ReplacementSucceededBackupUnknown) {
@@ -1201,10 +1213,9 @@ fn durable_write_inner_with_all_hooks(
             recovery_paths: vec![intended_recovery, displaced_path],
         });
     };
-    let expected_digest = format!("{:x}", Sha256::digest(bytes));
-    if version.sha256 != expected_digest {
+    if !version.is_displaced_version_of(&staged_version) {
         return Ok(DurableWriteOutcome::Indeterminate {
-            message: "The replacement digest did not match the staged content; recovery material was retained."
+            message: "The replacement identity did not match the synchronized staged image; recovery material was retained."
                 .to_string(),
             recovery_paths: vec![intended_recovery, displaced_path],
         });
@@ -1712,6 +1723,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn recovery_files(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
         fs::read_dir(directory)
             .unwrap()
@@ -1813,6 +1825,42 @@ mod tests {
             DurableWriteOutcome::ConfirmedCommitted { .. }
         ));
         assert_eq!(fs::read(&destination).unwrap(), b"second");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_same_bytes_staging_substitution_cannot_confirm_commit() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("settings.json");
+        fs::write(&destination, b"old-image").unwrap();
+        let expected = capture_file_version(&destination).unwrap().unwrap();
+
+        let outcome = durable_write_inner_with_all_hooks(
+            &destination,
+            b"new-image",
+            &exact(&expected),
+            None,
+            || {},
+            || {
+                let staged = staged_files(directory.path());
+                assert_eq!(staged.len(), 1);
+                fs::remove_file(&staged[0]).unwrap();
+                fs::write(&staged[0], b"new-image").unwrap();
+            },
+            || {},
+        )
+        .unwrap();
+
+        let DurableWriteOutcome::Indeterminate { recovery_paths, .. } = outcome else {
+            panic!("a replacement with matching bytes but a different identity is not committed");
+        };
+        assert_eq!(fs::read(&destination).unwrap(), b"new-image");
+        assert!(recovery_paths
+            .iter()
+            .any(|path| fs::read(path).ok().as_deref() == Some(b"old-image")));
+        assert!(recovery_paths
+            .iter()
+            .any(|path| fs::read(path).ok().as_deref() == Some(b"new-image")));
     }
 
     #[cfg(unix)]
@@ -2314,6 +2362,7 @@ mod tests {
             .any(|path| fs::read(path).ok().as_deref() == Some(b"old")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn post_create_parent_change_with_failed_recovery_creation_is_indeterminate() {
         let directory = tempdir().unwrap();
@@ -2352,6 +2401,7 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn ancestor_swap_is_detected_without_mutating_the_replacement_tree() {
         let directory = tempdir().unwrap();
@@ -2381,6 +2431,83 @@ mod tests {
         assert!(recovery_files(&parent)
             .iter()
             .any(|path| fs::read(path).ok().as_deref() == Some(b"intended")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_live_staging_handle_prevents_ancestor_swap_before_replacement() {
+        use std::cell::Cell;
+
+        let directory = tempdir().unwrap();
+        let ancestor = directory.path().join("workspace");
+        let parent = ancestor.join("nested");
+        fs::create_dir_all(&parent).unwrap();
+        let destination = parent.join("document.md");
+        fs::write(&destination, b"old").unwrap();
+        let expected = capture_file_version(&destination).unwrap().unwrap();
+        let moved = directory.path().join("moved-workspace");
+        let rename_error = Cell::new(None);
+
+        let outcome = durable_write_inner_with_hook(
+            &destination,
+            b"intended",
+            &exact(&expected),
+            None,
+            || {
+                rename_error.set(
+                    fs::rename(&ancestor, &moved)
+                        .err()
+                        .and_then(|error| error.raw_os_error()),
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rename_error.get(), Some(5));
+        assert!(matches!(
+            outcome,
+            DurableWriteOutcome::ConfirmedCommitted { .. }
+        ));
+        assert_eq!(fs::read(destination).unwrap(), b"intended");
+        assert!(!moved.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_live_installed_handle_prevents_post_create_parent_swap() {
+        use std::cell::Cell;
+
+        let directory = tempdir().unwrap();
+        let ancestor = directory.path().join("workspace");
+        fs::create_dir(&ancestor).unwrap();
+        let destination = ancestor.join("document.md");
+        let moved = directory.path().join("moved-workspace");
+        let rename_error = Cell::new(None);
+
+        let outcome = durable_write_inner_with_all_hooks(
+            &destination,
+            b"intended",
+            &ExpectedFileState::Absent,
+            None,
+            || {},
+            || {},
+            || {
+                rename_error.set(
+                    fs::rename(&ancestor, &moved)
+                        .err()
+                        .and_then(|error| error.raw_os_error()),
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rename_error.get(), Some(5));
+        assert!(matches!(
+            outcome,
+            DurableWriteOutcome::ConfirmedCommitted { .. }
+        ));
+        assert_eq!(fs::read(destination).unwrap(), b"intended");
+        assert!(!moved.exists());
     }
 
     #[test]

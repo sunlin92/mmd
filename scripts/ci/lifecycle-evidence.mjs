@@ -131,11 +131,85 @@ function peTextSection(bytes) {
   throw new Error('PE .text section is missing');
 }
 
+function elfSafeInteger(value, description) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) throw new Error(`invalid ELF ${description}`);
+  return number;
+}
+
+function elfFileRange(bytes, offset, size, description) {
+  if (offset > bytes.length || size > bytes.length - offset) {
+    throw new Error(`invalid ELF ${description} range`);
+  }
+  return bytes.subarray(offset, offset + size);
+}
+
+function elfTextSection(bytes) {
+  if (bytes.length < 64
+    || !bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
+    || bytes[4] !== 2
+    || bytes[5] !== 1
+    || bytes[6] !== 1) {
+    throw new Error('expected a little-endian 64-bit ELF binary');
+  }
+  if (bytes.readUInt16LE(52) < 64) throw new Error('invalid ELF header size');
+
+  const sectionTableOffset = elfSafeInteger(bytes.readBigUInt64LE(40), 'section table offset');
+  const sectionHeaderSize = bytes.readUInt16LE(58);
+  const sectionCount = bytes.readUInt16LE(60);
+  const stringTableIndex = bytes.readUInt16LE(62);
+  if (sectionHeaderSize < 64 || sectionCount === 0) throw new Error('invalid ELF section table dimensions');
+  if (stringTableIndex === 0xffff || stringTableIndex >= sectionCount) {
+    throw new Error('invalid ELF section-name string table index');
+  }
+  elfFileRange(bytes, sectionTableOffset, sectionHeaderSize * sectionCount, 'section table');
+
+  function sectionHeader(index) {
+    const offset = sectionTableOffset + (index * sectionHeaderSize);
+    return {
+      nameOffset: bytes.readUInt32LE(offset),
+      type: bytes.readUInt32LE(offset + 4),
+      flags: bytes.readBigUInt64LE(offset + 8),
+      fileOffset: elfSafeInteger(bytes.readBigUInt64LE(offset + 24), 'section offset'),
+      size: elfSafeInteger(bytes.readBigUInt64LE(offset + 32), 'section size'),
+    };
+  }
+
+  const stringTableHeader = sectionHeader(stringTableIndex);
+  if (stringTableHeader.type !== 3) throw new Error('ELF section-name table is not a string table');
+  const stringTable = elfFileRange(
+    bytes,
+    stringTableHeader.fileOffset,
+    stringTableHeader.size,
+    'section-name string table',
+  );
+
+  function sectionName(nameOffset) {
+    if (nameOffset >= stringTable.length) throw new Error('invalid ELF section name offset');
+    const end = stringTable.indexOf(0, nameOffset);
+    if (end === -1) throw new Error('unterminated ELF section name');
+    return stringTable.subarray(nameOffset, end).toString('ascii');
+  }
+
+  const textSections = [];
+  for (let index = 0; index < sectionCount; index += 1) {
+    const header = sectionHeader(index);
+    if (sectionName(header.nameOffset) !== '.text') continue;
+    if (header.type !== 1 || (header.flags & 0x4n) === 0n || header.size === 0) {
+      throw new Error('ELF .text section is not executable file-backed code');
+    }
+    textSections.push(elfFileRange(bytes, header.fileOffset, header.size, '.text section'));
+  }
+  if (textSections.length !== 1) throw new Error('ELF must contain exactly one .text section');
+  return textSections[0];
+}
+
 async function executableIdentity(file, format) {
   const bytes = await readFile(file);
   if (format === 'exact') return { algorithm: 'file-sha256', sha256: hashBytes(bytes) };
   if (format === 'macho-text') return { algorithm: 'macho-__TEXT,__text-sha256', sha256: hashBytes(machoTextSection(bytes)) };
   if (format === 'pe-text') return { algorithm: 'pe-.text-sha256', sha256: hashBytes(peTextSection(bytes)) };
+  if (format === 'elf-text') return { algorithm: 'elf-.text-sha256', sha256: hashBytes(elfTextSection(bytes)) };
   throw new Error(`unsupported identity format: ${format}`);
 }
 

@@ -27,6 +27,7 @@ test('records target-native durable-write CAS and real Trash gates', async () =>
   assert.match(value, /run-cargo-tests\s+--gate durable-write-cas/);
   assert.match(value, /final_compare_race_retains_complete_competing_bytes/);
   assert.match(value, /expected_absent_install_race_retains_independent_intended_bytes/);
+  assert.match(value, /staged_path_substitution_at_native_boundary_preserves_all_complete_images/);
   assert.match(value, /run-cargo-tests\s+--gate native-trash/);
   assert.match(value, /real_native_trash_round_trip_for_file_and_non_empty_directory/);
   assert.match(value, /MMD_RUN_NATIVE_TRASH_SMOKE:\s*'1'/);
@@ -42,6 +43,7 @@ test('verifies packaged main-binary identity on macOS Windows and Linux', async 
   assert.match(value, /--packaged-binary/);
   assert.match(value, /--identity-format macho-text/);
   assert.match(value, /--identity-format pe-text/);
+  assert.match(value, /--identity-format elf-text/);
 });
 
 test('creates lifecycle evidence after package build and archives it in the manifest', async () => {

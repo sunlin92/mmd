@@ -103,6 +103,7 @@ jobs:
           --output .m2-evidence/cas.json
           --filter durable_write::tests::final_compare_race_retains_complete_competing_bytes
           --filter durable_write::tests::expected_absent_install_race_retains_independent_intended_bytes
+          --filter durable_write::tests::staged_path_substitution_at_native_boundary_preserves_all_complete_images
       - name: Native Trash file and directory evidence
         run: >-
           node scripts/ci/lifecycle-evidence.mjs run-cargo-tests
@@ -241,6 +242,7 @@ jobs:
         run: >-
           node scripts/ci/lifecycle-evidence.mjs finalize
           --target ${{ matrix.target }}
+          --identity-format elf-text
           --source-binary src-tauri/target/${{ matrix.target }}/release/mmd
           --package-variant appimage
           --packaged-binary packaged-main/mmd-appimage
