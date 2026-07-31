@@ -345,9 +345,161 @@ fn verify_kind(metadata: &fs::Metadata, kind: TrashEntryKind) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
+fn windows_shell_parsing_name_from_wide(path: &[u16]) -> Result<Vec<u16>, &'static str> {
+    // Rust canonicalization returns verbatim names; Shell expects a display name.
+    const BACKSLASH: u16 = b'\\' as u16;
+    const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+    const VERBATIM_UNC_PREFIX: [u16; 8] = [
+        BACKSLASH,
+        BACKSLASH,
+        b'?' as u16,
+        BACKSLASH,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        BACKSLASH,
+    ];
+    const DEVICE_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'.' as u16, BACKSLASH];
+
+    if path.starts_with(&VERBATIM_UNC_PREFIX) {
+        return Err("Windows UNC paths are not supported for Shell Trash");
+    }
+    if let Some(rest) = path.strip_prefix(&VERBATIM_PREFIX) {
+        let drive_letter = rest.first().copied().is_some_and(|value| {
+            (b'A' as u16..=b'Z' as u16).contains(&value)
+                || (b'a' as u16..=b'z' as u16).contains(&value)
+        });
+        if drive_letter && rest.get(1) == Some(&(b':' as u16)) && rest.get(2) == Some(&BACKSLASH) {
+            return Ok(rest.to_vec());
+        }
+        return Err("unsupported Windows verbatim path for Shell parsing");
+    }
+    if path.starts_with(&DEVICE_PREFIX) {
+        return Err("unsupported Windows device path for Shell parsing");
+    }
+    if path.starts_with(&[BACKSLASH, BACKSLASH]) {
+        return Err("Windows UNC paths are not supported for Shell Trash");
+    }
+    Ok(path.to_vec())
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().collect()
+    }
+
+    #[test]
+    fn windows_shell_parsing_name_converts_a_supported_verbatim_drive_path() {
+        assert_eq!(
+            windows_shell_parsing_name_from_wide(&wide(
+                r"\\?\C:\Users\runneradmin\AppData\Local\Temp\note.md"
+            ))
+            .unwrap(),
+            wide(r"C:\Users\runneradmin\AppData\Local\Temp\note.md"),
+        );
+    }
+
+    #[test]
+    fn windows_shell_parsing_name_rejects_unc_and_device_namespaces() {
+        for value in [r"C:\Users\runneradmin\AppData\Local\Temp\note.md"] {
+            assert_eq!(
+                windows_shell_parsing_name_from_wide(&wide(value)).unwrap(),
+                wide(value),
+            );
+        }
+        for value in [
+            r"\\?\UNC\server\share\folder\note.md",
+            r"\\server\share\folder\note.md",
+        ] {
+            assert_eq!(
+                windows_shell_parsing_name_from_wide(&wide(value)),
+                Err("Windows UNC paths are not supported for Shell Trash"),
+            );
+        }
+        assert_eq!(
+            windows_shell_parsing_name_from_wide(&wide(
+                r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\note.md"
+            )),
+            Err("unsupported Windows verbatim path for Shell parsing"),
+        );
+        assert_eq!(
+            windows_shell_parsing_name_from_wide(&wide(r"\\.\PhysicalDrive0")),
+            Err("unsupported Windows device path for Shell parsing"),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_verbatim_source_uses_an_equivalent_dos_shell_name() {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Component};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("note.md");
+        fs::write(&source, "content").unwrap();
+        let canonical = fs::canonicalize(&source).unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+
+        let expected = capture_source_identity(&canonical, TrashEntryKind::File).unwrap();
+        let shell_name = platform::shell_parsing_name(&canonical, &expected).unwrap();
+        assert_eq!(shell_name.last(), Some(&0));
+        let shell_path =
+            std::path::PathBuf::from(OsString::from_wide(&shell_name[..shell_name.len() - 1]));
+        assert!(!shell_path.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(fs::canonicalize(shell_path).unwrap(), canonical);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_shell_name_rejects_a_same_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("note.md");
+        fs::write(&source, "authorized").unwrap();
+        let canonical = fs::canonicalize(&source).unwrap();
+        let expected = capture_source_identity(&canonical, TrashEntryKind::File).unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, "replacement").unwrap();
+
+        let error = platform::shell_parsing_name(&canonical, &expected).unwrap_err();
+        assert_eq!(error.operation, "revalidate trash source identity");
+        assert!(error.message.contains("source changed"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pre_delete_identity_guard_keeps_a_replacement_unmoved_and_uncommitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("note.md");
+        fs::write(&source, "authorized").unwrap();
+        let mut port = NativeTrashPort {
+            source_identity: None,
+            injected_move: Some(Box::new(|source, _, expected| {
+                fs::remove_file(source).unwrap();
+                fs::write(source, "replacement").unwrap();
+                match platform::validate_pre_delete_identity(source, &expected) {
+                    Ok(()) => panic!("same-path replacement must fail the pre-delete guard"),
+                    Err(error) => MoveToTrash::Rejected { error },
+                }
+            })),
+        };
+
+        let classification =
+            crate::workspace_trash::classify_trash(&mut port, &source, TrashEntryKind::File);
+
+        assert!(matches!(
+            classification,
+            crate::workspace_trash::TrashClassification::Indeterminate { .. }
+        ));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+    }
 
     #[test]
     fn recreated_source_is_unobservable_instead_of_present() {
@@ -560,20 +712,35 @@ mod identity_tests {
                     fs::write(source.join("child.md"), "smoke").unwrap();
                 }
             }
-            let mut port = NativeTrashPort::default();
-            let receipt = match crate::workspace_trash::classify_trash(&mut port, &source, kind) {
-                crate::workspace_trash::TrashClassification::ConfirmedCommitted {
-                    recovery_receipt,
-                    warnings,
-                } => {
-                    assert!(
-                        warnings.is_empty(),
-                        "native Trash smoke warnings: {warnings:?}"
-                    );
-                    recovery_receipt
-                }
-                other => panic!("native Trash smoke was not committed: {other:?}"),
+            #[cfg(windows)]
+            let trash_source = {
+                use std::path::Component;
+
+                let canonical = fs::canonicalize(&source).unwrap();
+                assert!(matches!(
+                    canonical.components().next(),
+                    Some(Component::Prefix(prefix))
+                        if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+                ));
+                canonical
             };
+            #[cfg(not(windows))]
+            let trash_source = source.clone();
+            let mut port = NativeTrashPort::default();
+            let receipt =
+                match crate::workspace_trash::classify_trash(&mut port, &trash_source, kind) {
+                    crate::workspace_trash::TrashClassification::ConfirmedCommitted {
+                        recovery_receipt,
+                        warnings,
+                    } => {
+                        assert!(
+                            warnings.is_empty(),
+                            "native Trash smoke warnings: {warnings:?}"
+                        );
+                        recovery_receipt
+                    }
+                    other => panic!("native Trash smoke was not committed: {other:?}"),
+                };
             fs::rename(&receipt.destination, &source).unwrap();
             #[cfg(target_os = "linux")]
             fs::remove_file(&receipt.trash_info).unwrap();
@@ -1172,8 +1339,9 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::{
+        ffi::OsString,
         io,
-        os::windows::ffi::OsStrExt,
+        os::windows::ffi::{OsStrExt, OsStringExt},
         path::PathBuf,
         sync::{Arc, Mutex},
         thread,
@@ -1182,7 +1350,7 @@ mod platform {
     use windows::{
         core::{implement, Ref, Result as WinResult, HRESULT, PCWSTR},
         Win32::{
-            Foundation::E_FAIL,
+            Foundation::{E_ABORT, E_FAIL},
             System::Com::{
                 CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
@@ -1197,6 +1365,39 @@ mod platform {
     };
 
     use super::*;
+
+    pub(super) fn shell_parsing_name(
+        source: &Path,
+        expected_identity: &NativeSourceIdentity,
+    ) -> Result<Vec<u16>, NativeTrashError> {
+        if !source.is_absolute() {
+            return Err(NativeTrashError::new(
+                "prepare Windows shell item path",
+                "Trash source path must be absolute",
+            ));
+        }
+        let source_wide: Vec<u16> = source.as_os_str().encode_wide().collect();
+        let shell_wide = windows_shell_parsing_name_from_wide(&source_wide)
+            .map_err(|error| NativeTrashError::new("prepare Windows shell item path", error))?;
+        let shell_source = PathBuf::from(OsString::from_wide(&shell_wide));
+        let canonical_source = fs::canonicalize(source).map_err(|error| {
+            NativeTrashError::new("revalidate Windows shell item source", error)
+        })?;
+        let canonical_shell_source = fs::canonicalize(&shell_source).map_err(|error| {
+            NativeTrashError::new("revalidate Windows shell parsing path", error)
+        })?;
+        if canonical_shell_source != canonical_source {
+            return Err(NativeTrashError::new(
+                "revalidate Windows shell parsing path",
+                "Shell path does not resolve to the authorized source",
+            ));
+        }
+        ensure_identity_unchanged(&canonical_shell_source, expected_identity)?;
+
+        let mut terminated = shell_wide;
+        terminated.push(0);
+        Ok(terminated)
+    }
 
     #[derive(Default)]
     struct SinkState {
@@ -1217,6 +1418,47 @@ mod platform {
     #[implement(IFileOperationProgressSink)]
     struct ProgressSink {
         state: Arc<Mutex<SinkState>>,
+        expected_source_identity: NativeSourceIdentity,
+    }
+
+    pub(super) fn validate_pre_delete_identity(
+        item_path: &Path,
+        expected_identity: &NativeSourceIdentity,
+    ) -> Result<(), NativeTrashError> {
+        ensure_identity_unchanged(item_path, expected_identity)
+    }
+
+    fn record_pre_delete_validation(
+        state: &Arc<Mutex<SinkState>>,
+        validation: Result<(), NativeTrashError>,
+    ) -> WinResult<()> {
+        match validation {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                state
+                    .lock()
+                    .map_err(|_| windows::core::Error::from(E_FAIL))?
+                    .record_error(error);
+                Err(windows::core::Error::from(E_ABORT))
+            }
+        }
+    }
+
+    fn operation_error_with_sink_detail(
+        operation: &'static str,
+        error: impl fmt::Display,
+        state: &Arc<Mutex<SinkState>>,
+    ) -> NativeTrashError {
+        let mut message = error.to_string();
+        if let Some(callback_error) = state
+            .lock()
+            .ok()
+            .and_then(|state| state.post_delete_error.clone())
+        {
+            message.push_str("; pre-delete validation: ");
+            message.push_str(&callback_error);
+        }
+        NativeTrashError::new(operation, message)
     }
 
     #[allow(non_snake_case)]
@@ -1286,8 +1528,21 @@ mod platform {
         ) -> WinResult<()> {
             Ok(())
         }
-        fn PreDeleteItem(&self, _: u32, _: Ref<'_, IShellItem>) -> WinResult<()> {
-            Ok(())
+        fn PreDeleteItem(&self, _: u32, item: Ref<'_, IShellItem>) -> WinResult<()> {
+            let validation = match item.as_ref() {
+                Some(item) => unsafe { shell_item_path(item) }
+                    .map_err(|error| {
+                        NativeTrashError::new("resolve Windows shell item before deletion", error)
+                    })
+                    .and_then(|item_path| {
+                        validate_pre_delete_identity(&item_path, &self.expected_source_identity)
+                    }),
+                None => Err(NativeTrashError::new(
+                    "resolve Windows shell item before deletion",
+                    "Shell did not provide the item queued for deletion",
+                )),
+            };
+            record_pre_delete_validation(&self.state, validation)
         }
         fn PostDeleteItem(
             &self,
@@ -1397,7 +1652,10 @@ mod platform {
             }
         }
         let _guard = ComGuard;
-        let path: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let path = match shell_parsing_name(&source, &source_identity) {
+            Ok(path) => path,
+            Err(error) => return MoveToTrash::Rejected { error },
+        };
         let item: IShellItem = match SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None) {
             Ok(item) => item,
             Err(error) => {
@@ -1428,6 +1686,7 @@ mod platform {
         let state = Arc::new(Mutex::new(SinkState::default()));
         let sink: IFileOperationProgressSink = ProgressSink {
             state: Arc::clone(&state),
+            expected_source_identity: source_identity.clone(),
         }
         .into();
         if let Err(error) = operation.DeleteItem(&item, &sink) {
@@ -1438,23 +1697,32 @@ mod platform {
         if let Err(error) = operation.PerformOperations() {
             return MoveToTrash::PossiblyMoved {
                 recovery_receipt: receipt_from_state(&state, kind, &source_identity),
-                error: NativeTrashError::new("perform Windows Trash operation", error),
+                error: operation_error_with_sink_detail(
+                    "perform Windows Trash operation",
+                    error,
+                    &state,
+                ),
             };
         }
         match operation.GetAnyOperationsAborted() {
             Ok(aborted) if aborted.as_bool() => {
                 return MoveToTrash::PossiblyMoved {
                     recovery_receipt: receipt_from_state(&state, kind, &source_identity),
-                    error: NativeTrashError::new(
+                    error: operation_error_with_sink_detail(
                         "perform Windows Trash operation",
                         "operation was aborted",
+                        &state,
                     ),
                 }
             }
             Err(error) => {
                 return MoveToTrash::PossiblyMoved {
                     recovery_receipt: receipt_from_state(&state, kind, &source_identity),
-                    error: NativeTrashError::new("inspect Windows Trash completion", error),
+                    error: operation_error_with_sink_detail(
+                        "inspect Windows Trash completion",
+                        error,
+                        &state,
+                    ),
                 }
             }
             _ => {}
@@ -1532,6 +1800,58 @@ mod platform {
             Err(error) => PlacementVerification::Unobservable {
                 error: NativeTrashError::new("observe Windows recycle-bin receipt", error),
             },
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pre_delete_callback_aborts_a_replacement_and_retains_its_reason() {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("note.md");
+            fs::write(&source, "authorized").unwrap();
+            let canonical = fs::canonicalize(&source).unwrap();
+            let expected = capture_source_identity(&canonical, TrashEntryKind::File).unwrap();
+            let source_for_callback = source.clone();
+            let (code, recorded, propagated) = thread::spawn(move || unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap();
+                struct TestComGuard;
+                impl Drop for TestComGuard {
+                    fn drop(&mut self) {
+                        unsafe { CoUninitialize() }
+                    }
+                }
+                let _guard = TestComGuard;
+                let shell_name = shell_parsing_name(&canonical, &expected).unwrap();
+                let item: IShellItem =
+                    SHCreateItemFromParsingName(PCWSTR(shell_name.as_ptr()), None).unwrap();
+                fs::remove_file(&source_for_callback).unwrap();
+                fs::write(&source_for_callback, "replacement").unwrap();
+                let state = Arc::new(Mutex::new(SinkState::default()));
+                let sink: IFileOperationProgressSink = ProgressSink {
+                    state: Arc::clone(&state),
+                    expected_source_identity: expected,
+                }
+                .into();
+
+                let error = sink.PreDeleteItem(0, &item).unwrap_err();
+                let recorded = state.lock().unwrap().post_delete_error.clone().unwrap();
+                let propagated = operation_error_with_sink_detail(
+                    "perform Windows Trash operation",
+                    "operation was aborted",
+                    &state,
+                );
+                (error.code(), recorded, propagated)
+            })
+            .join()
+            .unwrap();
+
+            assert_eq!(code, E_ABORT);
+            assert!(recorded.contains("source changed"));
+            assert!(propagated.message.contains(&recorded));
+            assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
         }
     }
 }
