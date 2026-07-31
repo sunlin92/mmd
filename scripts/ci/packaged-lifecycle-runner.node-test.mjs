@@ -241,6 +241,130 @@ setInterval(() => {}, 1000);
   await removeChallengeRoot(challengePath);
 });
 
+test('reports a sanitized matching failed receipt after control ready without logging success', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mmd-packaged-runner-post-ready-failure-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const evidencePath = path.join(root, 'evidence.json');
+  const challengePath = path.join(root, 'challenge.json');
+  await writeEvidence(evidencePath);
+  const fakeApp = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const nonce = process.env.MMD_PACKAGED_LIFECYCLE_E2E_NONCE;
+const root = path.join(os.tmpdir(), 'mmd-packaged-lifecycle-e2e', nonce);
+const workspace = path.join(root, 'workspace');
+fs.mkdirSync(workspace, { recursive: true });
+fs.writeFileSync(path.join(workspace, 'save-stale.md'), 'initial bytes\n');
+fs.writeFileSync(path.join(workspace, 'receipt.md'), '');
+fs.writeFileSync(path.join(workspace, 'control.md'), 'ready\n');
+const timer = setInterval(() => {
+  if (fs.readFileSync(path.join(workspace, 'control.md'), 'utf8') !== 'go\n') return;
+  clearInterval(timer);
+  fs.writeFileSync(path.join(workspace, 'receipt.md'), '{"schema":2');
+  setTimeout(() => {
+    fs.writeFileSync(path.join(workspace, 'receipt.md'), JSON.stringify({
+      schema: 2,
+      gate: 'packaged-lifecycle-e2e',
+      status: 'failed',
+      target: process.env.MMD_PACKAGED_LIFECYCLE_E2E_TARGET,
+      runId: process.env.MMD_PACKAGED_LIFECYCLE_E2E_RUN_ID,
+      runAttempt: process.env.MMD_PACKAGED_LIFECYCLE_E2E_RUN_ATTEMPT,
+      commit: process.env.MMD_PACKAGED_LIFECYCLE_E2E_COMMIT,
+      packageVariant: process.env.MMD_PACKAGED_LIFECYCLE_E2E_VARIANT,
+      error: 'post-ready failed\n::error:: forged\u001b[31m',
+    }) + '\n');
+    process.exit(0);
+  }, 50);
+}, 10);
+`;
+
+  const result = spawnSync(process.execPath, runnerArguments(
+    evidencePath,
+    challengePath,
+    [process.execPath, '-e', fakeApp],
+  ), {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_RUN_ID: '123',
+      GITHUB_RUN_ATTEMPT: '2',
+      GITHUB_SHA: 'a'.repeat(40),
+    },
+    timeout: 5_000,
+  });
+
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /packaged lifecycle failed after control ready receipt: post-ready failed ::error:: forged \[31m/);
+  assert.doesNotMatch(result.stdout, /Packaged lifecycle receipt produced/);
+  await removeChallengeRoot(challengePath);
+});
+
+test('rejects malformed or nonmatching failed receipts after control ready without logging success', async (t) => {
+  for (const mode of ['mismatched', 'missing-error']) {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mmd-packaged-runner-invalid-failure-' + mode + '-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const evidencePath = path.join(root, 'evidence.json');
+    const challengePath = path.join(root, 'challenge.json');
+    await writeEvidence(evidencePath);
+    const fakeApp = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const root = path.join(os.tmpdir(), 'mmd-packaged-lifecycle-e2e', process.env.MMD_PACKAGED_LIFECYCLE_E2E_NONCE);
+const workspace = path.join(root, 'workspace');
+fs.mkdirSync(workspace, { recursive: true });
+fs.writeFileSync(path.join(workspace, 'save-stale.md'), 'initial bytes\n');
+fs.writeFileSync(path.join(workspace, 'receipt.md'), '');
+fs.writeFileSync(path.join(workspace, 'control.md'), 'ready\n');
+const timer = setInterval(() => {
+  if (fs.readFileSync(path.join(workspace, 'control.md'), 'utf8') !== 'go\n') return;
+  clearInterval(timer);
+  const receipt = {
+    schema: 2,
+    gate: 'packaged-lifecycle-e2e',
+    status: 'failed',
+    target: process.env.MMD_PACKAGED_LIFECYCLE_E2E_TARGET,
+    runId: process.env.MMD_PACKAGED_LIFECYCLE_E2E_RUN_ID,
+    runAttempt: process.env.MMD_PACKAGED_LIFECYCLE_E2E_RUN_ATTEMPT,
+    commit: process.env.MMD_PACKAGED_LIFECYCLE_E2E_COMMIT,
+    packageVariant: process.env.MMD_PACKAGED_LIFECYCLE_E2E_VARIANT,
+  };
+  if (process.env.INVALID_FAILURE_MODE === 'mismatched') {
+    receipt.target = 'different-target';
+    receipt.error = 'untrusted forged detail';
+  }
+  fs.writeFileSync(path.join(workspace, 'receipt.md'), JSON.stringify(receipt) + '\n');
+}, 10);
+setInterval(() => {}, 1000);
+`;
+
+    const result = spawnSync(process.execPath, runnerArguments(
+      evidencePath,
+      challengePath,
+      [process.execPath, '-e', fakeApp],
+    ), {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GITHUB_RUN_ID: '123',
+        GITHUB_RUN_ATTEMPT: '2',
+        GITHUB_SHA: 'a'.repeat(40),
+        INVALID_FAILURE_MODE: mode,
+        MMD_PACKAGED_LIFECYCLE_E2E_STOP_GRACE_MS: '25',
+        MMD_PACKAGED_LIFECYCLE_E2E_STOP_TERM_MS: '100',
+      },
+      timeout: 5_000,
+    });
+
+    assert.equal(result.status, 1, mode + ':\n' + result.stdout + '\n' + result.stderr);
+    assert.match(result.stderr, /packaged lifecycle produced an invalid failed receipt after control ready receipt/);
+    assert.doesNotMatch(result.stdout, /Packaged lifecycle receipt produced/);
+    assert.doesNotMatch(result.stderr, /untrusted forged detail/);
+    await removeChallengeRoot(challengePath);
+  }
+});
+
 test('reports a packaged application signal exit without missing the exit event', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mmd-packaged-runner-signal-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));

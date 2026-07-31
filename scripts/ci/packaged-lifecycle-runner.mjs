@@ -74,6 +74,7 @@ async function waitUntil(predicate, completion, description) {
       new Promise((resolve) => setTimeout(() => resolve({ type: 'poll' }), 100)),
     ]);
     if (outcome.type === 'completion') {
+      if (await predicate()) return;
       throw new Error(`packaged application ${describeCompletion(outcome.result)} before ${description}`);
     }
   }
@@ -96,22 +97,33 @@ function sanitizeReceiptError(message) {
   return sanitized.replace(/\s+/g, ' ').trim() || 'unspecified packaged lifecycle failure';
 }
 
-async function failedReceiptError(file, challenge) {
+async function readPackagedReceiptState(file, challenge) {
   let receipt;
   try {
     receipt = JSON.parse(await readFile(file, 'utf8'));
   } catch (error) {
-    if (error?.code === 'ENOENT' || error instanceof SyntaxError) return null;
+    if (error?.code === 'ENOENT' || error instanceof SyntaxError) return { kind: 'pending' };
     throw error;
   }
-  if (receipt.schema !== 2
-      || receipt.gate !== 'packaged-lifecycle-e2e'
-      || receipt.status !== 'failed'
-      || typeof receipt.error !== 'string') return null;
-  for (const field of ['target', 'runId', 'runAttempt', 'commit', 'packageVariant']) {
-    if (receipt[field] !== challenge[field]) return null;
+  if (receipt.schema !== 2 || receipt.gate !== 'packaged-lifecycle-e2e') {
+    return { kind: 'pending' };
   }
-  return sanitizeReceiptError(receipt.error);
+  if (receipt.status === 'passed') return { kind: 'passed' };
+  if (receipt.status !== 'failed') return { kind: 'pending' };
+  if (typeof receipt.error !== 'string') return { kind: 'invalid-failed' };
+  for (const field of ['target', 'runId', 'runAttempt', 'commit', 'packageVariant']) {
+    if (receipt[field] !== challenge[field]) return { kind: 'invalid-failed' };
+  }
+  return { kind: 'failed', error: sanitizeReceiptError(receipt.error) };
+}
+
+function throwReceiptFailure(state, timing) {
+  if (state.kind === 'failed') {
+    throw new Error(`packaged lifecycle failed ${timing}: ${state.error}`);
+  }
+  if (state.kind === 'invalid-failed') {
+    throw new Error(`packaged lifecycle produced an invalid failed receipt ${timing}`);
+  }
 }
 
 async function settlesWithin(completion, milliseconds) {
@@ -228,23 +240,17 @@ const childObservation = observeChild(child);
 
 try {
   await waitUntil(async () => {
-    const failure = await failedReceiptError(challenge.receiptPath, challenge);
-    if (failure) throw new Error(`packaged lifecycle failed before control ready receipt: ${failure}`);
+    const receiptState = await readPackagedReceiptState(challenge.receiptPath, challenge);
+    throwReceiptFailure(receiptState, 'before control ready receipt');
     if (!(await exists(challenge.controlPath))) return false;
     return await readFile(challenge.controlPath, 'utf8') === 'ready\n';
   }, childObservation.completion, 'control ready receipt');
   await writeFile(challenge.stalePath, COMPETING_BYTES);
   await writeAtomic(challenge.controlPath, 'go\n');
   await waitUntil(async () => {
-    if (!(await exists(challenge.receiptPath))) return false;
-    try {
-      const receipt = JSON.parse(await readFile(challenge.receiptPath, 'utf8'));
-      return receipt.schema === 2
-        && receipt.gate === 'packaged-lifecycle-e2e'
-        && (receipt.status === 'passed' || receipt.status === 'failed');
-    } catch {
-      return false;
-    }
+    const receiptState = await readPackagedReceiptState(challenge.receiptPath, challenge);
+    throwReceiptFailure(receiptState, 'after control ready receipt');
+    return receiptState.kind === 'passed';
   }, childObservation.completion, 'complete lifecycle receipt');
 } finally {
   await stopChild(child, childObservation);
