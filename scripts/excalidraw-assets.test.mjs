@@ -111,7 +111,9 @@ describe('Excalidraw font transform', () => {
     );
     const moduleEntries = html.match(/<script\b[^>]*\btype=["']module["'][^>]*\bsrc=/gu) ?? [];
     const fontImportIndex = bootstrap.indexOf("import './lib/excalidrawSystemFontsBootstrap'");
-    const mainImportIndex = bootstrap.indexOf("import './main'");
+    const featureGateIndex = bootstrap.indexOf('VITE_MMD_PACKAGED_LIFECYCLE_E2E');
+    const packagedRunnerImportIndex = bootstrap.indexOf("import('./lib/packagedLifecycleE2e')");
+    const mainImportIndex = bootstrap.indexOf("import('./main')");
 
     expect(moduleEntries).toHaveLength(1);
     expect(html).toContain('src="/src/bootstrap.ts"');
@@ -119,7 +121,10 @@ describe('Excalidraw font transform', () => {
     expect(html).not.toContain('EXCALIDRAW_ASSET_PATH');
     expect(fontBootstrap).toContain('installExcalidrawSystemFonts()');
     expect(fontImportIndex).toBeGreaterThan(-1);
-    expect(mainImportIndex).toBeGreaterThan(fontImportIndex);
-    expect(bootstrap).not.toMatch(/\bimport\s*\(/u);
+    expect(featureGateIndex).toBeGreaterThan(fontImportIndex);
+    expect(packagedRunnerImportIndex).toBeGreaterThan(featureGateIndex);
+    expect(mainImportIndex).toBeGreaterThan(featureGateIndex);
+    expect(bootstrap.match(/\bimport\s*\(/gu)).toHaveLength(2);
+    expect(bootstrap).not.toContain("import './main'");
   });
 });

@@ -45,7 +45,7 @@ export function getFileTreeContextMenuItems(
       { action: 'create-folder', label: 'New Folder' },
       { action: 'rename', label: 'Rename', separatorBefore: true, shortcut: 'Return' },
       { action: 'move', label: 'Move…' },
-      { action: 'delete', danger: true, label: 'Delete', separatorBefore: true, shortcut: '⌘⌫' },
+      { action: 'delete', danger: true, label: 'Move to Trash', separatorBefore: true, shortcut: '⌘⌫' },
     ];
   }
 
@@ -59,6 +59,6 @@ export function getFileTreeContextMenuItems(
     items.push({ action: 'rename', label: 'Rename', separatorBefore: true, shortcut: 'Return' });
   }
   items.push({ action: 'move', label: 'Move…', separatorBefore: !canRenameFileTreeTarget(target) });
-  items.push({ action: 'delete', danger: true, label: 'Delete', separatorBefore: true, shortcut: '⌘⌫' });
+  items.push({ action: 'delete', danger: true, label: 'Move to Trash', separatorBefore: true, shortcut: '⌘⌫' });
   return items;
 }

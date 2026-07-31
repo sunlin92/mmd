@@ -3,6 +3,9 @@ import {
   createWorkspaceDirectory,
   createWorkspaceFile,
   deleteWorkspaceEntry,
+  cancelDocumentOverwriteToken,
+  getSettings,
+  issueDocumentOverwriteToken,
   moveWorkspaceEntry,
   openDirectoryDialog,
   openFileDialog,
@@ -12,13 +15,16 @@ import {
   releaseMarkdownHtmlEmbed,
   readMarkdownExcalidraw,
   readWorkspaceImage,
+  resetSettings,
   refreshDirectory,
   renameWorkspaceEntry,
+  retryDocumentSaveWithToken,
   resolveWorkspaceMedia,
   saveAsDialog,
   setNativeSaveMenuEnabled,
   setNativeLocalePreference,
   setNativeThemePreference,
+  updateSettings,
   restoreWorkspaceSession,
   writeFile,
 } from './tauriCommands';
@@ -32,6 +38,14 @@ const workspaceSnapshot = {
   directories: [],
 };
 
+const fileVersion = {
+  canonicalPath: '/workspace/draft.md',
+  platformIdentity: '1:2',
+  length: '7',
+  modifiedNanos: '12',
+  sha256: 'a'.repeat(64),
+};
+
 const committedCreateOutcome = {
   status: 'confirmed-committed',
   receipt: {
@@ -40,6 +54,7 @@ const committedCreateOutcome = {
       path: '/workspace/draft.md',
       content_mode: 'text',
       content: '',
+      file_version: fileVersion,
     },
     workspace: {
       status: 'stale',
@@ -114,8 +129,40 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 describe('Tauri command wrappers', () => {
+  const expectedVersion = fileVersion;
+  const overwriteToken = 'c'.repeat(64);
+
   beforeEach(() => {
     invokeMock.mockReset();
+  });
+
+  it('uses the exact settings command names and projects their current envelopes', async () => {
+    const envelope = {
+      schemaVersion: 1,
+      revision: 7,
+      settings: {
+        autosaveEnabled: true,
+        autosaveDelayMs: 1000,
+        spellcheckEnabled: true,
+        wikilinksEnabled: false,
+        resourceDirectory: 'assets',
+        editorPaneRatio: 0.5,
+        selectedSkin: 'jinxiu-zhusha',
+        followSystemTheme: false,
+        localeMode: 'system',
+        shortcuts: {},
+        exportProfiles: {},
+      },
+    } as const;
+    invokeMock.mockResolvedValue(envelope);
+
+    await expect(getSettings()).resolves.toEqual(envelope);
+    await expect(updateSettings(envelope.settings, 6)).resolves.toEqual(envelope);
+    await expect(resetSettings(7)).resolves.toEqual(envelope);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'get_settings');
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'update_settings', { expectedRevision: 6, settings: envelope.settings });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, 'reset_settings', { expectedRevision: 7 });
   });
 
   it('syncs the validated frontend theme preference into the native menu projection', async () => {
@@ -147,50 +194,64 @@ describe('Tauri command wrappers', () => {
   it('rejects a legacy null write response before treating the save as complete', async () => {
     invokeMock.mockResolvedValue(null);
 
-    await expect(writeFile('/workspace/draft.md', '# Saved')).rejects.toThrow('Invalid mutation outcome');
+    await expect(writeFile('/workspace/draft.md', '# Saved', expectedVersion, 'save-1')).rejects.toThrow(
+      'Invalid document save response',
+    );
     expect(invokeMock).toHaveBeenCalledWith('write_file', {
       path: '/workspace/draft.md',
       content: '# Saved',
+      expectedVersion,
+      operationId: 'save-1',
     });
   });
 
-  it('rejects a confirmed-not-committed write with the backend message', async () => {
-    invokeMock.mockResolvedValue({
-      status: 'confirmed-not-committed',
-      message: 'injected pre-call write failure',
-    });
-
-    await expect(writeFile('/workspace/draft.md', '# Saved')).rejects.toThrow(
-      'injected pre-call write failure',
-    );
-  });
-
-  it('rejects an indeterminate write with the recovery message', async () => {
-    invokeMock.mockResolvedValue({
+  it('returns conflicts and indeterminate saves as data and wires overwrite commands exactly', async () => {
+    const conflict = {
+      status: 'conflict',
+      path: '/workspace/draft.md',
+      current_version: expectedVersion,
+      message: 'The file changed on disk.',
+    } as const;
+    const indeterminate = {
       status: 'indeterminate',
-      operation: 'write',
-      paths: ['/workspace/draft.md'],
-      recovery_message: 'Reopen and inspect the file before retrying.',
+      path: '/workspace/draft.md',
+      message: 'Inspect the file before retrying.',
+    } as const;
+    invokeMock
+      .mockResolvedValueOnce(conflict)
+      .mockResolvedValueOnce({ overwriteToken })
+      .mockResolvedValueOnce(indeterminate)
+      .mockResolvedValueOnce(undefined);
+
+    await expect(writeFile('/workspace/draft.md', '# Saved', expectedVersion, 'save-1')).resolves.toEqual(conflict);
+    await expect(issueDocumentOverwriteToken('/workspace/draft.md', '# Saved', 'save-1')).resolves.toEqual({
+      overwriteToken,
     });
+    await expect(
+      retryDocumentSaveWithToken('/workspace/draft.md', '# Saved', 'save-1', overwriteToken),
+    ).resolves.toEqual(indeterminate);
+    await expect(cancelDocumentOverwriteToken('/workspace/draft.md', overwriteToken)).resolves.toBeUndefined();
 
-    await expect(writeFile('/workspace/draft.md', '# Saved')).rejects.toThrow(
-      'Reopen and inspect the file before retrying.',
-    );
-  });
-
-  it('resolves a canonical committed write outcome to void', async () => {
-    invokeMock.mockResolvedValue({
-      status: 'confirmed-committed',
-      receipt: {
-        committed: { path: '/workspace/draft.md' },
-        workspace: { status: 'not-applicable' },
-      },
-    });
-
-    await expect(writeFile('/workspace/draft.md', '# Saved')).resolves.toBeUndefined();
-    expect(invokeMock).toHaveBeenCalledWith('write_file', {
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'write_file', {
       path: '/workspace/draft.md',
       content: '# Saved',
+      expectedVersion,
+      operationId: 'save-1',
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'issue_document_overwrite_token', {
+      path: '/workspace/draft.md',
+      content: '# Saved',
+      operationId: 'save-1',
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, 'retry_document_save_with_token', {
+      path: '/workspace/draft.md',
+      content: '# Saved',
+      operationId: 'save-1',
+      overwriteToken,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, 'cancel_document_overwrite_token', {
+      path: '/workspace/draft.md',
+      overwriteToken,
     });
   });
 
@@ -317,6 +378,7 @@ describe('Tauri command wrappers', () => {
           path: '/workspace/architecture.excalidraw',
           content_mode: 'text',
           content: '{"type":"excalidraw","version":2,"elements":[],"appState":{},"files":{}}',
+          file_version: fileVersion,
         },
         workspace: { status: 'not-applicable' },
       },
@@ -345,13 +407,14 @@ describe('Tauri command wrappers', () => {
 
     await openFileDialog();
     await expect(openDirectoryDialog()).resolves.toEqual(workspaceSnapshot);
-    await saveAsDialog('# Draft', 'Draft.md');
+    await saveAsDialog('# Draft', 'Draft.md', 'save-as-1');
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, 'open_file_dialog');
     expect(invokeMock).toHaveBeenNthCalledWith(2, 'open_directory_dialog');
     expect(invokeMock).toHaveBeenNthCalledWith(3, 'save_as_dialog', {
       content: '# Draft',
       defaultName: 'Draft.md',
+      operationId: 'save-as-1',
     });
   });
 
@@ -362,6 +425,7 @@ describe('Tauri command wrappers', () => {
         path: '/workspace/notes.md',
         content_mode: 'text',
         content: '# Notes',
+        file_version: fileVersion,
       },
       open_receipt: '0123456789abcdef0123456789abcdef',
       commit_operation_id: 'fedcba9876543210fedcba9876543210',
@@ -401,41 +465,40 @@ describe('Tauri command wrappers', () => {
     });
   });
 
-  it('decodes save-as mutation outcomes instead of collapsing them to a path', async () => {
+  it('decodes a committed versioned Save As response', async () => {
     const outcome = {
-      status: 'confirmed-committed',
-      receipt: {
-        committed: { path: '/workspace/saved.md' },
-        workspace: { status: 'not-applicable' },
-      },
+      status: 'confirmed_committed',
+      path: '/workspace/saved.md',
+      version: fileVersion,
     };
     invokeMock.mockResolvedValue(outcome);
 
-    await expect(saveAsDialog('# Draft', 'Draft.md')).resolves.toEqual(outcome);
+    await expect(saveAsDialog('# Draft', 'Draft.md', 'save-as-2')).resolves.toEqual(outcome);
     expect(invokeMock).toHaveBeenCalledWith('save_as_dialog', {
       content: '# Draft',
       defaultName: 'Draft.md',
+      operationId: 'save-as-2',
     });
   });
 
   it('restricts an Excalidraw Save As request to the Excalidraw backend flow', async () => {
     const outcome = {
-      status: 'confirmed-committed',
-      receipt: {
-        committed: { path: '/workspace/architecture.excalidraw' },
-        workspace: { status: 'not-applicable' },
-      },
+      status: 'confirmed_committed',
+      path: '/workspace/architecture.excalidraw',
+      version: fileVersion,
     };
     invokeMock.mockResolvedValue(outcome);
 
     await expect(saveAsDialog(
       '{"type":"excalidraw","version":2,"elements":[],"appState":{},"files":{}}',
       'architecture.excalidraw',
+      'save-as-3',
       'excalidraw',
     )).resolves.toEqual(outcome);
     expect(invokeMock).toHaveBeenCalledWith('save_as_dialog', {
       content: '{"type":"excalidraw","version":2,"elements":[],"appState":{},"files":{}}',
       defaultName: 'architecture.excalidraw',
+      operationId: 'save-as-3',
       fileKind: 'excalidraw',
     });
   });
@@ -443,7 +506,7 @@ describe('Tauri command wrappers', () => {
   it('preserves save-as cancellation as null', async () => {
     invokeMock.mockResolvedValue(null);
 
-    await expect(saveAsDialog('# Draft', 'Draft.md')).resolves.toBeNull();
+    await expect(saveAsDialog('# Draft', 'Draft.md', 'save-as-4')).resolves.toBeNull();
   });
 
   it('reads an authorized workspace image as a browser-safe data URL', async () => {

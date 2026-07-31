@@ -980,7 +980,7 @@ describe('FileSidebar native workspace interactions', () => {
     expect(rows[0]?.getAttribute('aria-selected')).toBe('true');
   });
 
-  it('offers rename, move, and delete from the selected-entry action menu', () => {
+  it('offers rename, move, and Move to Trash from the selected-entry action menu', () => {
     act(() => root.render(
       <FileSidebar
         activePath="/workspace/draft.md"
@@ -1015,7 +1015,8 @@ describe('FileSidebar native workspace interactions', () => {
     const menuText = document.body.querySelector('[role="menu"]')?.textContent;
     expect(menuText).toContain('Rename');
     expect(menuText).toContain('Move…');
-    expect(menuText).toContain('Delete');
+    expect(menuText).toContain('Move to Trash');
+    expect(menuText).not.toContain('Delete');
   });
 
   it('disables workspace mutation controls and dragging while an operation is busy', () => {

@@ -7,6 +7,8 @@ use std::{
 
 use crate::state::AppState;
 
+const MAX_PENDING_SAVE_AUTHORITIES: usize = 1;
+
 #[path = "workspace_snapshot.rs"]
 pub(crate) mod workspace_snapshot;
 
@@ -268,10 +270,12 @@ pub(crate) mod lock_order_test_probe {
 struct AuthorizationState {
     workspaces: HashMap<WorkspaceToken, WorkspaceGrant>,
     grants: HashMap<GrantKey, GrantLedger>,
+    pending_save_authorities: HashMap<DocumentGrantId, PendingSaveReservation>,
     next_workspace_token_id: u64,
     next_document_grant_id: u64,
     next_preview_lease_id: u64,
     next_grant_sequence: u64,
+    authorization_generation: u64,
 }
 
 pub(crate) struct WorkspaceCandidate {
@@ -301,6 +305,7 @@ pub(crate) struct RenamedWorkspaceEntry {
 pub(crate) struct DeletedWorkspaceEntry {
     workspace: AuthorizedWorkspace,
     deleted_path: PathBuf,
+    #[cfg(test)]
     is_file: bool,
 }
 
@@ -361,9 +366,16 @@ pub(crate) enum AuthorizedDeleteOutcome {
     },
 }
 
+#[cfg(test)]
 pub(crate) enum DeleteFileObservation {
     Present,
     Missing,
+}
+
+pub(crate) enum TrashAuthorizationDisposition {
+    ConfirmedCommitted,
+    ConfirmedNotCommitted { message: String },
+    Indeterminate { message: String },
 }
 
 enum DeleteWorkspaceEntryAuthorizationOutcome {
@@ -441,6 +453,84 @@ pub(crate) struct AuthorizedFile {
     origin: GrantOrigin,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingSaveAuthority {
+    path: PathBuf,
+    id: DocumentGrantId,
+    generation: u64,
+}
+
+pub(crate) struct SaveAuthorizationScope<'a> {
+    state: &'a mut AuthorizationState,
+    path: PathBuf,
+}
+
+impl SaveAuthorizationScope<'_> {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.state.authorization_generation
+    }
+
+    pub(crate) fn has_exact_write_authority(&self) -> bool {
+        self.state.grants.iter().any(|(key, ledger)| {
+            ledger.is_active()
+                && matches!(key, GrantKey::ExactReadWrite(file) if file == &self.path)
+        })
+    }
+
+    pub(crate) fn matches_pending(&self, pending: &PendingSaveAuthority) -> bool {
+        pending.path == self.path
+            && pending.generation == self.state.authorization_generation
+            && self
+                .state
+                .pending_save_authorities
+                .get(&pending.id)
+                .is_some_and(|reservation| reservation.path == self.path)
+    }
+
+    pub(crate) fn publish_pending(&mut self, pending: &PendingSaveAuthority) {
+        debug_assert!(self.matches_pending(pending));
+        let reservation = self
+            .state
+            .pending_save_authorities
+            .remove(&pending.id)
+            .expect("pending save reservation was checked while authorization was held");
+        self.state.authorization_generation += 1;
+        for mutation in reservation.mutations {
+            match mutation {
+                PreparedGrantMutation::Existing { key, origin } => {
+                    let ledger = self
+                        .state
+                        .grants
+                        .get_mut(&key)
+                        .expect("pending save grant retains its reserved ledger");
+                    ledger.origins.insert(origin, 1);
+                    ledger.status = GrantStatus::Active;
+                }
+                PreparedGrantMutation::New { key, ledger } => {
+                    let replaced = self.state.grants.insert(key, ledger);
+                    debug_assert!(replaced.is_none());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn invalidate_pending(&mut self, pending: &PendingSaveAuthority) {
+        if self
+            .state
+            .pending_save_authorities
+            .remove(&pending.id)
+            .is_some()
+            && pending.generation == self.state.authorization_generation
+        {
+            self.state.authorization_generation += 1;
+        }
+    }
+}
+
 pub(crate) struct AuthorizedPreviewScope {
     document: PathBuf,
     root: PathBuf,
@@ -480,17 +570,24 @@ enum PreparedGrantMutation {
     New { key: GrantKey, ledger: GrantLedger },
 }
 
+struct PendingSaveReservation {
+    path: PathBuf,
+    mutations: Vec<PreparedGrantMutation>,
+}
+
 pub(crate) struct PreparedOpenDocumentGrant<'a> {
     state: AuthorizationGuard<'a>,
     mutations: Vec<PreparedGrantMutation>,
     next_document_grant_id: u64,
     next_grant_sequence: u64,
+    next_authorization_generation: u64,
 }
 
 impl PreparedOpenDocumentGrant<'_> {
     pub(crate) fn apply(mut self) {
         self.state.next_document_grant_id = self.next_document_grant_id;
         self.state.next_grant_sequence = self.next_grant_sequence;
+        self.state.authorization_generation = self.next_authorization_generation;
         for mutation in self.mutations {
             match mutation {
                 PreparedGrantMutation::Existing { key, origin } => {
@@ -556,6 +653,25 @@ pub(crate) fn path_is_under(child: &Path, root: &Path) -> bool {
     child == root || child.starts_with(root)
 }
 
+fn reject_symlink_components_below_root(path: &Path, root: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| format!("Cannot access workspace entry: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            let parent = current
+                .parent()
+                .ok_or_else(|| "Workspace entry path is invalid".to_string())?;
+            let canonical_parent = normalize_existing_path(parent)?;
+            if path_is_under(&canonical_parent, root) {
+                return Err("Symbolic links cannot be modified as workspace entries".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl AuthorizedWorkspace {
     fn new(token: WorkspaceToken, root: PathBuf) -> Self {
         Self { token, root }
@@ -603,6 +719,7 @@ impl DeletedWorkspaceEntry {
         &self.deleted_path
     }
 
+    #[cfg(test)]
     pub(crate) fn is_file(&self) -> bool {
         self.is_file
     }
@@ -766,6 +883,17 @@ impl GrantLedger {
 }
 
 impl AuthorizationState {
+    fn next_authorization_generation(&self) -> Result<u64, String> {
+        self.authorization_generation
+            .checked_add(1)
+            .ok_or_else(|| "Authorization generation is exhausted".to_string())
+    }
+
+    fn advance_authorization_generation(&mut self) -> Result<(), String> {
+        self.authorization_generation = self.next_authorization_generation()?;
+        Ok(())
+    }
+
     fn allocate_workspace_token(&mut self) -> Result<WorkspaceToken, String> {
         let id = self.next_workspace_token_id;
         self.next_workspace_token_id = id
@@ -798,28 +926,37 @@ impl AuthorizationState {
         })
     }
 
-    fn grant(&mut self, key: GrantKey, origin: GrantOrigin) {
+    fn grant(&mut self, key: GrantKey, origin: GrantOrigin) -> Result<(), String> {
+        self.advance_authorization_generation()?;
         if let Some(ledger) = self.grants.get_mut(&key) {
             ledger.add_origin(origin);
-            return;
+            return Ok(());
         }
         let sequence = self.next_grant_sequence;
         self.next_grant_sequence = self.next_grant_sequence.saturating_add(1);
         self.grants.insert(key, GrantLedger::new(origin, sequence));
+        Ok(())
     }
 
-    fn grant_once(&mut self, key: GrantKey, origin: GrantOrigin) {
+    fn grant_once(&mut self, key: GrantKey, origin: GrantOrigin) -> Result<(), String> {
+        if self.grants.get(&key).is_some_and(|ledger| {
+            ledger.status == GrantStatus::Active && ledger.origins.contains_key(&origin)
+        }) {
+            return Ok(());
+        }
+        self.advance_authorization_generation()?;
         if let Some(ledger) = self.grants.get_mut(&key) {
             ledger.origins.entry(origin).or_insert(1);
             ledger.status = GrantStatus::Active;
-            return;
+            return Ok(());
         }
         let sequence = self.next_grant_sequence;
         self.next_grant_sequence = self.next_grant_sequence.saturating_add(1);
         self.grants.insert(key, GrantLedger::new(origin, sequence));
+        Ok(())
     }
 
-    fn revoke_origin(&mut self, origin: &GrantOrigin, mode: RevokeOriginMode) {
+    fn revoke_origin_raw(&mut self, origin: &GrantOrigin, mode: RevokeOriginMode) {
         for ledger in self.grants.values_mut() {
             ledger.revoke_origin(origin, mode);
         }
@@ -827,6 +964,25 @@ impl AuthorizationState {
         if let GrantOrigin::Workspace(token) = origin {
             self.workspaces.remove(token);
         }
+    }
+
+    #[cfg(test)]
+    fn revoke_origin(
+        &mut self,
+        origin: &GrantOrigin,
+        mode: RevokeOriginMode,
+    ) -> Result<bool, String> {
+        let changes = self
+            .grants
+            .values()
+            .any(|ledger| ledger.origins.contains_key(origin))
+            || matches!(origin, GrantOrigin::Workspace(token) if self.workspaces.contains_key(token));
+        if !changes {
+            return Ok(false);
+        }
+        self.advance_authorization_generation()?;
+        self.revoke_origin_raw(origin, mode);
+        Ok(true)
     }
 
     fn unsupported_preview_leases(&self) -> HashSet<PreviewLeaseId> {
@@ -890,23 +1046,45 @@ impl AuthorizationState {
         &mut self,
         origin: &GrantOrigin,
         mode: RevokeOriginMode,
-    ) -> HashSet<PreviewLeaseId> {
-        self.revoke_origin(origin, mode);
+    ) -> Result<HashSet<PreviewLeaseId>, String> {
+        self.revoke_origin(origin, mode)?;
         let mut invalidated = self.unsupported_preview_leases();
         if let GrantOrigin::Preview(lease) = origin {
             invalidated.insert(lease.clone());
         }
         for lease in &invalidated {
-            self.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            self.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
-        invalidated
+        Ok(invalidated)
     }
 
     fn relocate_path_prefix(
         &mut self,
         old_prefix: &Path,
         new_prefix: &Path,
-    ) -> HashSet<PreviewLeaseId> {
+    ) -> Result<HashSet<PreviewLeaseId>, String> {
+        if old_prefix == new_prefix {
+            return Ok(HashSet::new());
+        }
+        let invalidates_preview = self.grants.values().any(|ledger| {
+            ledger.origins.keys().any(|origin| {
+                matches!(origin, GrantOrigin::Preview(lease)
+                    if lease.intersects_prefix(old_prefix) || lease.intersects_prefix(new_prefix))
+            })
+        });
+        let changes = self
+            .workspaces
+            .values()
+            .any(|workspace| path_is_under(&workspace.root, old_prefix))
+            || self
+                .grants
+                .keys()
+                .any(|key| path_is_under(key.path(), old_prefix))
+            || invalidates_preview;
+        if !changes {
+            return Ok(HashSet::new());
+        }
+        self.advance_authorization_generation()?;
         let invalidated_preview_leases = self
             .grants
             .iter()
@@ -928,7 +1106,7 @@ impl AuthorizationState {
             })
             .collect::<HashSet<_>>();
         for lease in &invalidated_preview_leases {
-            self.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            self.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
         for workspace in self.workspaces.values_mut() {
             if let Ok(suffix) = workspace.root.strip_prefix(old_prefix) {
@@ -944,10 +1122,10 @@ impl AuthorizationState {
                 self.grants.insert(relocated_key, ledger);
             }
         }
-        invalidated_preview_leases
+        Ok(invalidated_preview_leases)
     }
 
-    fn suspend_write_path(&mut self, path: &Path) -> HashSet<PreviewLeaseId> {
+    fn suspend_write_path(&mut self, path: &Path) -> Result<HashSet<PreviewLeaseId>, String> {
         let invalidated_preview_leases = self
             .grants
             .values()
@@ -961,6 +1139,15 @@ impl AuthorizationState {
             })
             .collect::<HashSet<_>>();
 
+        let suspends_grant = self
+            .grants
+            .get(&GrantKey::ExactReadWrite(path.to_path_buf()))
+            .is_some_and(|ledger| ledger.status == GrantStatus::Active);
+        if !suspends_grant && invalidated_preview_leases.is_empty() {
+            return Ok(invalidated_preview_leases);
+        }
+        self.advance_authorization_generation()?;
+
         if let Some(ledger) = self
             .grants
             .get_mut(&GrantKey::ExactReadWrite(path.to_path_buf()))
@@ -968,18 +1155,34 @@ impl AuthorizationState {
             ledger.suspend();
         }
         for lease in &invalidated_preview_leases {
-            self.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            self.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
-        invalidated_preview_leases
+        Ok(invalidated_preview_leases)
     }
 
     fn suspend_rename_path_prefixes(
         &mut self,
         old_prefix: &Path,
         new_prefix: &Path,
-    ) -> HashSet<GrantKey> {
+    ) -> Result<HashSet<GrantKey>, String> {
         let is_affected =
             |path: &Path| path_is_under(path, old_prefix) || path_is_under(path, new_prefix);
+        let affected = self
+            .grants
+            .iter()
+            .filter_map(|(key, ledger)| {
+                (matches!(
+                    key,
+                    GrantKey::ExactReadWrite(_) | GrantKey::InternalAsset(_)
+                ) && is_affected(key.path())
+                    && ledger.status == GrantStatus::Active)
+                    .then_some(key.clone())
+            })
+            .collect::<HashSet<_>>();
+        if affected.is_empty() {
+            return Ok(affected);
+        }
+        self.advance_authorization_generation()?;
         let mut transitioned_grants = HashSet::new();
         for (key, ledger) in &mut self.grants {
             if matches!(
@@ -992,10 +1195,22 @@ impl AuthorizationState {
                 transitioned_grants.insert(key.clone());
             }
         }
-        transitioned_grants
+        Ok(transitioned_grants)
     }
 
-    fn restore_rename_grants(&mut self, transitioned_grants: &HashSet<GrantKey>) {
+    fn restore_rename_grants(
+        &mut self,
+        transitioned_grants: &HashSet<GrantKey>,
+    ) -> Result<(), String> {
+        let changes = transitioned_grants.iter().any(|key| {
+            self.grants.get(key).is_some_and(|ledger| {
+                ledger.status == GrantStatus::Suspended && !ledger.origins.is_empty()
+            })
+        });
+        if !changes {
+            return Ok(());
+        }
+        self.advance_authorization_generation()?;
         for key in transitioned_grants {
             if let Some(ledger) = self.grants.get_mut(key) {
                 if ledger.status == GrantStatus::Suspended && !ledger.origins.is_empty() {
@@ -1003,14 +1218,15 @@ impl AuthorizationState {
                 }
             }
         }
+        Ok(())
     }
 
     fn finalize_indeterminate_rename(
         &mut self,
         old_prefix: &Path,
         new_prefix: &Path,
-    ) -> HashSet<PreviewLeaseId> {
-        self.suspend_rename_path_prefixes(old_prefix, new_prefix);
+    ) -> Result<HashSet<PreviewLeaseId>, String> {
+        let _ = self.suspend_rename_path_prefixes(old_prefix, new_prefix)?;
         let is_affected =
             |path: &Path| path_is_under(path, old_prefix) || path_is_under(path, new_prefix);
         let invalidated_preview_leases = self
@@ -1030,12 +1246,15 @@ impl AuthorizationState {
             })
             .collect::<HashSet<_>>();
         for lease in &invalidated_preview_leases {
-            self.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            self.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
-        invalidated_preview_leases
+        Ok(invalidated_preview_leases)
     }
 
-    fn suspend_delete_path_prefix(&mut self, prefix: &Path) -> HashSet<PreviewLeaseId> {
+    fn suspend_delete_path_prefix(
+        &mut self,
+        prefix: &Path,
+    ) -> Result<HashSet<PreviewLeaseId>, String> {
         let invalidated_preview_leases = self
             .grants
             .iter()
@@ -1051,6 +1270,18 @@ impl AuthorizationState {
             })
             .collect::<HashSet<_>>();
 
+        let suspends_grant = self.grants.iter().any(|(key, ledger)| {
+            matches!(
+                key,
+                GrantKey::ExactReadWrite(_) | GrantKey::InternalAsset(_)
+            ) && path_is_under(key.path(), prefix)
+                && ledger.status == GrantStatus::Active
+        });
+        if !suspends_grant && invalidated_preview_leases.is_empty() {
+            return Ok(invalidated_preview_leases);
+        }
+        self.advance_authorization_generation()?;
+
         for (key, ledger) in &mut self.grants {
             if matches!(
                 key,
@@ -1061,12 +1292,30 @@ impl AuthorizationState {
             }
         }
         for lease in &invalidated_preview_leases {
-            self.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            self.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
-        invalidated_preview_leases
+        Ok(invalidated_preview_leases)
     }
 
-    fn revoke_path_prefix(&mut self, prefix: &Path) -> HashSet<PreviewLeaseId> {
+    fn revoke_path_prefix(&mut self, prefix: &Path) -> Result<HashSet<PreviewLeaseId>, String> {
+        let invalidates_preview = self.grants.values().any(|ledger| {
+            ledger.origins.keys().any(|origin| {
+                matches!(origin, GrantOrigin::Preview(lease) if lease.intersects_prefix(prefix))
+            })
+        });
+        let changes = self
+            .grants
+            .keys()
+            .any(|key| path_is_under(key.path(), prefix))
+            || self
+                .workspaces
+                .values()
+                .any(|workspace| path_is_under(&workspace.root, prefix))
+            || invalidates_preview;
+        if !changes {
+            return Ok(HashSet::new());
+        }
+        self.advance_authorization_generation()?;
         let mut invalidated_preview_leases = self
             .grants
             .iter()
@@ -1092,10 +1341,10 @@ impl AuthorizationState {
             .flat_map(|(_, ledger)| ledger.origins.keys().cloned())
             .collect::<HashSet<_>>();
         for origin in origins {
-            self.revoke_origin(&origin, RevokeOriginMode::All);
+            self.revoke_origin_raw(&origin, RevokeOriginMode::All);
         }
         for lease in &invalidated_preview_leases {
-            self.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            self.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
         self.grants
             .retain(|key, _| !path_is_under(key.path(), prefix));
@@ -1103,10 +1352,10 @@ impl AuthorizationState {
             .retain(|_, workspace| !path_is_under(&workspace.root, prefix));
         let unsupported = self.unsupported_preview_leases();
         for lease in &unsupported {
-            self.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            self.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
         invalidated_preview_leases.extend(unsupported);
-        invalidated_preview_leases
+        Ok(invalidated_preview_leases)
     }
 }
 
@@ -1124,6 +1373,146 @@ impl FileAuthorizationSession {
         {
             Ok(guard)
         }
+    }
+
+    pub(crate) fn authorization_generation(&self) -> Result<u64, String> {
+        Ok(self.lock()?.authorization_generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_authorization_generation_for_test(
+        &self,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.lock()?.authorization_generation = generation;
+        Ok(())
+    }
+
+    pub(crate) fn with_save_authorization_scope<T>(
+        &self,
+        path: impl AsRef<Path>,
+        operation: impl FnOnce(&mut SaveAuthorizationScope<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let path = normalize_file_for_write(path)?;
+        let mut state = self.lock()?;
+        operation(&mut SaveAuthorizationScope {
+            state: &mut state,
+            path,
+        })
+    }
+
+    pub(crate) fn with_exact_write_authority<T>(
+        &self,
+        path: impl AsRef<Path>,
+        operation: impl FnOnce(&Path, u64) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let path = normalize_file_for_write(path)?;
+        let state = self.lock()?;
+        if !state.grants.iter().any(|(key, ledger)| {
+            ledger.is_active() && matches!(key, GrantKey::ExactReadWrite(file) if file == &path)
+        }) {
+            return Err("Destination file has not been explicitly authorized by open, workspace selection, or save-as".into());
+        }
+        operation(&path, state.authorization_generation)
+    }
+
+    pub(crate) fn reserve_pending_save_authority(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<PendingSaveAuthority, String> {
+        let path = normalize_file_for_write(path)?;
+        let mut state = self.lock()?;
+        state
+            .authorization_generation
+            .checked_add(2)
+            .ok_or_else(|| {
+                "Authorization generation cannot reserve a save-as transition".to_string()
+            })?;
+        let id = DocumentGrantId(state.next_document_grant_id);
+        let next_document_grant_id = state
+            .next_document_grant_id
+            .checked_add(1)
+            .ok_or_else(|| "Document authorization identifier space is exhausted".to_string())?;
+        let origin = GrantOrigin::SaveAs(id);
+        let mut keys = vec![GrantKey::ExactReadWrite(path.clone())];
+        if let Some(parent) = path.parent() {
+            keys.push(GrantKey::InternalAsset(parent.to_path_buf()));
+        }
+        let new_grant_count = keys
+            .iter()
+            .filter(|key| !state.grants.contains_key(*key))
+            .count();
+        state
+            .grants
+            .try_reserve(new_grant_count)
+            .map_err(|_| "Cannot reserve save-as authorization".to_string())?;
+        state
+            .pending_save_authorities
+            .try_reserve(1)
+            .map_err(|_| "Cannot reserve save-as authorization".to_string())?;
+        let mut mutations = Vec::new();
+        mutations
+            .try_reserve_exact(keys.len())
+            .map_err(|_| "Cannot reserve save-as authorization".to_string())?;
+        let mut next_grant_sequence = state.next_grant_sequence;
+        for key in keys {
+            if let Some(ledger) = state.grants.get_mut(&key) {
+                ledger
+                    .origins
+                    .try_reserve(1)
+                    .map_err(|_| "Cannot reserve save-as authorization".to_string())?;
+                mutations.push(PreparedGrantMutation::Existing {
+                    key,
+                    origin: origin.clone(),
+                });
+            } else {
+                mutations.push(PreparedGrantMutation::New {
+                    key,
+                    ledger: GrantLedger::try_new(origin.clone(), next_grant_sequence)?,
+                });
+                next_grant_sequence = next_grant_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| "Document grant sequence is exhausted".to_string())?;
+            }
+        }
+        state.authorization_generation += 1;
+        let generation = state.authorization_generation;
+        state.next_document_grant_id = next_document_grant_id;
+        state.next_grant_sequence = next_grant_sequence;
+        if state.pending_save_authorities.len() >= MAX_PENDING_SAVE_AUTHORITIES {
+            state.pending_save_authorities.clear();
+        }
+        state.pending_save_authorities.insert(
+            id,
+            PendingSaveReservation {
+                path: path.clone(),
+                mutations,
+            },
+        );
+        Ok(PendingSaveAuthority {
+            path,
+            id,
+            generation,
+        })
+    }
+
+    pub(crate) fn cancel_pending_save_authority(
+        &self,
+        pending: &PendingSaveAuthority,
+    ) -> Result<bool, String> {
+        let mut state = self.lock()?;
+        let removed = state.pending_save_authorities.remove(&pending.id).is_some();
+        if removed && pending.generation == state.authorization_generation {
+            state.authorization_generation += 1;
+        }
+        Ok(removed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_save_authority_count_for_test(&self) -> Result<usize, String> {
+        let count = self.lock()?.pending_save_authorities.len();
+        debug_assert!(count <= MAX_PENDING_SAVE_AUTHORITIES);
+        Ok(count)
     }
 
     #[cfg(test)]
@@ -1162,6 +1551,7 @@ impl FileAuthorizationSession {
                 state.next_document_grant_id,
                 state.next_preview_lease_id,
                 state.next_grant_sequence,
+                state.authorization_generation,
             )
         )
     }
@@ -1292,13 +1682,17 @@ impl FileAuthorizationSession {
         state: &mut AuthorizationState,
         candidate: WorkspaceCandidate,
     ) -> Result<AuthorizedWorkspace, String> {
+        state
+            .authorization_generation
+            .checked_add(2)
+            .ok_or_else(|| "Authorization generation is exhausted".to_string())?;
         let token = state.allocate_workspace_token()?;
         let origin = GrantOrigin::Workspace(token);
         state.grant(
             GrantKey::DirectoryRead(candidate.root.clone()),
             origin.clone(),
-        );
-        state.grant(GrantKey::InternalAsset(candidate.root.clone()), origin);
+        )?;
+        state.grant(GrantKey::InternalAsset(candidate.root.clone()), origin)?;
         state.workspaces.insert(
             token,
             WorkspaceGrant {
@@ -1400,6 +1794,7 @@ impl FileAuthorizationSession {
             .try_reserve_exact(keys.len())
             .map_err(|_| "Cannot reserve prepared document grants".to_string())?;
         let mut next_grant_sequence = state.next_grant_sequence;
+        let next_authorization_generation = state.next_authorization_generation()?;
         for key in keys {
             if let Some(ledger) = state.grants.get_mut(&key) {
                 ledger
@@ -1424,6 +1819,7 @@ impl FileAuthorizationSession {
             mutations,
             next_document_grant_id,
             next_grant_sequence,
+            next_authorization_generation,
         })
     }
 
@@ -1450,7 +1846,7 @@ impl FileAuthorizationSession {
         }
         let mut state = self.lock()?;
         let origin = GrantOrigin::SaveAs(state.allocate_document_grant_id()?);
-        Self::grant_exact_file(&mut state, &normalized, origin.clone(), true);
+        Self::grant_exact_file(&mut state, &normalized, origin.clone(), true)?;
         Ok(AuthorizedFile::new(normalized, origin))
     }
 
@@ -1465,13 +1861,19 @@ impl FileAuthorizationSession {
         file: &Path,
         origin: GrantOrigin,
         include_internal_assets: bool,
-    ) {
-        state.grant(GrantKey::ExactReadWrite(file.to_path_buf()), origin.clone());
+    ) -> Result<(), String> {
+        let grant_count = 1 + usize::from(include_internal_assets && file.parent().is_some());
+        state
+            .authorization_generation
+            .checked_add(grant_count as u64)
+            .ok_or_else(|| "Authorization generation is exhausted".to_string())?;
+        state.grant(GrantKey::ExactReadWrite(file.to_path_buf()), origin.clone())?;
         if include_internal_assets {
             if let Some(parent) = file.parent() {
-                state.grant(GrantKey::InternalAsset(parent.to_path_buf()), origin);
+                state.grant(GrantKey::InternalAsset(parent.to_path_buf()), origin)?;
             }
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1481,7 +1883,7 @@ impl FileAuthorizationSession {
         include_internal_assets: bool,
     ) -> Result<AuthorizedFile, String> {
         let origin = GrantOrigin::OpenDocument(state.allocate_document_grant_id()?);
-        Self::grant_exact_file(state, &file, origin.clone(), include_internal_assets);
+        Self::grant_exact_file(state, &file, origin.clone(), include_internal_assets)?;
         Ok(AuthorizedFile::new(file, origin))
     }
 
@@ -1571,7 +1973,7 @@ impl FileAuthorizationSession {
 
     fn suspend_write_file(&self, path: &Path) -> Result<HashSet<PreviewLeaseId>, String> {
         let mut state = self.lock()?;
-        Ok(state.suspend_write_path(path))
+        state.suspend_write_path(path)
     }
 
     fn directory_for_read(&self, path: impl AsRef<Path>) -> Result<PathBuf, String> {
@@ -1687,7 +2089,7 @@ impl FileAuthorizationSession {
 
         let origin = GrantOrigin::CreatedDocument(state.allocate_document_grant_id()?);
         create(&target)?;
-        Self::grant_exact_file(&mut state, &target, origin.clone(), true);
+        Self::grant_exact_file(&mut state, &target, origin.clone(), true)?;
 
         Ok((active_workspace, AuthorizedFile::new(target, origin)))
     }
@@ -1731,12 +2133,14 @@ impl FileAuthorizationSession {
         token: &WorkspaceToken,
         path: impl AsRef<Path>,
     ) -> Result<(PathBuf, AuthorizedWorkspace), String> {
+        let workspace = Self::workspace_for_token(state, token)
+            .ok_or_else(|| "Workspace authorization is no longer active".to_string())?;
+        let path = path.as_ref();
+        reject_symlink_components_below_root(path, &workspace.root)?;
         let canonical = normalize_existing_path(path)?;
         if !canonical.is_file() && !canonical.is_dir() {
             return Err("Workspace entry is not a file or directory".into());
         }
-        let workspace = Self::workspace_for_token(state, token)
-            .ok_or_else(|| "Workspace authorization is no longer active".to_string())?;
         if !path_is_under(&canonical, &workspace.root) {
             return Err("Workspace entry is outside the selected workspace".into());
         }
@@ -1814,7 +2218,7 @@ impl FileAuthorizationSession {
         match rename(&entry.old_path, &entry.new_path) {
             Ok(()) => {
                 let invalidated_preview_leases =
-                    state.relocate_path_prefix(&entry.old_path, &entry.new_path);
+                    state.relocate_path_prefix(&entry.old_path, &entry.new_path)?;
                 Ok(RenameWorkspaceEntryAuthorizationOutcome::Committed {
                     renamed: entry,
                     invalidated_preview_leases,
@@ -1822,7 +2226,7 @@ impl FileAuthorizationSession {
             }
             Err(operation_error) => {
                 let transitioned_grants =
-                    state.suspend_rename_path_prefixes(&entry.old_path, &entry.new_path);
+                    state.suspend_rename_path_prefixes(&entry.old_path, &entry.new_path)?;
                 Ok(
                     RenameWorkspaceEntryAuthorizationOutcome::AwaitingObservation {
                         attempted: entry,
@@ -1897,7 +2301,7 @@ impl FileAuthorizationSession {
         let mut state = self.lock()?;
         match observation {
             RenameErrorObservation::ConfirmedNotCommitted => {
-                state.restore_rename_grants(&transitioned_grants);
+                state.restore_rename_grants(&transitioned_grants)?;
                 Ok(
                     RenameWorkspaceEntryAuthorizationOutcome::ConfirmedNotCommitted {
                         message: operation_error,
@@ -1905,17 +2309,17 @@ impl FileAuthorizationSession {
                 )
             }
             RenameErrorObservation::ConfirmedCommitted => {
-                state.restore_rename_grants(&transitioned_grants);
+                state.restore_rename_grants(&transitioned_grants)?;
                 let invalidated_preview_leases =
-                    state.relocate_path_prefix(&attempted.old_path, &attempted.new_path);
+                    state.relocate_path_prefix(&attempted.old_path, &attempted.new_path)?;
                 Ok(RenameWorkspaceEntryAuthorizationOutcome::Committed {
                     renamed: attempted,
                     invalidated_preview_leases,
                 })
             }
             RenameErrorObservation::Indeterminate { message } => {
-                let invalidated_preview_leases =
-                    state.finalize_indeterminate_rename(&attempted.old_path, &attempted.new_path);
+                let invalidated_preview_leases = state
+                    .finalize_indeterminate_rename(&attempted.old_path, &attempted.new_path)?;
                 Ok(RenameWorkspaceEntryAuthorizationOutcome::Indeterminate {
                     attempted,
                     invalidated_preview_leases,
@@ -1926,6 +2330,7 @@ impl FileAuthorizationSession {
         }
     }
 
+    #[cfg(test)]
     fn delete_workspace_entry(
         &self,
         workspace_token: &str,
@@ -1941,13 +2346,14 @@ impl FileAuthorizationSession {
         let deleted = DeletedWorkspaceEntry {
             workspace,
             deleted_path: source,
+            #[cfg(test)]
             is_file,
         };
 
         if let Err(message) = delete(&deleted.deleted_path, is_file) {
             if !is_file {
                 let invalidated_preview_leases =
-                    state.suspend_delete_path_prefix(&deleted.deleted_path);
+                    state.suspend_delete_path_prefix(&deleted.deleted_path)?;
                 return Ok(DeleteWorkspaceEntryAuthorizationOutcome::Indeterminate {
                     attempted: deleted,
                     invalidated_preview_leases,
@@ -1963,7 +2369,7 @@ impl FileAuthorizationSession {
                 Ok(DeleteFileObservation::Missing) => {}
                 Err(observation_error) => {
                     let invalidated_preview_leases =
-                        state.suspend_delete_path_prefix(&deleted.deleted_path);
+                        state.suspend_delete_path_prefix(&deleted.deleted_path)?;
                     return Ok(DeleteWorkspaceEntryAuthorizationOutcome::Indeterminate {
                         attempted: deleted,
                         invalidated_preview_leases,
@@ -1974,11 +2380,52 @@ impl FileAuthorizationSession {
                 }
             }
         }
-        let invalidated_preview_leases = state.revoke_path_prefix(&deleted.deleted_path);
+        let invalidated_preview_leases = state.revoke_path_prefix(&deleted.deleted_path)?;
         Ok(DeleteWorkspaceEntryAuthorizationOutcome::Committed {
             deleted,
             invalidated_preview_leases,
         })
+    }
+
+    fn trash_workspace_entry(
+        &self,
+        workspace_token: &str,
+        source_path: impl AsRef<Path>,
+        trash: impl FnOnce(&Path, bool) -> TrashAuthorizationDisposition,
+    ) -> Result<DeleteWorkspaceEntryAuthorizationOutcome, String> {
+        let token = WorkspaceToken::from_wire(workspace_token)?;
+        let mut state = self.lock()?;
+        let (source, workspace) =
+            Self::workspace_entry_for_mutation_locked(&state, &token, source_path)?;
+        let is_file = source.is_file();
+        let deleted = DeletedWorkspaceEntry {
+            workspace,
+            deleted_path: source,
+            #[cfg(test)]
+            is_file,
+        };
+
+        match trash(&deleted.deleted_path, is_file) {
+            TrashAuthorizationDisposition::ConfirmedNotCommitted { message } => {
+                Ok(DeleteWorkspaceEntryAuthorizationOutcome::ConfirmedNotCommitted { message })
+            }
+            TrashAuthorizationDisposition::ConfirmedCommitted => {
+                let invalidated_preview_leases = state.revoke_path_prefix(&deleted.deleted_path)?;
+                Ok(DeleteWorkspaceEntryAuthorizationOutcome::Committed {
+                    deleted,
+                    invalidated_preview_leases,
+                })
+            }
+            TrashAuthorizationDisposition::Indeterminate { message } => {
+                let invalidated_preview_leases =
+                    state.suspend_delete_path_prefix(&deleted.deleted_path)?;
+                Ok(DeleteWorkspaceEntryAuthorizationOutcome::Indeterminate {
+                    attempted: deleted,
+                    invalidated_preview_leases,
+                    operation_error: message,
+                })
+            }
+        }
     }
 
     fn relocate_path_prefix(
@@ -1987,12 +2434,12 @@ impl FileAuthorizationSession {
         new_prefix: &Path,
     ) -> Result<HashSet<PreviewLeaseId>, String> {
         let mut state = self.lock()?;
-        Ok(state.relocate_path_prefix(old_prefix, new_prefix))
+        state.relocate_path_prefix(old_prefix, new_prefix)
     }
 
     fn revoke_path_prefix(&self, prefix: &Path) -> Result<HashSet<PreviewLeaseId>, String> {
         let mut state = self.lock()?;
-        Ok(state.revoke_path_prefix(prefix))
+        state.revoke_path_prefix(prefix)
     }
 
     fn is_authorized_preview_asset(&self, canonical: &Path) -> Result<bool, String> {
@@ -2053,7 +2500,7 @@ impl FileAuthorizationSession {
         state.grant_once(
             GrantKey::InternalAsset(root.clone()),
             GrantOrigin::Preview(lease.clone()),
-        );
+        )?;
         Ok(AuthorizedPreviewScope {
             document,
             root,
@@ -2159,7 +2606,7 @@ impl FileAuthorizationSession {
         state.grant_once(
             GrantKey::InternalAsset(root.clone()),
             GrantOrigin::Preview(lease.clone()),
-        );
+        )?;
         Ok(AuthorizedPreviewScope {
             document,
             root,
@@ -2181,7 +2628,7 @@ impl FileAuthorizationSession {
     #[cfg(test)]
     fn revoke_origin(&self, origin: &GrantOrigin, mode: RevokeOriginMode) -> Result<(), String> {
         let mut state = self.lock()?;
-        state.revoke_origin(origin, mode);
+        state.revoke_origin(origin, mode)?;
         Ok(())
     }
 
@@ -2221,9 +2668,28 @@ impl FileAuthorizationSession {
         {
             return Err(PreviewRetirementError::Recoverable(error));
         }
+        let retiring = leases
+            .iter()
+            .filter(|lease| {
+                let origin = GrantOrigin::Preview((*lease).clone());
+                state
+                    .grants
+                    .values()
+                    .any(|ledger| ledger.origins.contains_key(&origin))
+            })
+            .count() as u64;
+        let next_generation = state
+            .authorization_generation
+            .checked_add(retiring)
+            .ok_or_else(|| {
+                PreviewRetirementError::AuthorizationUnavailable(
+                    "Authorization generation is exhausted".to_string(),
+                )
+            })?;
         for lease in leases {
-            state.revoke_origin(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
+            state.revoke_origin_raw(&GrantOrigin::Preview(lease.clone()), RevokeOriginMode::All);
         }
+        state.authorization_generation = next_generation;
         Ok(())
     }
 
@@ -2233,7 +2699,7 @@ impl FileAuthorizationSession {
         file: &AuthorizedFile,
     ) -> Result<HashSet<PreviewLeaseId>, String> {
         let mut state = self.lock()?;
-        Ok(state.revoke_origin_and_unsupported_previews(&file.origin, RevokeOriginMode::All))
+        state.revoke_origin_and_unsupported_previews(&file.origin, RevokeOriginMode::All)
     }
 }
 
@@ -2508,6 +2974,7 @@ pub(crate) fn move_authorized_workspace_entry_inner(
     )
 }
 
+#[cfg(test)]
 fn delete_authorized_workspace_entry_with_preview_inner(
     state: &AppState,
     workspace_token: &str,
@@ -2562,6 +3029,7 @@ fn delete_authorized_workspace_entry_with_preview_inner(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn delete_authorized_workspace_entry_inner(
     state: &AppState,
     workspace_token: &str,
@@ -2581,6 +3049,54 @@ pub(crate) fn delete_authorized_workspace_entry_inner(
     )
 }
 
+pub(crate) fn trash_authorized_workspace_entry_inner(
+    state: &AppState,
+    workspace_token: &str,
+    source_path: impl AsRef<Path>,
+    trash: impl FnOnce(&Path, bool) -> TrashAuthorizationDisposition,
+) -> Result<AuthorizedDeleteOutcome, String> {
+    let outcome =
+        state
+            .file_authorization()
+            .trash_workspace_entry(workspace_token, source_path, trash)?;
+    let (deleted, invalidated_preview_leases) = match outcome {
+        DeleteWorkspaceEntryAuthorizationOutcome::ConfirmedNotCommitted { message } => {
+            return Ok(AuthorizedDeleteOutcome::ConfirmedNotCommitted { message });
+        }
+        DeleteWorkspaceEntryAuthorizationOutcome::Committed {
+            deleted,
+            invalidated_preview_leases,
+        } => (deleted, invalidated_preview_leases),
+        DeleteWorkspaceEntryAuthorizationOutcome::Indeterminate {
+            attempted,
+            invalidated_preview_leases,
+            operation_error,
+        } => {
+            let mut recovery_message = operation_error;
+            if invalidate_preview_leases_after_authorization(state, &invalidated_preview_leases)
+                .is_err()
+            {
+                recovery_message.push_str(
+                    " Active previews also could not be retired; close preview windows before retrying.",
+                );
+            }
+            return Ok(AuthorizedDeleteOutcome::Indeterminate {
+                attempted,
+                recovery_message,
+            });
+        }
+    };
+    match invalidate_preview_leases_after_authorization(state, &invalidated_preview_leases) {
+        Ok(()) => Ok(AuthorizedDeleteOutcome::Committed(deleted)),
+        Err(_) => Ok(AuthorizedDeleteOutcome::RecoveryRequired {
+            deleted,
+            recovery_message:
+                "The entry was moved to Trash, but active previews could not be retired. Close preview windows and refresh the workspace."
+                    .to_string(),
+        }),
+    }
+}
+
 pub(crate) fn relocate_authorized_path_prefix_inner(
     state: &AppState,
     old_prefix: &Path,
@@ -2598,12 +3114,13 @@ pub(crate) fn relocate_authorized_path_prefix_inner(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn commit_indeterminate_delete_inner(
     state: &AppState,
     deleted_path: &Path,
 ) -> Result<(), String> {
     let mut authorization = state.file_authorization().lock()?;
-    authorization.revoke_path_prefix(deleted_path);
+    authorization.revoke_path_prefix(deleted_path)?;
     Ok(())
 }
 
@@ -3007,6 +3524,110 @@ mod tests {
             canonical_document
         );
         assert!(ensure_authorized_existing_file_inner(&state, &sibling).is_err());
+    }
+
+    #[test]
+    fn authorization_generation_advances_for_grant_revoke_and_regrant() {
+        let directory = tempdir().unwrap();
+        let document = directory.path().join("document.md");
+        fs::write(&document, "# document").unwrap();
+        let session = FileAuthorizationSession::default();
+
+        assert_eq!(session.authorization_generation().unwrap(), 0);
+        let first = session.authorize_file(&document).unwrap();
+        let after_grant = session.authorization_generation().unwrap();
+        assert!(after_grant > 0);
+
+        session
+            .revoke_origin(first.origin(), RevokeOriginMode::All)
+            .unwrap();
+        let after_revoke = session.authorization_generation().unwrap();
+        assert!(after_revoke > after_grant);
+
+        session.authorize_file(&document).unwrap();
+        assert!(session.authorization_generation().unwrap() > after_revoke);
+    }
+
+    #[test]
+    fn authorization_generation_tracks_suspend_restore_and_relocation() {
+        let directory = tempdir().unwrap();
+        let old = directory.path().join("old.md");
+        let new = directory.path().join("new.md");
+        fs::write(&old, "# document").unwrap();
+        let canonical_old = normalize_existing_path(&old).unwrap();
+        let session = FileAuthorizationSession::default();
+        session.authorize_file(&old).unwrap();
+        let after_grant = session.authorization_generation().unwrap();
+
+        let transitioned = {
+            let mut state = session.lock().unwrap();
+            state
+                .suspend_rename_path_prefixes(&canonical_old, &new)
+                .unwrap()
+        };
+        let after_suspend = session.authorization_generation().unwrap();
+        assert!(after_suspend > after_grant);
+
+        {
+            let mut state = session.lock().unwrap();
+            state.restore_rename_grants(&transitioned).unwrap();
+        }
+        let after_restore = session.authorization_generation().unwrap();
+        assert!(after_restore > after_suspend);
+
+        fs::rename(&old, &new).unwrap();
+        let canonical_new = normalize_existing_path(&new).unwrap();
+        session
+            .relocate_path_prefix(&canonical_old, &canonical_new)
+            .unwrap();
+        assert!(session.authorization_generation().unwrap() > after_restore);
+    }
+
+    #[test]
+    fn authorization_generation_is_stable_for_reads_noops_and_failed_publication() {
+        let directory = tempdir().unwrap();
+        let document = directory.path().join("document.md");
+        fs::write(&document, "# document").unwrap();
+        let canonical = normalize_existing_path(&document).unwrap();
+        let session = FileAuthorizationSession::default();
+        let initial = session.authorization_generation().unwrap();
+
+        assert!(session.file_for_read(&canonical).is_err());
+        assert_eq!(session.authorization_generation().unwrap(), initial);
+        session.revoke_path_prefix(&canonical).unwrap();
+        assert_eq!(session.authorization_generation().unwrap(), initial);
+        session
+            .relocate_path_prefix(&canonical, &canonical)
+            .unwrap();
+        assert_eq!(session.authorization_generation().unwrap(), initial);
+        assert!(session
+            .authorize_directory_root_with(directory.path(), |_| Err("injected failure".into()))
+            .is_err());
+        assert_eq!(session.authorization_generation().unwrap(), initial);
+    }
+
+    #[test]
+    fn authorization_generation_overflow_fails_closed_before_grant_mutation() {
+        let directory = tempdir().unwrap();
+        let document = directory.path().join("document.md");
+        fs::write(&document, "# document").unwrap();
+        let canonical = normalize_existing_path(&document).unwrap();
+        let session = FileAuthorizationSession::default();
+        session.lock().unwrap().authorization_generation = u64::MAX;
+
+        let error = match session.authorize_file(&document) {
+            Ok(_) => panic!("overflow must reject the grant"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "Authorization generation is exhausted");
+        assert_eq!(session.authorization_generation().unwrap(), u64::MAX);
+        assert_eq!(
+            session
+                .exact_write_grant_snapshot_for_test(&canonical)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -3560,11 +4181,13 @@ mod tests {
         let active_origin = GrantOrigin::OpenDocument(DocumentGrantId(1));
         let suspended_origin = GrantOrigin::SaveAs(DocumentGrantId(2));
         let mut state = AuthorizationState::default();
-        state.grant(old_key, active_origin.clone());
-        state.grant(new_key.clone(), suspended_origin.clone());
+        state.grant(old_key, active_origin.clone()).unwrap();
+        state
+            .grant(new_key.clone(), suspended_origin.clone())
+            .unwrap();
         state.grants.get_mut(&new_key).unwrap().suspend();
 
-        state.relocate_path_prefix(&old_root, &new_root);
+        state.relocate_path_prefix(&old_root, &new_root).unwrap();
 
         let relocated = state.grants.get(&new_key).unwrap();
         assert_eq!(relocated.status, GrantStatus::Active);

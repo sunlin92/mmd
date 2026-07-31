@@ -9,6 +9,14 @@ export type WorkspaceFileKind =
   | 'docx';
 export type ContentMode = 'text' | 'binary';
 
+export interface FileVersion {
+  canonicalPath: string;
+  platformIdentity: string;
+  length: string;
+  modifiedNanos: string;
+  sha256: string;
+}
+
 export interface WorkspaceFileEntry {
   kind: WorkspaceFileKind;
   path: string;
@@ -27,6 +35,7 @@ export interface OpenMarkdownFileResponse {
   path: string;
   content_mode: 'text';
   content: string;
+  file_version: FileVersion;
   mime_type?: never;
 }
 
@@ -35,6 +44,7 @@ export interface OpenImageFileResponse {
   path: string;
   content_mode: 'binary';
   content?: never;
+  file_version?: never;
   mime_type: string;
 }
 
@@ -43,6 +53,7 @@ export interface OpenHtmlFileResponse {
   path: string;
   content_mode: 'text';
   content: string;
+  file_version: FileVersion;
   mime_type: string;
 }
 
@@ -51,6 +62,7 @@ export interface OpenExcalidrawFileResponse {
   path: string;
   content_mode: 'text';
   content: string;
+  file_version: FileVersion;
   mime_type?: never;
 }
 
@@ -59,6 +71,7 @@ export interface OpenMediaFileResponse {
   path: string;
   content_mode: 'binary';
   content?: never;
+  file_version?: never;
   mime_type: string;
 }
 
@@ -67,6 +80,7 @@ export interface OpenBinaryDocumentResponse {
   path: string;
   content_mode: 'binary';
   content?: never;
+  file_version?: never;
   mime_type: string;
   bytes_base64: string;
 }
@@ -78,6 +92,36 @@ export type OpenFileResponse =
   | OpenImageFileResponse
   | OpenMediaFileResponse
   | OpenBinaryDocumentResponse;
+
+export type DocumentSaveResponse =
+  | {
+      status: 'confirmed_committed';
+      path: string;
+      version: FileVersion;
+      cleanup_repair_receipt?: string;
+    }
+  | {
+      status: 'confirmed_not_committed';
+      path: string;
+      current_version?: FileVersion;
+      message: string;
+    }
+  | {
+      status: 'conflict';
+      path: string;
+      current_version?: FileVersion;
+      overwrite_token?: string;
+      message: string;
+    }
+  | {
+      status: 'indeterminate';
+      path: string;
+      message: string;
+    };
+
+export interface OverwriteTokenResponse {
+  overwriteToken: string;
+}
 
 export interface PreparedOpenFileResponse {
   file: OpenFileResponse;
@@ -148,4 +192,41 @@ export interface RenameWorkspaceEntryResponse {
 
 export interface DeleteWorkspaceEntryResponse {
   deleted_path: string;
+}
+
+export const SETTINGS_SCHEMA_VERSION = 1 as const;
+
+export type SettingsSkinId =
+  | 'jinxiu-zhusha'
+  | 'ruyao-tianqing'
+  | 'qinghua-jilan'
+  | 'songke-zhuying'
+  | 'shanshui-yemo';
+
+export type SettingsLocaleMode = 'system' | 'zh-CN' | 'en';
+
+export interface AppSettings {
+  autosaveEnabled: boolean;
+  autosaveDelayMs: number;
+  spellcheckEnabled: boolean;
+  wikilinksEnabled: boolean;
+  resourceDirectory: string;
+  editorPaneRatio: number;
+  selectedSkin: SettingsSkinId;
+  followSystemTheme: boolean;
+  localeMode: SettingsLocaleMode;
+  shortcuts: Record<string, string>;
+  exportProfiles: Record<string, unknown>;
+}
+
+export interface SettingsEnvelope {
+  schemaVersion: typeof SETTINGS_SCHEMA_VERSION;
+  revision: number;
+  settings: AppSettings;
+}
+
+export interface SettingsError {
+  code: string;
+  message: string;
+  canReset: boolean;
 }

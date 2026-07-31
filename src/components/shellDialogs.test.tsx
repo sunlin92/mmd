@@ -72,8 +72,10 @@ describe('shell modal dialogs', () => {
     expect(createHtml).toContain('aria-labelledby="workspace-entry-dialog-title"');
     expect(createHtml).toContain('value="Untitled.md"');
     expect(deleteHtml).toContain('role="alertdialog"');
-    expect(deleteHtml).toContain('Delete Folder');
-    expect(deleteHtml).toContain('This cannot be undone');
+    expect(deleteHtml).toContain('Move Folder to Trash');
+    expect(deleteHtml).toContain('You can restore it from the system Trash');
+    expect(deleteHtml).not.toContain('Permanently delete');
+    expect(deleteHtml).not.toContain('This cannot be undone');
   });
 
   it('uses an Excalidraw-specific default name when creating a drawing', () => {

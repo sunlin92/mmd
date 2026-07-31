@@ -37,8 +37,9 @@
   .toolbar {
     grid-template-columns: 34px minmax(0, 1fr) 64px;
     gap: 8px;
-    padding: 0 10px;
+    padding: 0 44px 0 10px;
   }
+  .settings-launch-button { right: 7px; }
   .brand { min-width: 0; }
   .brand-copy { display: none; }
   .document-status { min-width: 0; }
@@ -65,4 +66,11 @@
   .app-dialog-icon,
   .unsaved-dialog-icon,
   .workspace-entry-dialog-icon { width: 36px; height: 36px; }
+  .settings-dialog-backdrop { padding: 12px; }
+  .settings-dialog { max-height: calc(100vh - 24px); }
+  .settings-toggle,
+  .settings-field { align-items: flex-start; flex-direction: column; gap: 6px; }
+  .settings-field > input,
+  .settings-field select,
+  .settings-number { width: 100%; }
 }

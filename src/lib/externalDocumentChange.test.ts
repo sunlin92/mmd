@@ -7,6 +7,10 @@ import {
   resolveUseExternal,
 } from './externalDocumentChange';
 
+const fileVersion = {
+  canonicalPath: '/workspace/notes.md', platformIdentity: '1', length: '7', modifiedNanos: '1', sha256: 'd'.repeat(64),
+};
+
 function editableState(overrides: Partial<DocumentSessionState> = {}): DocumentSessionState {
   return {
     documentId: 'pane-document-1',
@@ -41,6 +45,7 @@ describe('external document change decisions', () => {
           path: '/workspace/notes.md',
           content_mode: 'text',
           content: '# Current',
+          file_version: fileVersion,
         },
         preview_revision: 2,
       },
@@ -73,6 +78,7 @@ describe('external document change decisions', () => {
           path: '/workspace/notes.md',
           content_mode: 'text',
           content: '# External',
+          file_version: fileVersion,
         },
         preview_revision: 3,
       },
@@ -107,6 +113,7 @@ describe('external document change decisions', () => {
           path: '/workspace/notes.md',
           content_mode: 'text',
           content: '# External',
+          file_version: fileVersion,
         },
         preview_revision: 4,
       },
@@ -197,6 +204,7 @@ describe('external document change decisions', () => {
           path: '/workspace/notes.md',
           content_mode: 'text',
           content: '# First',
+          file_version: fileVersion,
         },
         preview_revision: 4,
       },
@@ -231,6 +239,7 @@ describe('external document change decisions', () => {
           path: '/workspace/notes.md',
           content_mode: 'text',
           content: '# External',
+          file_version: fileVersion,
         },
         preview_revision: 7,
       },
@@ -263,6 +272,7 @@ describe('external document change decisions', () => {
           path: '/workspace/notes.md',
           content_mode: 'text',
           content: '# Latest external',
+          file_version: fileVersion,
         },
         preview_revision: 8,
       },

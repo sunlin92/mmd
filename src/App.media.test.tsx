@@ -48,6 +48,13 @@ vi.mock('./components/PreviewPane', () => ({ PreviewPane: appMocks.previewPane }
 vi.mock('./hooks/useDocumentSession', () => ({
   useDocumentSession: appMocks.useDocumentSession,
 }));
+vi.mock('./hooks/useCrashDraftRecovery', () => ({
+  useCrashDraftRecovery: () => ({
+    afterConfirmedSave: vi.fn<(documentId: string) => Promise<boolean>>(async () => true), busy: false, canRepairOverflow: false,
+    catalog: null, discard: vi.fn<() => void>(), discardAll: vi.fn<() => void>(), error: null,
+    overflowRepairProgress: null, repairOverflowBatch: vi.fn<() => void>(), recover: vi.fn<() => void>(), retry: vi.fn<() => void>(),
+  }),
+}));
 vi.mock('./hooks/usePanePopouts', () => ({
   usePanePopouts: () => ({
     closePopoutWindows: vi.fn<() => Promise<void>>(async () => undefined),
@@ -68,6 +75,16 @@ vi.mock('./hooks/usePaneResize', () => ({
 vi.mock('./hooks/useProgramCloseGuard', () => ({
   useProgramCloseGuard: () => ({
     forceCloseProgram: vi.fn<() => Promise<void>>(async () => undefined),
+  }),
+}));
+vi.mock('./hooks/useSettings', () => ({
+  useSettings: () => ({
+    busy: false,
+    recovery: null,
+    reset: vi.fn<() => Promise<void>>(async () => undefined),
+    retry: vi.fn<() => Promise<void>>(async () => undefined),
+    settings: null,
+    updateSettings: vi.fn<(settings: unknown) => Promise<void>>(async () => undefined),
   }),
 }));
 vi.mock('./lib/tauriCommands', () => ({

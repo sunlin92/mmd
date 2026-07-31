@@ -21,6 +21,8 @@ export default defineConfig({
       '.omx/**',
       'scripts/check-release-version.test.mjs',
       'scripts/ci/artifact-manifest.test.mjs',
+      'scripts/project-metadata.test.mjs',
+      'scripts/perf/*.test.mjs',
     ],
     server: {
       deps: {

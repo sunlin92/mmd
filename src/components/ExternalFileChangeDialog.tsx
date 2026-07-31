@@ -76,7 +76,7 @@ export function ExternalFileChangeDialog({
                 </button>
                 <button
                   type="button"
-                  className="dialog-button ghost"
+                  className="dialog-button danger"
                   disabled={action.busy}
                   onClick={onKeepCurrent}
                 >

@@ -24,7 +24,8 @@ describe('ExternalFileChangeDialog', () => {
     expect(html).toContain('aria-describedby="external-file-change-message"');
     expect(html).toContain('notes.md');
     expect(html).toContain('Use External Version');
-    expect(html).toContain('Keep Current Edits');
+    expect(html).toContain('Overwrite with Current Edits');
+    expect(html).toContain('dialog-button danger');
     expect(html).not.toContain('Save As');
     expect(html).not.toContain('Close Without Saving');
   });

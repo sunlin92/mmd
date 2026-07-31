@@ -30,9 +30,17 @@ test('installs the app locally, detaches the DMG, then launches', async () => {
   await writeFile(path.join(artifactDir, 'MMD.dmg'), 'fake dmg');
   await writeExecutable(
     sourceBinary,
-    'printf "launch:%s\\n" "$0" >> "$EVENT_LOG"\nwhile :; do /bin/sleep 1; done\n',
+    'printf "launch:%s\\n" "$0" >> "$EVENT_LOG"\n',
   );
-  await writeExecutable(path.join(binDir, 'node'), 'exit 0\n');
+  await writeExecutable(
+    path.join(binDir, 'node'),
+    `if [[ "\${1:-}" == *packaged-lifecycle-runner.mjs ]]; then
+  for argument in "$@"; do app="$argument"; done
+  "$app"
+fi
+exit 0
+`,
+  );
   await writeExecutable(path.join(binDir, 'uname'), 'printf "arm64\\n"\n');
   await writeExecutable(
     path.join(binDir, 'find'),
@@ -71,7 +79,7 @@ fi
   try {
     const result = spawnSync(
       '/bin/bash',
-      ['scripts/ci/smoke-macos.sh', artifactDir, 'arm64'],
+      ['scripts/ci/smoke-macos.sh', artifactDir, 'arm64', 'aarch64-apple-darwin'],
       {
         cwd: repoRoot,
         encoding: 'utf8',
@@ -99,7 +107,7 @@ fi
     assert.ok(attachIndex < dittoIndex);
     assert.ok(dittoIndex < detachIndex);
     assert.ok(detachIndex < launchIndex);
-    assert.ok(events.includes('sleep:5'));
+    assert.ok(!events.some((event) => event.startsWith('sleep:5')));
 
     const installedApp = events[dittoIndex].split(':').slice(2).join(':');
     const launchedBinary = events[launchIndex].slice('launch:'.length);

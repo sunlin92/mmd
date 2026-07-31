@@ -1,6 +1,73 @@
-use serde::Serialize;
+use std::collections::BTreeMap;
 
-use crate::workspace_file_kind::{ContentMode, WorkspaceFileKind};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    durable_write::FileVersion,
+    workspace_file_kind::{ContentMode, WorkspaceFileKind},
+};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Settings {
+    pub(crate) autosave_enabled: bool,
+    pub(crate) autosave_delay_ms: u32,
+    pub(crate) spellcheck_enabled: bool,
+    pub(crate) wikilinks_enabled: bool,
+    pub(crate) resource_directory: String,
+    pub(crate) editor_pane_ratio: f64,
+    pub(crate) selected_skin: String,
+    pub(crate) follow_system_theme: bool,
+    pub(crate) locale_mode: String,
+    pub(crate) shortcuts: BTreeMap<String, String>,
+    pub(crate) export_profiles: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            autosave_enabled: true,
+            autosave_delay_ms: 1_000,
+            spellcheck_enabled: true,
+            wikilinks_enabled: false,
+            resource_directory: "assets".to_string(),
+            editor_pane_ratio: 0.5,
+            selected_skin: "jinxiu-zhusha".to_string(),
+            follow_system_theme: false,
+            locale_mode: "system".to_string(),
+            shortcuts: BTreeMap::new(),
+            export_profiles: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SettingsEnvelope {
+    pub(crate) schema_version: u32,
+    pub(crate) revision: u64,
+    pub(crate) settings: Settings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SettingsErrorCode {
+    Malformed,
+    Oversized,
+    Invalid,
+    UnsupportedVersion,
+    Conflict,
+    Persistence,
+    NotInitialized,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SettingsError {
+    pub(crate) code: SettingsErrorCode,
+    pub(crate) message: String,
+    pub(crate) can_reset: bool,
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct MarkdownFileEntry {
@@ -23,11 +90,48 @@ pub(crate) struct OpenFileResponse {
     pub(crate) path: String,
     pub(crate) content_mode: ContentMode,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) file_version: Option<FileVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mime_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) bytes_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum DocumentSaveResponse {
+    ConfirmedCommitted {
+        path: String,
+        version: FileVersion,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cleanup_repair_receipt: Option<String>,
+    },
+    ConfirmedNotCommitted {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_version: Option<FileVersion>,
+        message: String,
+    },
+    Conflict {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_version: Option<FileVersion>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        overwrite_token: Option<String>,
+        message: String,
+    },
+    Indeterminate {
+        path: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OverwriteTokenResponse {
+    pub(crate) overwrite_token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -238,7 +342,10 @@ mod tests {
         SnapshotReceipt, WorkspaceSessionRestore, WorkspaceSnapshot,
         ACTIVE_DOCUMENT_WATCH_PROTOCOL_VERSION,
     };
-    use crate::workspace_file_kind::{ContentMode, WorkspaceFileKind};
+    use crate::{
+        durable_write::FileVersion,
+        workspace_file_kind::{ContentMode, WorkspaceFileKind},
+    };
 
     #[derive(Serialize)]
     struct FixtureWorkspaceFileEntry {
@@ -307,12 +414,36 @@ mod tests {
         }
     }
 
+    fn fixture_file_version(
+        canonical_path: &str,
+        platform_identity: &str,
+        length: &str,
+        modified_nanos: &str,
+        sha256: &str,
+    ) -> FileVersion {
+        serde_json::from_value(json!({
+            "canonicalPath": canonical_path,
+            "platformIdentity": platform_identity,
+            "length": length,
+            "modifiedNanos": modified_nanos,
+            "sha256": sha256,
+        }))
+        .unwrap()
+    }
+
     fn open_file_responses() -> Vec<OpenFileResponse> {
         vec![
             OpenFileResponse {
                 kind: WorkspaceFileKind::Markdown,
                 path: "/workspace/notes.md".to_string(),
                 content_mode: ContentMode::Text,
+                file_version: Some(fixture_file_version(
+                    "/workspace/notes.md",
+                    "1",
+                    "7",
+                    "1",
+                    &"a".repeat(64),
+                )),
                 content: Some("# Notes".to_string()),
                 mime_type: None,
                 bytes_base64: None,
@@ -321,6 +452,13 @@ mod tests {
                 kind: WorkspaceFileKind::Html,
                 path: "/workspace/page.xhtml".to_string(),
                 content_mode: ContentMode::Text,
+                file_version: Some(fixture_file_version(
+                    "/workspace/page.xhtml",
+                    "2",
+                    "17",
+                    "2",
+                    &"b".repeat(64),
+                )),
                 content: Some("<main>Page</main>".to_string()),
                 mime_type: Some("application/xhtml+xml".to_string()),
                 bytes_base64: None,
@@ -329,6 +467,7 @@ mod tests {
                 kind: WorkspaceFileKind::Image,
                 path: "/workspace/assets/pixel.png".to_string(),
                 content_mode: ContentMode::Binary,
+                file_version: None,
                 content: None,
                 mime_type: Some("image/png".to_string()),
                 bytes_base64: None,
@@ -337,6 +476,7 @@ mod tests {
                 kind: WorkspaceFileKind::Video,
                 path: "/workspace/assets/clip.mp4".to_string(),
                 content_mode: ContentMode::Binary,
+                file_version: None,
                 content: None,
                 mime_type: Some("video/mp4".to_string()),
                 bytes_base64: None,
@@ -345,6 +485,7 @@ mod tests {
                 kind: WorkspaceFileKind::Audio,
                 path: "/workspace/assets/track.mp3".to_string(),
                 content_mode: ContentMode::Binary,
+                file_version: None,
                 content: None,
                 mime_type: Some("audio/mpeg".to_string()),
                 bytes_base64: None,
@@ -402,6 +543,13 @@ mod tests {
                     kind: WorkspaceFileKind::Markdown,
                     path: "/workspace/notes.md".to_string(),
                     content_mode: ContentMode::Text,
+                    file_version: Some(fixture_file_version(
+                        "/workspace/notes.md",
+                        "1",
+                        "7",
+                        "1",
+                        &"a".repeat(64),
+                    )),
                     content: Some("# Notes".to_string()),
                     mime_type: None,
                     bytes_base64: None,
@@ -461,6 +609,13 @@ mod tests {
                             kind: WorkspaceFileKind::Markdown,
                             path: "/workspace/notes.md".to_string(),
                             content_mode: ContentMode::Text,
+                            file_version: Some(fixture_file_version(
+                                "/workspace/notes.md",
+                                "1",
+                                "10",
+                                "3",
+                                &"c".repeat(64),
+                            )),
                             content: Some("# External".to_string()),
                             mime_type: None,
                             bytes_base64: None,
@@ -479,6 +634,7 @@ mod tests {
                             kind: WorkspaceFileKind::Pdf,
                             path: "/workspace/document.pdf".to_string(),
                             content_mode: ContentMode::Binary,
+                            file_version: None,
                             content: None,
                             mime_type: Some("application/pdf".to_string()),
                             bytes_base64: Some("AQ==".to_string()),
@@ -509,6 +665,13 @@ mod tests {
                             kind: WorkspaceFileKind::Markdown,
                             path: "/workspace/notes.md".to_string(),
                             content_mode: ContentMode::Text,
+                            file_version: Some(fixture_file_version(
+                                "/workspace/notes.md",
+                                "1",
+                                "10",
+                                "4",
+                                &"d".repeat(64),
+                            )),
                             content: Some("# Resynced".to_string()),
                             mime_type: None,
                             bytes_base64: None,
@@ -530,6 +693,13 @@ mod tests {
                                 kind: WorkspaceFileKind::Markdown,
                                 path: "/workspace/notes.md".to_string(),
                                 content_mode: ContentMode::Text,
+                                file_version: Some(fixture_file_version(
+                                    "/workspace/notes.md",
+                                    "1",
+                                    "9",
+                                    "5",
+                                    &"e".repeat(64),
+                                )),
                                 content: Some("# Changed".to_string()),
                                 mime_type: None,
                                 bytes_base64: None,
@@ -552,6 +722,13 @@ mod tests {
                                 kind: WorkspaceFileKind::Markdown,
                                 path: "/workspace/renamed.md".to_string(),
                                 content_mode: ContentMode::Text,
+                                file_version: Some(fixture_file_version(
+                                    "/workspace/renamed.md",
+                                    "1",
+                                    "9",
+                                    "6",
+                                    &"f".repeat(64),
+                                )),
                                 content: Some("# Renamed".to_string()),
                                 mime_type: None,
                                 bytes_base64: None,
@@ -632,6 +809,48 @@ mod tests {
                     "directories": [],
                 },
                 "active_file": null,
+            })
+        );
+    }
+
+    #[test]
+    fn settings_contract_serializes_camel_case_with_revision_and_structured_errors() {
+        let envelope = super::SettingsEnvelope {
+            schema_version: 1,
+            revision: 7,
+            settings: super::Settings::default(),
+        };
+        assert_eq!(
+            serde_json::to_value(envelope).unwrap(),
+            json!({
+                "schemaVersion": 1,
+                "revision": 7,
+                "settings": {
+                    "autosaveEnabled": true,
+                    "autosaveDelayMs": 1000,
+                    "spellcheckEnabled": true,
+                    "wikilinksEnabled": false,
+                    "resourceDirectory": "assets",
+                    "editorPaneRatio": 0.5,
+                    "selectedSkin": "jinxiu-zhusha",
+                    "followSystemTheme": false,
+                    "localeMode": "system",
+                    "shortcuts": {},
+                    "exportProfiles": {}
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(super::SettingsError {
+                code: super::SettingsErrorCode::UnsupportedVersion,
+                message: "newer settings".to_string(),
+                can_reset: false,
+            })
+            .unwrap(),
+            json!({
+                "code": "unsupportedVersion",
+                "message": "newer settings",
+                "canReset": false
             })
         );
     }

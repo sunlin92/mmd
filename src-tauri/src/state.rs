@@ -4,28 +4,71 @@ use std::{
 };
 
 use crate::{
-    active_document_watch::ActiveDocumentWatchState, html_preview_server::HtmlPreviewServerState,
-    native_menu::NativeMenuState, path_auth::FileAuthorizationSession,
-    recent_files::RecentFilesState, workspace_session::WorkspaceSessionState,
+    active_document_watch::ActiveDocumentWatchState,
+    crash_draft_store::{DurableDraftWriter, ProductionCrashDraftStore, SystemDraftClock},
+    document_save::DocumentSaveCoordinator,
+    html_preview_server::HtmlPreviewServerState,
+    native_menu::NativeMenuState,
+    path_auth::FileAuthorizationSession,
+    recent_files::RecentFilesState,
+    settings::SettingsStore,
+    workspace_session::WorkspaceSessionState,
 };
 
 #[derive(Default)]
 pub(crate) struct AppState {
     active_document_watch: ActiveDocumentWatchState,
+    document_save: DocumentSaveCoordinator,
     file_authorization: FileAuthorizationSession,
     native_menu: Mutex<NativeMenuState>,
     recent_files: OnceLock<RecentFilesState>,
+    settings: OnceLock<SettingsStore>,
     workspace_session: OnceLock<WorkspaceSessionState>,
+    crash_drafts: OnceLock<ProductionCrashDraftStore>,
+    crash_draft_startup_error: Mutex<Option<crate::crash_drafts::CrashDraftError>>,
     pub(crate) html_preview_server: HtmlPreviewServerState,
 }
 
 impl AppState {
+    pub(crate) fn initialize_crash_drafts(&self, app_data_dir: PathBuf) -> Result<(), String> {
+        let store =
+            ProductionCrashDraftStore::new(app_data_dir, DurableDraftWriter, SystemDraftClock);
+        let startup_error = store.repair_startup().err();
+        self.crash_drafts
+            .set(store)
+            .map_err(|_| "Crash draft state is already initialized".to_string())?;
+        *self
+            .crash_draft_startup_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = startup_error;
+        Ok(())
+    }
+
+    pub(crate) fn take_crash_draft_startup_error(
+        &self,
+    ) -> Option<crate::crash_drafts::CrashDraftError> {
+        self.crash_draft_startup_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub(crate) fn crash_drafts(&self) -> Result<&ProductionCrashDraftStore, String> {
+        self.crash_drafts
+            .get()
+            .ok_or_else(|| "Crash draft state is not initialized".to_string())
+    }
+
     pub(crate) fn active_document_watch(&self) -> &ActiveDocumentWatchState {
         &self.active_document_watch
     }
 
     pub(crate) fn file_authorization(&self) -> &FileAuthorizationSession {
         &self.file_authorization
+    }
+
+    pub(crate) fn document_save(&self) -> &DocumentSaveCoordinator {
+        &self.document_save
     }
 
     pub(crate) fn native_menu_state(&self) -> NativeMenuState {
@@ -83,6 +126,22 @@ impl AppState {
             .ok_or_else(|| "Recent files state is not initialized".to_string())
     }
 
+    pub(crate) fn initialize_settings(&self, app_data_dir: PathBuf) -> Result<(), String> {
+        self.settings
+            .set(SettingsStore::new(app_data_dir))
+            .map_err(|_| "Settings state is already initialized".to_string())
+    }
+
+    pub(crate) fn settings(&self) -> Result<&SettingsStore, crate::models::SettingsError> {
+        self.settings
+            .get()
+            .ok_or_else(|| crate::models::SettingsError {
+                code: crate::models::SettingsErrorCode::NotInitialized,
+                message: "Settings state is not initialized.".to_string(),
+                can_reset: false,
+            })
+    }
+
     pub(crate) fn initialize_workspace_session(&self, app_data_dir: PathBuf) -> Result<(), String> {
         self.workspace_session
             .set(WorkspaceSessionState::new(app_data_dir))
@@ -98,6 +157,10 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
@@ -118,5 +181,23 @@ mod tests {
         assert!(state.native_menu_state().follow_system());
         assert_eq!(state.native_menu_state().locale_mode(), "zh-CN");
         assert_eq!(state.native_menu_state().effective_locale(), "zh-CN");
+    }
+
+    #[test]
+    fn crash_draft_state_remains_initialized_when_startup_repair_needs_overflow_batches() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("crash-drafts").join("v1");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..65 {
+            fs::write(root.join(format!("{index:032x}.json")), b"invalid").unwrap();
+        }
+        let state = AppState::default();
+        state
+            .initialize_crash_drafts(directory.path().to_path_buf())
+            .unwrap();
+
+        assert!(state.take_crash_draft_startup_error().is_some());
+        let error = state.crash_drafts().unwrap().list().unwrap_err();
+        assert!(error.repair_receipt.is_some());
     }
 }

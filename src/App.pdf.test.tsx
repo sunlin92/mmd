@@ -25,6 +25,7 @@ const appMocks = vi.hoisted(() => ({
   setNativeSaveMenuEnabled: vi.fn<(enabled: boolean) => Promise<void>>(),
   session: null as unknown as Record<string, unknown>,
   useDocumentSession: vi.fn<(input: Record<string, unknown>) => Record<string, unknown>>(),
+  useCrashDraftRecovery: vi.fn<(input: Record<string, unknown>) => Record<string, unknown>>(),
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
@@ -33,6 +34,9 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 vi.mock('./hooks/useDocumentSession', () => ({
   useDocumentSession: appMocks.useDocumentSession,
+}));
+vi.mock('./hooks/useCrashDraftRecovery', () => ({
+  useCrashDraftRecovery: appMocks.useCrashDraftRecovery,
 }));
 vi.mock('./lib/tauriCommands', () => ({
   setNativeSaveMenuEnabled: appMocks.setNativeSaveMenuEnabled,
@@ -59,6 +63,16 @@ vi.mock('./hooks/usePanePopouts', () => ({
 vi.mock('./hooks/useProgramCloseGuard', () => ({
   useProgramCloseGuard: () => ({
     forceCloseProgram: vi.fn<() => Promise<void>>(async () => undefined),
+  }),
+}));
+vi.mock('./hooks/useSettings', () => ({
+  useSettings: () => ({
+    busy: false,
+    recovery: null,
+    reset: vi.fn<() => Promise<void>>(async () => undefined),
+    retry: vi.fn<() => Promise<void>>(async () => undefined),
+    settings: null,
+    updateSettings: vi.fn<(settings: unknown) => Promise<void>>(async () => undefined),
   }),
 }));
 vi.mock('./components/EditorPane', () => ({ EditorPane: appMocks.editorPane }));
@@ -122,6 +136,7 @@ function createBinarySession(kind: BinaryKind, authorityStatus: PreviewAuthority
     documentId: fixture.documentId,
     error: null,
     externalFileAction: null,
+    saveConflict: null as { busy: boolean; path: string } | null,
     fileTree: [],
     handleClearRecent: vi.fn<() => Promise<void>>(async () => undefined),
     handleNew: vi.fn<() => void>(),
@@ -130,6 +145,8 @@ function createBinarySession(kind: BinaryKind, authorityStatus: PreviewAuthority
     handleOpenRecent: vi.fn<(entryId: string) => Promise<void>>(async () => undefined),
     handleSave: vi.fn<() => Promise<void>>(async () => undefined),
     handleSaveAs: vi.fn<() => Promise<void>>(async () => undefined),
+    handleCancelSaveConflict: vi.fn<() => void>(),
+    handleOverwriteSaveConflict: vi.fn<() => Promise<void>>(async () => undefined),
     moveWorkspaceEntryPath: vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined),
     notice: null,
     openWorkspaceFilePath: vi.fn<(path: string) => Promise<void>>(async () => undefined),
@@ -254,6 +271,12 @@ describe('App binary document composition', () => {
     appMocks.setNativeSaveMenuEnabled.mockReset();
     appMocks.setNativeSaveMenuEnabled.mockResolvedValue(undefined);
     appMocks.useDocumentSession.mockReset();
+    appMocks.useCrashDraftRecovery.mockReset();
+    appMocks.useCrashDraftRecovery.mockReturnValue({
+      afterConfirmedSave: vi.fn<(documentId: string) => Promise<boolean>>(async () => true), busy: false, canRepairOverflow: false,
+      catalog: null, discard: vi.fn<() => void>(), discardAll: vi.fn<() => void>(), error: null,
+      overflowRepairProgress: null, repairOverflowBatch: vi.fn<() => void>(), recover: vi.fn<() => void>(), retry: vi.fn<() => void>(),
+    });
   });
 
   afterEach(() => {
@@ -288,6 +311,17 @@ describe('App binary document composition', () => {
     expect(appMocks.excalidrawPane).toHaveBeenCalledOnce();
   });
 
+  it('enables crash recovery only in the main window', async () => {
+    appMocks.useDocumentSession.mockReturnValue(createTextSession('markdown'));
+    await act(async () => root.render(<App />));
+    expect(appMocks.useCrashDraftRecovery).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
+    act(() => root.unmount());
+    root = createRoot(container);
+    window.history.replaceState({}, '', '/?pane=editor');
+    await act(async () => root.render(<App />));
+    expect(appMocks.useCrashDraftRecovery).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: false }));
+  });
+
   it.each(COMPOSITION_CASES)(
     'routes %s with %s authority at %s to one read-only full-width preview',
     async (kind, authorityStatus, search, previewSelector, isPopout, popoutPane) => {
@@ -312,7 +346,9 @@ describe('App binary document composition', () => {
       expect(appMocks.jinxiuMarkdown).not.toHaveBeenCalled();
       expect(container.querySelectorAll('.preview-pane')).toHaveLength(1);
       expect(container.querySelector(previewSelector)).not.toBeNull();
-      expect(appMocks.useDocumentSession).toHaveBeenCalledWith({ isPopout, popoutPane });
+      expect(appMocks.useDocumentSession).toHaveBeenCalledWith({
+        afterConfirmedSave: expect.any(Function), autosaveDelayMs: 1500, autosaveEnabled: false, isPopout, popoutPane,
+      });
       expect(appMocks.setNativeSaveMenuEnabled.mock.calls).toEqual(isPopout ? [] : [[false]]);
     },
   );
@@ -342,7 +378,9 @@ describe('App binary document composition', () => {
       expect(appMocks.editorPane).not.toHaveBeenCalled();
       expect(appMocks.jinxiuMarkdown).not.toHaveBeenCalled();
       expect(appMocks.paneResizer).not.toHaveBeenCalled();
-      expect(appMocks.useDocumentSession).toHaveBeenCalledWith({ isPopout, popoutPane });
+      expect(appMocks.useDocumentSession).toHaveBeenCalledWith({
+        afterConfirmedSave: expect.any(Function), autosaveDelayMs: 1500, autosaveEnabled: false, isPopout, popoutPane,
+      });
       expect(appMocks.setNativeSaveMenuEnabled.mock.calls).toEqual(isPopout ? [] : [[true]]);
     },
   );
@@ -358,6 +396,53 @@ describe('App binary document composition', () => {
     session.busy = true;
     await act(async () => root.render(<App />));
     expect(appMocks.setNativeSaveMenuEnabled).toHaveBeenLastCalledWith(false);
+  });
+
+  it('renders the branching save-conflict modal and routes its actions', async () => {
+    const session = createTextSession('markdown');
+    session.saveConflict = { busy: false, path: '/workspace/report.md' };
+    appMocks.useDocumentSession.mockReturnValue(session);
+    await act(async () => root.render(<App />));
+    const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('.document-save-conflict-dialog button'));
+    act(() => buttons.find((button) => button.textContent === 'Cancel')?.click());
+    act(() => buttons.find((button) => button.textContent === 'Overwrite')?.click());
+    expect(session.handleCancelSaveConflict).toHaveBeenCalledOnce();
+    expect(session.handleOverwriteSaveConflict).toHaveBeenCalledOnce();
+  });
+
+  it('renders crash recovery and executes only one explicit repair batch per click', async () => {
+    const session = createTextSession('markdown');
+    appMocks.useDocumentSession.mockReturnValue(session);
+    const recover = vi.fn<() => void>();
+    appMocks.useCrashDraftRecovery.mockReturnValue({
+      afterConfirmedSave: vi.fn<(documentId: string) => Promise<boolean>>(async () => true), busy: false, canRepairOverflow: false,
+      catalog: {
+        schemaVersion: 1, catalogToken: 'a'.repeat(64), totalBytes: 10,
+        limits: { maxDraftBytes: 100, maxDrafts: 10, maxStoreBytes: 1000 },
+        entries: [{
+          status: 'recoverable', documentId: '1'.repeat(32), draftRevision: 1,
+          updatedAtUnixMs: 1, contentBytes: 10, pathHint: null, baseVersionToken: null,
+          fileKind: 'markdown', entryToken: 'b'.repeat(64),
+        }],
+      },
+      discard: vi.fn<() => void>(), discardAll: vi.fn<() => void>(), error: null, overflowRepairProgress: null,
+      repairOverflowBatch: vi.fn<() => void>(), recover, retry: vi.fn<() => void>(),
+    });
+    await act(async () => root.render(<App />));
+    act(() => [...container.querySelectorAll('button')].find((button) => button.textContent === 'Recover')?.click());
+    expect(recover).toHaveBeenCalledOnce();
+
+    const repairOverflowBatch = vi.fn<() => void>();
+    appMocks.useCrashDraftRecovery.mockReturnValue({
+      afterConfirmedSave: vi.fn<(documentId: string) => Promise<boolean>>(async () => true), busy: false, canRepairOverflow: true,
+      catalog: null, discard: vi.fn<() => void>(), discardAll: vi.fn<() => void>(),
+      error: { code: 'storeFull', message: 'Storage full.', canReset: false },
+      overflowRepairProgress: null, repairOverflowBatch, recover: vi.fn<() => void>(), retry: vi.fn<() => void>(),
+    });
+    await act(async () => root.render(<App />));
+    act(() => [...container.querySelectorAll('button')]
+      .find((button) => button.textContent?.includes('Repair Draft Storage'))?.click());
+    expect(repairOverflowBatch).toHaveBeenCalledOnce();
   });
 
   it('asks before opening another workspace file when the current document is dirty', async () => {
@@ -497,7 +582,9 @@ describe('App binary document composition', () => {
         previewRevision: 23,
       });
       expect(props?.popout).toBe(isPopout ? true : undefined);
-      expect(appMocks.useDocumentSession).toHaveBeenCalledWith({ isPopout, popoutPane });
+      expect(appMocks.useDocumentSession).toHaveBeenCalledWith({
+        afterConfirmedSave: expect.any(Function), autosaveDelayMs: 1500, autosaveEnabled: false, isPopout, popoutPane,
+      });
     },
   );
 

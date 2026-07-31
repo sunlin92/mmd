@@ -16,6 +16,7 @@ import {
 import {
   applyWorkspaceSelection,
   createProvisionalDocumentTransition,
+  createDocumentSaveOperationId,
   createWorkspaceDirectoryAndReconcile,
   deleteWorkspaceEntryAndReconcile,
   getEditableFileKindForPath,
@@ -43,6 +44,13 @@ import {
 } from '../lib/externalDocumentChange';
 import type { PaneReplicatedState, PaneSnapshotEnvelope, ReplicaRole } from '../lib/paneSync';
 import { normalizeAppError } from '../lib/appFeedback';
+import {
+  createCrashDraftDocumentId,
+  createCrashDraftScheduler,
+  type CrashDraftRecoverResponse,
+  type CrashDraftScheduler,
+} from '../lib/crashDrafts';
+import { crashDraftCommands } from '../lib/crashDraftCommands';
 import { translate, useI18n } from '../lib/i18n';
 import { createPaneProtocolId, createTauriPaneReplication } from '../lib/tauriPaneReplication';
 import {
@@ -63,10 +71,14 @@ import {
   renameWorkspaceEntry,
   restoreWorkspaceSession,
   saveAsDialog,
+  issueDocumentOverwriteToken,
+  retryDocumentSaveWithToken,
+  cancelDocumentOverwriteToken,
   writeFile,
 } from '../lib/tauriCommands';
 import type {
   MutationOutcome,
+  FileVersion,
   OpenFileResponse,
   PreparedOpenFileResponse,
   SnapshotReceipt,
@@ -80,6 +92,9 @@ interface UseDocumentSessionInput {
   activeDocumentWatchTransport?: ActiveDocumentWatchTransport | null;
   isPopout: boolean;
   popoutPane: 'main' | 'editor' | 'preview';
+  autosaveEnabled?: boolean;
+  autosaveDelayMs?: number;
+  afterConfirmedSave?: (documentId: string) => boolean | void | Promise<boolean | void>;
 }
 
 interface ActiveWorkspaceIdentity {
@@ -101,6 +116,19 @@ interface ExternalFileActionState {
   kind: 'conflict' | 'deleted-draft';
 }
 
+interface PendingDocumentSaveConflict {
+  busy: boolean;
+  content: string;
+  documentGeneration: number;
+  documentId: string;
+  operationId: string;
+  overwriteToken?: string;
+  path: string;
+  sourcePath: string | null;
+  saveKind: 'same-file' | 'save-as';
+  resumeExternalAction?: ExternalFileActionState;
+}
+
 function activePathInWorkspaceSnapshot(
   activePath: string | null,
   files: readonly WorkspaceFileEntry[],
@@ -109,9 +137,20 @@ function activePathInWorkspaceSnapshot(
   return activePath;
 }
 
+function editableFileVersion(file: OpenFileResponse): FileVersion | null {
+  return file.kind === 'markdown' || file.kind === 'html' || file.kind === 'excalidraw'
+    ? file.file_version
+    : null;
+}
+
 export interface ExternalFileActionDialogState {
   busy: boolean;
   kind: 'conflict' | 'deleted-draft';
+  path: string;
+}
+
+export interface DocumentSaveConflictDialogState {
+  busy: boolean;
   path: string;
 }
 
@@ -119,6 +158,9 @@ export function useDocumentSession({
   activeDocumentWatchTransport: suppliedActiveDocumentWatchTransport,
   isPopout,
   popoutPane,
+  autosaveEnabled = false,
+  autosaveDelayMs = 1500,
+  afterConfirmedSave,
 }: UseDocumentSessionInput) {
   const { locale } = useI18n();
   const localeRef = useRef(locale);
@@ -140,7 +182,9 @@ export function useDocumentSession({
   const [notice, setNotice] = useState<string | null>(null);
   const [externalFileAction, setExternalFileAction] = useState<ExternalFileActionState | null>(null);
   const [externalFileActionBusy, setExternalFileActionBusy] = useState(false);
+  const [saveConflict, setSaveConflict] = useState<PendingDocumentSaveConflict | null>(null);
   const [busy, setBusy] = useState(false);
+  const [autosaveBlockedContent, setAutosaveBlockedContent] = useState<string | null>(null);
   const [workspaceSessionRestoreSettled, setWorkspaceSessionRestoreSettled] = useState(
     () => !restoreWorkspaceSessionOnMount,
   );
@@ -161,6 +205,11 @@ export function useDocumentSession({
   const workspaceSessionRestoreStartedRef = useRef(false);
   const workspaceFilesRef = useRef<WorkspaceFileEntry[]>([]);
   const activePathRef = useRef<string | null>(null);
+  const activeFileVersionRef = useRef<FileVersion | null>(null);
+  const crashDraftSchedulerRef = useRef<CrashDraftScheduler | null>(null);
+  const crashDraftDocumentIdRef = useRef(createCrashDraftDocumentId());
+  const forcedDirtyCrashDraftIdRef = useRef<string | null>(null);
+  const saveConflictRef = useRef<PendingDocumentSaveConflict | null>(null);
   const activeDocumentWatchRef = useRef<AcceptedActiveDocumentWatch | null>(null);
   const externalFileActionRef = useRef<ExternalFileActionState | null>(null);
   const paneReplicationRef = useRef<ReturnType<typeof createTauriPaneReplication> | null>(null);
@@ -179,8 +228,10 @@ export function useDocumentSession({
   }, [suppliedActiveDocumentWatchTransport]);
 
   externalFileActionRef.current = externalFileAction;
+  saveConflictRef.current = saveConflict;
 
-  const dirty = isDocumentDirty({ activeFileKind, content, lastSavedContent });
+  const dirty = isDocumentDirty({ activeFileKind, content, lastSavedContent })
+    || forcedDirtyCrashDraftIdRef.current === crashDraftDocumentIdRef.current;
   const fileTree = useMemo(() => buildWorkspaceFileTree(files, directories), [directories, files]);
   workspaceFilesRef.current = files;
   const paneState = useMemo<PaneReplicatedState>(() => ({
@@ -199,6 +250,19 @@ export function useDocumentSession({
   paneStateRef.current = paneState;
 
   useEffect(() => sessionQueue.subscribeBusy(setBusy), [sessionQueue]);
+
+  useEffect(() => {
+    if (isPopout) return undefined;
+    const scheduler = createCrashDraftScheduler({
+      isMainWindow: true,
+      write: crashDraftCommands.write,
+    });
+    crashDraftSchedulerRef.current = scheduler;
+    return () => {
+      if (crashDraftSchedulerRef.current === scheduler) crashDraftSchedulerRef.current = null;
+      scheduler.dispose();
+    };
+  }, [isPopout]);
 
   const executeSessionOperation = useCallback(async <T,>(
     operation: DocumentSessionQueueOperation<T>,
@@ -239,6 +303,11 @@ export function useDocumentSession({
   }, []);
 
   const setActiveDocumentPath = useCallback((path: string | null) => {
+    const previousPath = activePathRef.current;
+    const currentVersion = activeFileVersionRef.current;
+    if (path && previousPath && currentVersion?.canonicalPath === previousPath) {
+      activeFileVersionRef.current = { ...currentVersion, canonicalPath: path };
+    }
     activePathRef.current = path;
     paneStateRef.current = {
       ...paneStateRef.current,
@@ -285,8 +354,67 @@ export function useDocumentSession({
     setExternalFileAction(next);
   }, []);
 
+  const setSaveConflictState = useCallback((next: PendingDocumentSaveConflict | null) => {
+    saveConflictRef.current = next;
+    setSaveConflict(next);
+  }, []);
+
+  const flushCrashDraft = useCallback(async () => {
+    await crashDraftSchedulerRef.current?.flush(crashDraftDocumentIdRef.current);
+  }, []);
+
+  const advanceCrashDraftIdentity = useCallback((priorDocumentId: string) => {
+    crashDraftSchedulerRef.current?.invalidate(priorDocumentId);
+    crashDraftDocumentIdRef.current = createCrashDraftDocumentId();
+    forcedDirtyCrashDraftIdRef.current = null;
+  }, []);
+
+  const scheduleCurrentCrashDraft = useCallback(() => {
+    if (isPopout) return;
+    const current = paneStateRef.current;
+    if ((current.authorityStatus ?? 'unknown') !== 'committed'
+      || !isEditableFileKind(current.activeFileKind)) return;
+    const version = activeFileVersionRef.current;
+    if (current.activePath && !version) return;
+    crashDraftSchedulerRef.current?.schedule({
+      documentId: crashDraftDocumentIdRef.current,
+      fileKind: current.activeFileKind,
+      pathHint: current.activePath,
+      baseVersionToken: current.activePath ? version!.sha256 : null,
+      content: current.content,
+    });
+  }, [isPopout]);
+
+  const cleanupConfirmedCrashDraft = useCallback(async (committedContent: string) => {
+    const crashDocumentId = crashDraftDocumentIdRef.current;
+    if (paneStateRef.current.content !== committedContent) {
+      try {
+        scheduleCurrentCrashDraft();
+      } catch {
+        setError('The document was saved, but newer edits could not be added to crash recovery.');
+      }
+      return;
+    }
+    try {
+      await crashDraftSchedulerRef.current?.flush(crashDocumentId);
+    } catch {
+      setError('The document was saved, but its recovery draft could not be finalized.');
+      return;
+    }
+    const cleaned = await afterConfirmedSave?.(crashDocumentId);
+    if (cleaned === false) return;
+    crashDraftSchedulerRef.current?.invalidate(crashDocumentId);
+    forcedDirtyCrashDraftIdRef.current = null;
+  }, [afterConfirmedSave, scheduleCurrentCrashDraft]);
+
+  const lockDocumentAuthorityUnknown = useCallback(() => {
+    paneStateRef.current = { ...paneStateRef.current, authorityStatus: 'unknown' };
+    setAuthorityStatus('unknown');
+  }, []);
+
   const ordinaryDocumentActionsBlocked = useCallback(
     () => externalFileActionRef.current !== null
+      || saveConflictRef.current !== null
       || (!isPopout && !workspaceSessionRestoreSettledRef.current),
     [isPopout],
   );
@@ -341,6 +469,7 @@ export function useDocumentSession({
       documentEpoch: current.documentEpoch + 1,
       authorityStatus: 'committed',
     });
+    activeFileVersionRef.current = editableFileVersion(response);
   }, [applyDocumentSessionState, currentDocumentSessionState]);
 
   const applyPreparedOpen = useCallback(async (
@@ -348,7 +477,16 @@ export function useDocumentSession({
     requestedGeneration: number,
     reportFailure = true,
   ) => {
+    const priorCrashDocumentId = crashDraftDocumentIdRef.current;
+    try {
+      await crashDraftSchedulerRef.current?.flush(priorCrashDocumentId);
+    } catch {
+      await discardOpenReceipt(prepared.open_receipt).catch(() => undefined);
+      if (reportFailure) setError('The recovery draft could not be saved. The current document remains open.');
+      return;
+    }
     const prior = currentDocumentSessionState();
+    const priorVersion = activeFileVersionRef.current;
     const transition = createProvisionalDocumentTransition(
       prior,
       prepared.file,
@@ -370,16 +508,20 @@ export function useDocumentSession({
         ...transition.provisional,
         authorityStatus: 'committed',
       });
+      activeFileVersionRef.current = editableFileVersion(prepared.file);
+      advanceCrashDraftIdentity(priorCrashDocumentId);
       return;
     }
     if (outcome.status === 'not_committed') {
       try {
         applyDocumentSessionState(restoreDocumentSnapshot(transition.prior));
+        activeFileVersionRef.current = priorVersion;
       } catch {
         applyDocumentSessionState({
           ...transition.provisional,
           authorityStatus: 'failed',
         });
+        activeFileVersionRef.current = priorVersion;
       }
       if (reportFailure) setError(outcome.message);
       return;
@@ -388,10 +530,11 @@ export function useDocumentSession({
       ...transition.provisional,
       authorityStatus: 'unknown',
     });
+    activeFileVersionRef.current = priorVersion;
     if (reportFailure) {
       setError('The file authorization result could not be confirmed. Open another file to continue.');
     }
-  }, [applyDocumentSessionState, currentDocumentSessionState]);
+  }, [advanceCrashDraftIdentity, applyDocumentSessionState, currentDocumentSessionState]);
 
   const claimPreparedOpen = useCallback((
     prepared: PreparedOpenFileResponse | null,
@@ -591,14 +734,25 @@ export function useDocumentSession({
     if (decision.kind === 'ignore') return;
     if (decision.kind === 'apply-document') {
       const previousPath = activePathRef.current;
+      const appliedAction = externalFileActionRef.current;
       if (accepted && decision.state.activePath) accepted.path = decision.state.activePath;
       applyDocumentSessionState(decision.state);
+      const sourceEnvelope = appliedAction?.envelope;
+      if (sourceEnvelope?.snapshot.status === 'present'
+        && isEditableFileKind(sourceEnvelope.snapshot.file.kind)) {
+        activeFileVersionRef.current = editableFileVersion(sourceEnvelope.snapshot.file);
+      }
       if (previousPath && decision.state.activePath !== previousPath) {
         await refreshWorkspaceAfterExternalPathChange(previousPath);
       }
       return;
     }
     if (decision.kind === 'show-conflict') {
+      const pendingSave = saveConflictRef.current;
+      setSaveConflictState(null);
+      if (pendingSave?.overwriteToken) {
+        void cancelDocumentOverwriteToken(pendingSave.path, pendingSave.overwriteToken).catch(() => undefined);
+      }
       const currentAction = externalFileActionRef.current;
       const envelope = currentAction?.kind === 'conflict'
         ? coalesceExternalConflict(currentAction.envelope, decision.envelope)
@@ -607,12 +761,24 @@ export function useDocumentSession({
       return;
     }
     if (decision.kind === 'show-deleted-draft') {
+      const pendingSave = saveConflictRef.current;
+      setSaveConflictState(null);
+      if (pendingSave?.overwriteToken) {
+        void cancelDocumentOverwriteToken(pendingSave.path, pendingSave.overwriteToken).catch(() => undefined);
+      }
       await stopAcceptedActiveDocumentWatch();
       setExternalFileActionState({ kind: 'deleted-draft', envelope: decision.envelope });
       return;
     }
 
     const previousPath = activePathRef.current;
+    const priorCrashDocumentId = crashDraftDocumentIdRef.current;
+    try {
+      await crashDraftSchedulerRef.current?.flush(priorCrashDocumentId);
+    } catch {
+      setError('The recovery draft could not be saved. The current document remains open.');
+      return;
+    }
     await stopAcceptedActiveDocumentWatch();
     documentOpenRequestRef.current += 1;
     documentGenerationRef.current += 1;
@@ -629,13 +795,17 @@ export function useDocumentSession({
       lastSavedContent: EMPTY_MARKDOWN,
       previewRevision: 0,
     });
+    activeFileVersionRef.current = null;
+    advanceCrashDraftIdentity(priorCrashDocumentId);
     setNotice(translate(localeRef.current, 'watchedFileDeleted', { name: displayName(decision.path) }));
     if (previousPath) await refreshWorkspaceAfterExternalPathChange(previousPath);
   }, [
     applyDocumentSessionState,
+    advanceCrashDraftIdentity,
     currentDocumentSessionState,
     refreshWorkspaceAfterExternalPathChange,
     setExternalFileActionState,
+    setSaveConflictState,
     stopAcceptedActiveDocumentWatch,
   ]);
 
@@ -666,10 +836,13 @@ export function useDocumentSession({
             accepted.highestAppliedSequence,
             currentEnvelope.sequence,
           );
-          await applyExternalDocumentDecision(
-            reduceExternalDocumentChange(currentDocumentSessionState(), currentEnvelope),
-            currentEnvelope.sequence,
-          );
+          const decision = reduceExternalDocumentChange(currentDocumentSessionState(), currentEnvelope);
+          await applyExternalDocumentDecision(decision, currentEnvelope.sequence);
+          if (decision.kind === 'apply-document'
+            && currentEnvelope.snapshot.status === 'present'
+            && isEditableFileKind(currentEnvelope.snapshot.file.kind)) {
+            activeFileVersionRef.current = editableFileVersion(currentEnvelope.snapshot.file);
+          }
         },
       });
       return result.status === 'applied';
@@ -1069,31 +1242,55 @@ export function useDocumentSession({
     defaultName: string,
     allowExternalRecovery = false,
   ): Promise<boolean> => {
-    if (!allowExternalRecovery && ordinaryDocumentActionsBlocked()) return false;
+    if (isPopout || (!allowExternalRecovery && ordinaryDocumentActionsBlocked())) return false;
     const document = currentDocumentSessionState();
-    if (document.authorityStatus !== 'committed'
-      || !isEditableFileKind(document.activeFileKind)) return true;
+    if (!isEditableFileKind(document.activeFileKind)) return true;
+    if (document.authorityStatus !== 'committed') return false;
     const contentToSave = document.content;
     const sourcePath = document.activePath;
     const requestedDocumentGeneration = documentGenerationRef.current;
     const requestedWorkspace = getActiveWorkspace();
     const requestedWorkspaceGeneration = workspaceGenerationRef.current;
+    const operationId = createDocumentSaveOperationId();
 
     const result = await executeSessionOperation({
       run: () => saveAsDialog(
         contentToSave,
         defaultName,
+        operationId,
         document.activeFileKind === 'excalidraw' ? 'excalidraw' : undefined,
       ),
-      consume: consumeMutationOutcome,
       isCurrent: () => documentGenerationRef.current === requestedDocumentGeneration
         && activePathRef.current === sourcePath,
       apply: async (outcome) => {
-        if (!outcome || outcome.status !== 'confirmed-committed') return;
+        if (!outcome) return;
+        if (outcome.status !== 'confirmed_committed') {
+          if (outcome.status === 'conflict' && outcome.overwrite_token) {
+            const resumeExternalAction = allowExternalRecovery ? externalFileActionRef.current : null;
+            if (allowExternalRecovery) setExternalFileActionState(null);
+            setSaveConflictState({
+              busy: false,
+              content: contentToSave,
+              documentGeneration: requestedDocumentGeneration,
+              documentId: document.documentId,
+              operationId,
+              overwriteToken: outcome.overwrite_token,
+              path: outcome.path,
+              sourcePath,
+              saveKind: 'save-as',
+              ...(resumeExternalAction ? { resumeExternalAction } : {}),
+            });
+            return;
+          }
+          setError(normalizeAppError(new Error(outcome.message), localeRef.current));
+          if (outcome.status === 'indeterminate') lockDocumentAuthorityUnknown();
+          return;
+        }
 
         documentGenerationRef.current = requestedDocumentGeneration + 1;
-        const savedPath = outcome.receipt.committed.path;
+        const savedPath = outcome.path;
         const savedKind = getEditableFileKindForPath(savedPath);
+        activeFileVersionRef.current = outcome.version;
         applyDocumentSessionState({
           ...currentDocumentSessionState(),
           activeFileKind: savedKind,
@@ -1101,68 +1298,11 @@ export function useDocumentSession({
           activePath: savedPath,
           lastSavedContent: contentToSave,
         });
-
-        if (!requestedWorkspace
-          || !isCurrentWorkspaceRequest(requestedWorkspace, requestedWorkspaceGeneration)) return;
-        try {
-          const receiptError = await reconcileRequestedWorkspaceReceipt(
-            requestedWorkspace,
-            requestedWorkspaceGeneration,
-            outcome.receipt.workspace,
-          );
-          if (receiptError) {
-            setError(receiptError);
-          } else if (outcome.receipt.workspace.status === 'not-applicable') {
-            await refreshWorkspaceDirect(requestedWorkspace, requestedWorkspaceGeneration);
-          }
-        } catch (err) {
-          if (isCurrentWorkspaceRequest(requestedWorkspace, requestedWorkspaceGeneration)) {
-            setError(normalizeAppError(err, localeRef.current));
-          }
+        await cleanupConfirmedCrashDraft(contentToSave);
+        if (outcome.cleanup_repair_receipt) {
+          setNotice('The document was saved, but background cleanup still needs attention.');
         }
-      },
-    });
 
-    return result?.status === 'applied'
-      && result.value?.status === 'confirmed-committed';
-  }, [
-    applyDocumentSessionState,
-    consumeMutationOutcome,
-    currentDocumentSessionState,
-    executeSessionOperation,
-    getActiveWorkspace,
-    isCurrentWorkspaceRequest,
-    ordinaryDocumentActionsBlocked,
-    reconcileRequestedWorkspaceReceipt,
-    refreshWorkspaceDirect,
-  ]);
-
-  const saveCurrentDocument = useCallback(async (): Promise<boolean> => {
-    if (ordinaryDocumentActionsBlocked()) return false;
-    const document = currentDocumentSessionState();
-    if (document.authorityStatus !== 'committed'
-      || !isEditableFileKind(document.activeFileKind)) return true;
-    const pathToSave = document.activePath;
-    if (!pathToSave) {
-      return saveDocumentAs(
-        document.activeFileKind === 'excalidraw' ? 'Untitled.excalidraw' : 'Untitled.md',
-      );
-    }
-
-    const contentToSave = document.content;
-    const requestedDocumentGeneration = documentGenerationRef.current;
-    const requestedWorkspace = getActiveWorkspace();
-    const requestedWorkspaceGeneration = workspaceGenerationRef.current;
-    const result = await executeSessionOperation({
-      run: () => writeFile(pathToSave, contentToSave),
-      isCurrent: () => documentGenerationRef.current === requestedDocumentGeneration
-        && activePathRef.current === pathToSave,
-      apply: async () => {
-        paneStateRef.current = {
-          ...paneStateRef.current,
-          lastSavedContent: contentToSave,
-        };
-        setLastSavedContent(contentToSave);
         if (!requestedWorkspace
           || !isCurrentWorkspaceRequest(requestedWorkspace, requestedWorkspaceGeneration)) return;
         try {
@@ -1174,15 +1314,111 @@ export function useDocumentSession({
         }
       },
     });
-    return result?.status === 'applied';
+
+    return result?.status === 'applied'
+      && result.value?.status === 'confirmed_committed'
+      && paneStateRef.current.content === contentToSave;
   }, [
+    applyDocumentSessionState,
+    cleanupConfirmedCrashDraft,
     currentDocumentSessionState,
     executeSessionOperation,
     getActiveWorkspace,
     isCurrentWorkspaceRequest,
+    isPopout,
+    lockDocumentAuthorityUnknown,
+    ordinaryDocumentActionsBlocked,
+    refreshWorkspaceDirect,
+    setSaveConflictState,
+    setExternalFileActionState,
+  ]);
+
+  const saveCurrentDocument = useCallback(async (): Promise<boolean> => {
+    if (isPopout || ordinaryDocumentActionsBlocked()) return false;
+    const document = currentDocumentSessionState();
+    if (!isEditableFileKind(document.activeFileKind)) return true;
+    if (document.authorityStatus !== 'committed') return false;
+    const pathToSave = document.activePath;
+    if (!pathToSave) {
+      return saveDocumentAs(
+        document.activeFileKind === 'excalidraw' ? 'Untitled.excalidraw' : 'Untitled.md',
+      );
+    }
+
+    const contentToSave = document.content;
+    const expectedVersion = activeFileVersionRef.current;
+    if (!expectedVersion) {
+      setError('The current file version is unavailable. Reopen the document before saving.');
+      return false;
+    }
+    const operationId = createDocumentSaveOperationId();
+    const requestedDocumentGeneration = documentGenerationRef.current;
+    const requestedWorkspace = getActiveWorkspace();
+    const requestedWorkspaceGeneration = workspaceGenerationRef.current;
+    const result = await executeSessionOperation({
+      run: () => writeFile(pathToSave, contentToSave, expectedVersion, operationId),
+      isCurrent: () => documentGenerationRef.current === requestedDocumentGeneration
+        && activePathRef.current === pathToSave,
+      apply: async (outcome) => {
+        if (outcome.status === 'conflict') {
+          setAutosaveBlockedContent(contentToSave);
+          setSaveConflictState({
+            busy: false,
+            content: contentToSave,
+            documentGeneration: requestedDocumentGeneration,
+            documentId: document.documentId,
+            operationId,
+            path: pathToSave,
+            sourcePath: pathToSave,
+            saveKind: 'same-file',
+          });
+          return;
+        }
+        if (outcome.status !== 'confirmed_committed') {
+          setAutosaveBlockedContent(contentToSave);
+          setError(normalizeAppError(new Error(outcome.message), localeRef.current));
+          if (outcome.status === 'indeterminate') lockDocumentAuthorityUnknown();
+          return;
+        }
+        activeFileVersionRef.current = outcome.version;
+        setAutosaveBlockedContent(null);
+        paneStateRef.current = {
+          ...paneStateRef.current,
+          lastSavedContent: contentToSave,
+        };
+        setLastSavedContent(contentToSave);
+        await cleanupConfirmedCrashDraft(contentToSave);
+        if (outcome.cleanup_repair_receipt) {
+          setNotice('The document was saved, but background cleanup still needs attention.');
+        }
+        if (!requestedWorkspace
+          || !isCurrentWorkspaceRequest(requestedWorkspace, requestedWorkspaceGeneration)) return;
+        try {
+          await refreshWorkspaceDirect(requestedWorkspace, requestedWorkspaceGeneration);
+        } catch (err) {
+          if (isCurrentWorkspaceRequest(requestedWorkspace, requestedWorkspaceGeneration)) {
+            setError(normalizeAppError(err, localeRef.current));
+          }
+        }
+      },
+    });
+    const saved = result?.status === 'applied'
+      && result.value.status === 'confirmed_committed'
+      && paneStateRef.current.content === contentToSave;
+    if (!saved) setAutosaveBlockedContent(contentToSave);
+    return saved;
+  }, [
+    cleanupConfirmedCrashDraft,
+    currentDocumentSessionState,
+    executeSessionOperation,
+    getActiveWorkspace,
+    isCurrentWorkspaceRequest,
+    isPopout,
+    lockDocumentAuthorityUnknown,
     ordinaryDocumentActionsBlocked,
     refreshWorkspaceDirect,
     saveDocumentAs,
+    setSaveConflictState,
   ]);
 
   const handleSave = useCallback(async () => {
@@ -1212,15 +1448,25 @@ export function useDocumentSession({
       lastSavedContent: EMPTY_MARKDOWN,
       previewRevision: 0,
     });
-  }, [applyDocumentSessionState, currentDocumentSessionState]);
+    activeFileVersionRef.current = null;
+    setSaveConflictState(null);
+  }, [applyDocumentSessionState, currentDocumentSessionState, setSaveConflictState]);
 
-  const handleNew = useCallback(() => {
+  const handleNew = useCallback(async () => {
     if (ordinaryDocumentActionsBlocked()) return;
+    const priorCrashDocumentId = crashDraftDocumentIdRef.current;
+    try {
+      await crashDraftSchedulerRef.current?.flush(priorCrashDocumentId);
+    } catch {
+      setError('The recovery draft could not be saved. The current document remains open.');
+      return;
+    }
     documentOpenRequestRef.current += 1;
     documentGenerationRef.current += 1;
     clearActiveDocument();
+    advanceCrashDraftIdentity(priorCrashDocumentId);
     setError(null);
-  }, [clearActiveDocument, ordinaryDocumentActionsBlocked]);
+  }, [advanceCrashDraftIdentity, clearActiveDocument, ordinaryDocumentActionsBlocked]);
 
   const resolveExternalConflict = useCallback(async (choice: 'keep-current' | 'use-external') => {
     const action = externalFileActionRef.current;
@@ -1261,12 +1507,27 @@ export function useDocumentSession({
             current.highestAppliedSequence,
             envelope.sequence,
           );
+          if (choice === 'use-external' && envelope.snapshot.status === 'present') {
+            activeFileVersionRef.current = editableFileVersion(envelope.snapshot.file);
+          }
           setExternalFileActionState(null);
           const currentDocument = currentDocumentSessionState();
           const decision = choice === 'keep-current'
             ? resolveKeepCurrent(currentDocument, envelope)
             : resolveUseExternal(currentDocument, envelope);
           await applyExternalDocumentDecision(decision, envelope.sequence);
+          if (choice === 'keep-current' && envelope.snapshot.status === 'present') {
+            setSaveConflictState({
+              busy: false,
+              content: currentDocument.content,
+              documentGeneration: accepted.documentGeneration,
+              documentId: currentDocument.documentId,
+              operationId: createDocumentSaveOperationId(),
+              path: envelope.snapshot.file.path,
+              sourcePath: envelope.snapshot.file.path,
+              saveKind: 'same-file',
+            });
+          }
         },
       });
     } catch (watchError) {
@@ -1280,12 +1541,121 @@ export function useDocumentSession({
     currentDocumentSessionState,
     envelopeMatchesAcceptedPath,
     sessionQueue,
+    setSaveConflictState,
+    setExternalFileActionState,
+  ]);
+
+  const handleCancelSaveConflict = useCallback(() => {
+    const pending = saveConflictRef.current;
+    if (!pending || pending.busy) return;
+    setSaveConflictState(null);
+    if (pending.resumeExternalAction) setExternalFileActionState(pending.resumeExternalAction);
+    if (pending.overwriteToken) {
+      void cancelDocumentOverwriteToken(pending.path, pending.overwriteToken).catch(() => undefined);
+    }
+  }, [setExternalFileActionState, setSaveConflictState]);
+
+  const handleOverwriteSaveConflict = useCallback(async () => {
+    const pending = saveConflictRef.current;
+    if (!pending || pending.busy || isPopout) return;
+    setSaveConflictState({ ...pending, busy: true });
+    const isPendingCurrent = () => {
+      const current = saveConflictRef.current;
+      return current?.operationId === pending.operationId
+        && current.documentId === pending.documentId
+        && documentGenerationRef.current === pending.documentGeneration
+        && activePathRef.current === pending.sourcePath
+        && externalFileActionRef.current === null;
+    };
+    const result = await executeSessionOperation({
+      run: async () => {
+        if (!isPendingCurrent()) return null;
+        const issuedToken = pending.overwriteToken ?? (await issueDocumentOverwriteToken(
+          pending.path, pending.content, pending.operationId,
+        )).overwriteToken;
+        if (!isPendingCurrent()) {
+          await cancelDocumentOverwriteToken(pending.path, issuedToken).catch(() => undefined);
+          return null;
+        }
+        try {
+          return await retryDocumentSaveWithToken(
+            pending.path,
+            pending.content,
+            pending.operationId,
+            issuedToken,
+          );
+        } catch (retryError) {
+          await cancelDocumentOverwriteToken(pending.path, issuedToken).catch(() => undefined);
+          throw retryError;
+        }
+      },
+      isCurrent: isPendingCurrent,
+      apply: async (outcome) => {
+        if (!outcome) return;
+        if (outcome.status !== 'confirmed_committed') {
+          setError(normalizeAppError(new Error(outcome.message), localeRef.current));
+          setSaveConflictState(null);
+          if (outcome.status !== 'indeterminate' && pending.resumeExternalAction) {
+            setExternalFileActionState(pending.resumeExternalAction);
+          }
+          if (outcome.status === 'indeterminate') {
+            lockDocumentAuthorityUnknown();
+          }
+          return;
+        }
+        activeFileVersionRef.current = outcome.version;
+        if (pending.saveKind === 'save-as') {
+          documentGenerationRef.current = pending.documentGeneration + 1;
+          const savedKind = getEditableFileKindForPath(outcome.path);
+          applyDocumentSessionState({
+            ...currentDocumentSessionState(),
+            activeFileKind: savedKind,
+            activeMimeType: savedKind === 'html' ? 'text/html' : null,
+            activePath: outcome.path,
+            lastSavedContent: pending.content,
+          });
+        } else {
+          paneStateRef.current = { ...paneStateRef.current, lastSavedContent: pending.content };
+          setLastSavedContent(pending.content);
+        }
+        setSaveConflictState(null);
+        await cleanupConfirmedCrashDraft(pending.content);
+        if (outcome.cleanup_repair_receipt) {
+          setNotice('The document was saved, but background cleanup still needs attention.');
+        }
+        const workspace = getActiveWorkspace();
+        if (!workspace) return;
+        const generation = workspaceGenerationRef.current;
+        try {
+          await refreshWorkspaceDirect(workspace, generation);
+        } catch (refreshError) {
+          if (isCurrentWorkspaceRequest(workspace, generation)) {
+            setError(normalizeAppError(refreshError, localeRef.current));
+          }
+        }
+      },
+    });
+    if (!result && saveConflictRef.current?.operationId === pending.operationId) {
+      setSaveConflictState({ ...pending, busy: false });
+    }
+  }, [
+    cleanupConfirmedCrashDraft,
+    applyDocumentSessionState,
+    currentDocumentSessionState,
+    executeSessionOperation,
+    getActiveWorkspace,
+    isCurrentWorkspaceRequest,
+    isPopout,
+    lockDocumentAuthorityUnknown,
+    refreshWorkspaceDirect,
+    setSaveConflictState,
     setExternalFileActionState,
   ]);
 
   const handleKeepCurrentExternal = useCallback(async () => {
     await resolveExternalConflict('keep-current');
-  }, [resolveExternalConflict]);
+    await handleOverwriteSaveConflict();
+  }, [handleOverwriteSaveConflict, resolveExternalConflict]);
 
   const handleUseExternal = useCallback(async () => {
     await resolveExternalConflict('use-external');
@@ -1312,15 +1682,20 @@ export function useDocumentSession({
     if (externalFileActionRef.current?.kind !== 'deleted-draft') return;
     setExternalFileActionBusy(true);
     try {
+      const priorCrashDocumentId = crashDraftDocumentIdRef.current;
+      await crashDraftSchedulerRef.current?.flush(priorCrashDocumentId);
       await stopAcceptedActiveDocumentWatch();
       setExternalFileActionState(null);
       documentOpenRequestRef.current += 1;
       documentGenerationRef.current += 1;
       clearActiveDocument();
+      advanceCrashDraftIdentity(priorCrashDocumentId);
+    } catch {
+      setError('The recovery draft could not be saved. The current document remains open.');
     } finally {
       setExternalFileActionBusy(false);
     }
-  }, [clearActiveDocument, setExternalFileActionState, stopAcceptedActiveDocumentWatch]);
+  }, [advanceCrashDraftIdentity, clearActiveDocument, setExternalFileActionState, stopAcceptedActiveDocumentWatch]);
 
   const createFileInWorkspace = useCallback(async (
     parentPath: string,
@@ -1348,8 +1723,11 @@ export function useDocumentSession({
       apply: async (outcome) => {
         if (outcome.status !== 'confirmed-committed') return;
         if (documentGenerationRef.current === requestedDocumentGeneration) {
+          const priorCrashDocumentId = crashDraftDocumentIdRef.current;
+          await crashDraftSchedulerRef.current?.flush(priorCrashDocumentId);
           documentGenerationRef.current = requestedDocumentGeneration + 1;
           applyOpenFileResponse(outcome.receipt.committed);
+          advanceCrashDraftIdentity(priorCrashDocumentId);
         }
         const receiptError = await reconcileRequestedWorkspaceReceipt(
           requestedWorkspace,
@@ -1361,6 +1739,7 @@ export function useDocumentSession({
     });
   }, [
     applyOpenFileResponse,
+    advanceCrashDraftIdentity,
     consumeMutationOutcome,
     executeSessionOperation,
     getActiveWorkspace,
@@ -1546,10 +1925,58 @@ export function useDocumentSession({
       content: nextContent,
     };
     setContent(nextContent);
+    setAutosaveBlockedContent(null);
     if (isPopout && popoutPane === 'editor') {
       paneReplicationRef.current?.publishEditorContent(nextContent);
     }
   }, [currentDocumentSessionState, isPopout, popoutPane]);
+
+  const recoverCrashDraft = useCallback(async (draft: CrashDraftRecoverResponse) => {
+    if (isPopout) return;
+    const priorCrashDocumentId = crashDraftDocumentIdRef.current;
+    await crashDraftSchedulerRef.current?.flush(priorCrashDocumentId);
+    await stopAcceptedActiveDocumentWatch();
+    documentOpenRequestRef.current += 1;
+    documentGenerationRef.current += 1;
+    crashDraftSchedulerRef.current?.invalidate(priorCrashDocumentId);
+    crashDraftDocumentIdRef.current = draft.documentId;
+    forcedDirtyCrashDraftIdRef.current = draft.documentId;
+    activeFileVersionRef.current = null;
+    const current = currentDocumentSessionState();
+    applyDocumentSessionState({
+      documentId: createPaneProtocolId('pane-document'),
+      documentEpoch: current.documentEpoch + 1,
+      authorityStatus: 'committed',
+      activeFileKind: draft.fileKind,
+      activeMimeType: draft.fileKind === 'html' ? 'text/html' : null,
+      activePath: null,
+      bytesBase64: null,
+      content: draft.content,
+      lastSavedContent: draft.content,
+      previewRevision: 0,
+    });
+    setExternalFileActionState(null);
+    setSaveConflictState(null);
+  }, [
+    applyDocumentSessionState,
+    currentDocumentSessionState,
+    isPopout,
+    setExternalFileActionState,
+    setSaveConflictState,
+    stopAcceptedActiveDocumentWatch,
+  ]);
+
+  const seedCrashDraftRevision = useCallback((documentId: string, revision: number, entryToken: string) => {
+    crashDraftSchedulerRef.current?.seedRevision(documentId, revision, entryToken);
+  }, []);
+
+  const getCrashDraftStoredEntryToken = useCallback((documentId: string) => (
+    crashDraftSchedulerRef.current?.getStoredEntryToken(documentId) ?? null
+  ), []);
+
+  const confirmCrashDraftDiscarded = useCallback((documentId: string, entryToken: string) => {
+    crashDraftSchedulerRef.current?.confirmDiscarded(documentId, entryToken);
+  }, []);
 
   const externalFileActionDialog = useMemo<ExternalFileActionDialogState | null>(() => {
     if (!externalFileAction) return null;
@@ -1562,6 +1989,56 @@ export function useDocumentSession({
       path,
     };
   }, [externalFileAction, externalFileActionBusy]);
+
+  const saveConflictDialog = useMemo<DocumentSaveConflictDialogState | null>(() => (
+    saveConflict ? { busy: saveConflict.busy, path: saveConflict.path } : null
+  ), [saveConflict]);
+
+  useEffect(() => {
+    if (isPopout
+      || !dirty
+      || authorityStatus !== 'committed'
+      || !isEditableFileKind(activeFileKind)) return;
+    const version = activeFileVersionRef.current;
+    if (activePath && !version) return;
+    try {
+      scheduleCurrentCrashDraft();
+    } catch {
+      setError('Crash recovery could not save the current edits. Your work remains in the editor.');
+    }
+  }, [activeFileKind, activePath, authorityStatus, content, dirty, documentIdentity.documentEpoch, isPopout, scheduleCurrentCrashDraft]);
+
+  useEffect(() => {
+    if (isPopout
+      || !autosaveEnabled
+      || !dirty
+      || !activePath
+      || !isEditableFileKind(activeFileKind)
+      || authorityStatus !== 'committed'
+      || !activeFileVersionRef.current
+      || externalFileAction !== null
+      || saveConflict !== null
+      || autosaveBlockedContent === content
+      || busy) return undefined;
+    const timer = globalThis.setTimeout(() => {
+      void saveCurrentDocument();
+    }, Math.max(250, Math.min(60_000, autosaveDelayMs)));
+    return () => globalThis.clearTimeout(timer);
+  }, [
+    activeFileKind,
+    activePath,
+    authorityStatus,
+    autosaveDelayMs,
+    autosaveEnabled,
+    autosaveBlockedContent,
+    busy,
+    content,
+    dirty,
+    externalFileAction,
+    isPopout,
+    saveConflict,
+    saveCurrentDocument,
+  ]);
 
   return {
     activeFileKind,
@@ -1583,6 +2060,7 @@ export function useDocumentSession({
     files,
     fileTree,
     flushWorkspaceSession,
+    flushCrashDraft,
     handleNew,
     handleOpenDirectory,
     handleOpenFile,
@@ -1590,6 +2068,8 @@ export function useDocumentSession({
     handleClearRecent,
     handleCloseDeletedDraft,
     handleKeepCurrentExternal,
+    handleCancelSaveConflict,
+    handleOverwriteSaveConflict,
     handleSave,
     handleSaveAs,
     handleSaveDeletedDraftAs,
@@ -1601,7 +2081,12 @@ export function useDocumentSession({
     previewRevision,
     renameWorkspaceEntryPath,
     refreshWorkspace,
+    recoverCrashDraft,
     saveCurrentDocument,
+    saveConflict: saveConflictDialog,
+    seedCrashDraftRevision,
+    getCrashDraftStoredEntryToken,
+    confirmCrashDraftDiscarded,
     setError,
     setNotice,
     updateContent,

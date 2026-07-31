@@ -1,8 +1,11 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{excalidraw_scene::validate_excalidraw_scene, models::OpenFileResponse};
+use crate::{
+    durable_write::read_versioned_file, excalidraw_scene::validate_excalidraw_scene,
+    models::OpenFileResponse,
+};
 
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "mdx", "markdown", "mdown", "mkd"];
 const HTML_EXTENSIONS: &[&str] = &["html", "htm", "xhtml"];
@@ -138,12 +141,16 @@ impl WorkspaceFileKind {
             return Err("PDF and DOCX responses require validated binary bytes".to_string());
         }
         let content_mode = self.content_mode();
-        let content = match content_mode {
-            ContentMode::Text => Some(
-                fs::read_to_string(path)
-                    .map_err(|error| format!("Failed to read file: {error}"))?,
-            ),
-            ContentMode::Binary => None,
+        let (content, file_version) = match content_mode {
+            ContentMode::Text => {
+                let observed = read_versioned_file(path, usize::MAX)
+                    .map_err(|error| format!("Failed to read stable file contents: {error}"))?
+                    .ok_or_else(|| "Path is not a file".to_string())?;
+                let content = String::from_utf8(observed.bytes)
+                    .map_err(|_| "Failed to read file: content is not valid UTF-8".to_string())?;
+                (Some(content), Some(observed.version))
+            }
+            ContentMode::Binary => (None, None),
         };
         if self == Self::Excalidraw {
             let scene = content
@@ -155,6 +162,7 @@ impl WorkspaceFileKind {
             kind: self,
             path: path.to_string_lossy().to_string(),
             content_mode,
+            file_version,
             content,
             mime_type: self.mime_type(path),
             bytes_base64: None,

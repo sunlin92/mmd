@@ -185,6 +185,13 @@ export function isEditableFileKind(
   return kind === 'markdown' || kind === 'html' || kind === 'excalidraw';
 }
 
+let documentSaveOperationSequence = 0;
+
+export function createDocumentSaveOperationId(): string {
+  documentSaveOperationSequence = (documentSaveOperationSequence + 1) % Number.MAX_SAFE_INTEGER;
+  return `document-save-${Date.now().toString(36)}-${documentSaveOperationSequence.toString(36)}`;
+}
+
 export function getEditableFileKindForPath(
   path: string,
 ): Extract<WorkspaceFileKind, 'markdown' | 'html' | 'excalidraw'> {
@@ -393,7 +400,13 @@ export async function deleteWorkspaceEntryAndReconcile(
     return null;
   }
   if (outcome.status !== 'confirmed-committed') {
-    return outcome.status === 'confirmed-not-committed' ? outcome.message : outcome.recovery_message;
+    if (outcome.status === 'confirmed-not-committed') return outcome.message;
+    try {
+      await ports.refresh();
+    } catch {
+      // The recovery message remains the authoritative user-facing guidance.
+    }
+    return outcome.recovery_message;
   }
 
   const { committed, workspace } = outcome.receipt;

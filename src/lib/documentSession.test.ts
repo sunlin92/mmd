@@ -12,6 +12,7 @@ import type {
 import {
   applyWorkspaceSelection,
   createProvisionalDocumentTransition,
+  createDocumentSaveOperationId,
   createWorkspaceDirectoryAndReconcile,
   deleteWorkspaceEntryAndReconcile,
   getEditableFileKindForPath,
@@ -29,6 +30,10 @@ import {
   resolveOpenCommitOutcome,
 } from './documentSession';
 
+const fileVersion = {
+  canonicalPath: '/workspace/notes.md', platformIdentity: '1', length: '7', modifiedNanos: '1', sha256: 'c'.repeat(64),
+};
+
 describe('document session state', () => {
   const preparedOpen: PreparedOpenFileResponse = {
     file: {
@@ -36,10 +41,19 @@ describe('document session state', () => {
       path: '/workspace/opened.md',
       content_mode: 'text',
       content: '# Opened',
+      file_version: fileVersion,
     },
     open_receipt: '11111111111111111111111111111111',
     commit_operation_id: '22222222222222222222222222222222',
   };
+
+  it('creates fresh bounded save operation identifiers', () => {
+    const first = createDocumentSaveOperationId();
+    const second = createDocumentSaveOperationId();
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/^document-save-[a-z0-9]+-[a-z0-9]+$/);
+    expect(first.length).toBeLessThanOrEqual(64);
+  });
 
   it('advances document generation only for a prepared winner', () => {
     expect(nextPreparedOpenGeneration(4, 4, preparedOpen)).toBe(5);
@@ -68,6 +82,7 @@ describe('document session state', () => {
         path: '/workspace/page.html',
         content_mode: 'text',
         content: '<h1>Page</h1>',
+        file_version: fileVersion,
         mime_type: 'text/html',
       },
       { documentId: 'document-new', documentEpoch: 8 },
@@ -241,6 +256,7 @@ describe('document session state', () => {
       path: '/workspace/site/index.html',
       content_mode: 'text',
       content: '<h1>Hello</h1>',
+      file_version: fileVersion,
       mime_type: 'text/html',
     });
 
@@ -707,6 +723,45 @@ describe('document session state', () => {
     expect(deleteEntry).toHaveBeenCalledWith('workspace-old', '/workspace/old/drafts');
     expect(clearActiveDocument).not.toHaveBeenCalled();
     expect(applySnapshot).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('refreshes after an indeterminate delete before returning recovery guidance', async () => {
+    const requestedWorkspace = { workspaceToken: 'workspace-7', workspaceRoot: '/workspace' };
+    const refresh = vi.fn<() => Promise<void>>(async () => undefined);
+    const recoveryMessage = 'Refresh and inspect the workspace before retrying.';
+    await expect(deleteWorkspaceEntryAndReconcile(
+      requestedWorkspace,
+      '/workspace/note.md',
+      {
+        deleteEntry: async () => ({
+          status: 'indeterminate', operation: 'delete', paths: ['/workspace/note.md'], recovery_message: recoveryMessage,
+        }),
+        getCurrentWorkspace: () => requestedWorkspace,
+        getActivePath: () => '/workspace/note.md',
+        clearActiveDocument: vi.fn<() => void>(),
+        applySnapshot: vi.fn<(snapshot: WorkspaceSnapshot) => void>(),
+        refresh,
+      },
+    )).resolves.toBe(recoveryMessage);
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('does not refresh after a confirmed-not-committed delete', async () => {
+    const requestedWorkspace = { workspaceToken: 'workspace-7', workspaceRoot: '/workspace' };
+    const refresh = vi.fn<() => Promise<void>>(async () => undefined);
+    await expect(deleteWorkspaceEntryAndReconcile(
+      requestedWorkspace,
+      '/workspace/note.md',
+      {
+        deleteEntry: async () => ({ status: 'confirmed-not-committed', message: 'Delete rejected.' }),
+        getCurrentWorkspace: () => requestedWorkspace,
+        getActivePath: () => '/workspace/note.md',
+        clearActiveDocument: vi.fn<() => void>(),
+        applySnapshot: vi.fn<(snapshot: WorkspaceSnapshot) => void>(),
+        refresh,
+      },
+    )).resolves.toBe('Delete rejected.');
     expect(refresh).not.toHaveBeenCalled();
   });
 

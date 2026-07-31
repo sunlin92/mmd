@@ -1,5 +1,6 @@
 import type {
   DeleteWorkspaceEntryResponse,
+  FileVersion,
   MutationOutcome,
   OpenFileResponse,
   RenameWorkspaceEntryResponse,
@@ -17,6 +18,38 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonBlankString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+const U64_MAX = '18446744073709551615';
+const U128_MAX = '340282366920938463463374607431768211455';
+
+function isCanonicalDecimalWithin(value: unknown, maximum: string): value is string {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  return value.length < maximum.length || (value.length === maximum.length && value <= maximum);
+}
+
+export function decodeFileVersion(value: unknown): FileVersion {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['canonicalPath', 'platformIdentity', 'length', 'modifiedNanos', 'sha256']) ||
+    typeof value.canonicalPath !== 'string' ||
+    value.canonicalPath.length === 0 ||
+    typeof value.platformIdentity !== 'string' ||
+    value.platformIdentity.length === 0 ||
+    !isCanonicalDecimalWithin(value.length, U64_MAX) ||
+    !isCanonicalDecimalWithin(value.modifiedNanos, U128_MAX) ||
+    typeof value.sha256 !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(value.sha256)
+  ) {
+    throw new Error('Invalid file version');
+  }
+  return {
+    canonicalPath: value.canonicalPath,
+    platformIdentity: value.platformIdentity,
+    length: value.length,
+    modifiedNanos: value.modifiedNanos,
+    sha256: value.sha256,
+  };
 }
 
 function hasExactKeys(value: Record<string, unknown>, expectedKeys: readonly string[]): boolean {
@@ -124,11 +157,21 @@ export function decodeOpenFileResponse(value: unknown): OpenFileResponse {
     if (
       value.content_mode !== 'text' ||
       typeof value.content !== 'string' ||
-      !hasExactKeys(value, ['kind', 'path', 'content_mode', 'content'])
+      !hasExactKeys(value, ['kind', 'path', 'content_mode', 'file_version', 'content'])
     ) {
       return invalidOpenFileResponse();
     }
-    return { kind, path: value.path, content_mode: 'text', content: value.content };
+    try {
+      return {
+        kind,
+        path: value.path,
+        content_mode: 'text',
+        file_version: decodeFileVersion(value.file_version),
+        content: value.content,
+      };
+    } catch {
+      return invalidOpenFileResponse();
+    }
   }
 
   if (kind === 'html') {
@@ -136,17 +179,22 @@ export function decodeOpenFileResponse(value: unknown): OpenFileResponse {
       value.content_mode !== 'text' ||
       typeof value.content !== 'string' ||
       !isNonBlankString(value.mime_type) ||
-      !hasExactKeys(value, ['kind', 'path', 'content_mode', 'content', 'mime_type'])
+      !hasExactKeys(value, ['kind', 'path', 'content_mode', 'file_version', 'content', 'mime_type'])
     ) {
       return invalidOpenFileResponse();
     }
-    return {
-      kind,
-      path: value.path,
-      content_mode: 'text',
-      content: value.content,
-      mime_type: value.mime_type,
-    };
+    try {
+      return {
+        kind,
+        path: value.path,
+        content_mode: 'text',
+        file_version: decodeFileVersion(value.file_version),
+        content: value.content,
+        mime_type: value.mime_type,
+      };
+    } catch {
+      return invalidOpenFileResponse();
+    }
   }
 
   if (kind === 'pdf' || kind === 'docx') {

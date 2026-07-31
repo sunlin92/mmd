@@ -40,6 +40,9 @@ const tauriMocks = vi.hoisted(() => ({
   deleteWorkspaceEntry: vi.fn<typeof import('../lib/tauriCommands').deleteWorkspaceEntry>(),
   discardOpenReceipt: vi.fn<typeof import('../lib/tauriCommands').discardOpenReceipt>(),
   getOpenCommitStatus: vi.fn<typeof import('../lib/tauriCommands').getOpenCommitStatus>(),
+  issueDocumentOverwriteToken: vi.fn<typeof import('../lib/tauriCommands').issueDocumentOverwriteToken>(),
+  retryDocumentSaveWithToken: vi.fn<typeof import('../lib/tauriCommands').retryDocumentSaveWithToken>(),
+  cancelDocumentOverwriteToken: vi.fn<typeof import('../lib/tauriCommands').cancelDocumentOverwriteToken>(),
   moveWorkspaceEntry: vi.fn<typeof import('../lib/tauriCommands').moveWorkspaceEntry>(),
   openDirectoryDialog: vi.fn<typeof import('../lib/tauriCommands').openDirectoryDialog>(),
   openFileDialog: vi.fn<typeof import('../lib/tauriCommands').openFileDialog>(),
@@ -51,6 +54,9 @@ const tauriMocks = vi.hoisted(() => ({
   restoreWorkspaceSession: vi.fn<typeof import('../lib/tauriCommands').restoreWorkspaceSession>(),
   saveAsDialog: vi.fn<typeof import('../lib/tauriCommands').saveAsDialog>(),
   writeFile: vi.fn<typeof import('../lib/tauriCommands').writeFile>(),
+}));
+const crashDraftMocks = vi.hoisted(() => ({
+  write: vi.fn<(request: import('../lib/crashDrafts').CrashDraftWriteRequest) => Promise<unknown>>(),
 }));
 
 const paneMocks = vi.hoisted(() => ({
@@ -70,6 +76,7 @@ vi.mock('../lib/documentSession', async (importOriginal) => {
 });
 
 vi.mock('../lib/tauriCommands', () => tauriMocks);
+vi.mock('../lib/crashDraftCommands', () => ({ crashDraftCommands: { write: crashDraftMocks.write } }));
 
 vi.mock('../lib/tauriPaneReplication', () => ({
   createPaneProtocolId: paneMocks.createPaneProtocolId,
@@ -86,15 +93,24 @@ interface Deferred<T> {
 }
 
 let currentSession: Session | null = null;
+const fileVersion = {
+  canonicalPath: '/workspace/notes.md', platformIdentity: '1', length: '7', modifiedNanos: '1', sha256: 'a'.repeat(64),
+};
 
-function SessionHarness({ isPopout = false, popoutPane = 'main' }: {
+function SessionHarness({ isPopout = false, popoutPane = 'main', autosaveEnabled, autosaveDelayMs, afterConfirmedSave }: {
   isPopout?: boolean;
   popoutPane?: 'main' | 'editor' | 'preview';
+  autosaveEnabled?: boolean;
+  autosaveDelayMs?: number;
+  afterConfirmedSave?: (documentId: string) => boolean | void | Promise<boolean | void>;
 }) {
   currentSession = useDocumentSession({
     activeDocumentWatchTransport: null,
     isPopout,
     popoutPane,
+    autosaveEnabled,
+    autosaveDelayMs,
+    afterConfirmedSave,
   });
   return null;
 }
@@ -121,6 +137,7 @@ function preparedOpen(
     path: `/workspace/${name}.md`,
     content_mode: 'text',
     content: `# ${name}`,
+    file_version: fileVersion,
   },
 ): PreparedOpenFileResponse {
   return {
@@ -241,6 +258,9 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     tauriMocks.deleteWorkspaceEntry.mockReset();
     tauriMocks.discardOpenReceipt.mockReset();
     tauriMocks.getOpenCommitStatus.mockReset();
+    tauriMocks.issueDocumentOverwriteToken.mockReset();
+    tauriMocks.retryDocumentSaveWithToken.mockReset();
+    tauriMocks.cancelDocumentOverwriteToken.mockReset();
     tauriMocks.moveWorkspaceEntry.mockReset();
     tauriMocks.openDirectoryDialog.mockReset();
     tauriMocks.openFileDialog.mockReset();
@@ -252,16 +272,26 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     tauriMocks.restoreWorkspaceSession.mockReset();
     tauriMocks.saveAsDialog.mockReset();
     tauriMocks.writeFile.mockReset();
+    crashDraftMocks.write.mockReset();
+    crashDraftMocks.write.mockImplementation(async (request) => ({
+      status: 'stored', documentId: request.documentId, draftRevision: request.draftRevision,
+      entryToken: '9'.repeat(64), updatedAtUnixMs: 1, evictedDocumentIds: [],
+    }));
 
     tauriMocks.clearRecentFiles.mockResolvedValue({ entries: [] });
     tauriMocks.commitRecentOpen.mockResolvedValue(committed());
     tauriMocks.discardOpenReceipt.mockResolvedValue(true);
     tauriMocks.getOpenCommitStatus.mockResolvedValue({ status: 'unknown' });
+    tauriMocks.issueDocumentOverwriteToken.mockResolvedValue({ overwriteToken: 'e'.repeat(64) });
+    tauriMocks.retryDocumentSaveWithToken.mockResolvedValue({ status: 'confirmed_committed', path: '/workspace/notes.md', version: fileVersion });
+    tauriMocks.cancelDocumentOverwriteToken.mockResolvedValue(undefined);
     tauriMocks.openFileDialog.mockResolvedValue(null);
     tauriMocks.persistWorkspaceSession.mockResolvedValue(undefined);
     tauriMocks.restoreWorkspaceSession.mockResolvedValue(null);
     tauriMocks.saveAsDialog.mockResolvedValue(null);
-    tauriMocks.writeFile.mockResolvedValue(undefined);
+    tauriMocks.writeFile.mockResolvedValue({
+      status: 'confirmed_committed', path: '/workspace/notes.md', version: fileVersion,
+    });
 
     paneMocks.instances.splice(0);
     paneMocks.createPaneProtocolId.mockReset();
@@ -333,6 +363,387 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     },
   );
 
+  it('saves with the opened version and resolves a conflict only after explicit overwrite', async () => {
+    const afterConfirmedSave = vi.fn<(documentId: string) => void>();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.writeFile.mockResolvedValueOnce({
+      status: 'conflict', path: '/workspace/notes.md', current_version: fileVersion, message: 'changed',
+    });
+    act(() => root.render(<SessionHarness afterConfirmedSave={afterConfirmedSave} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Dirty'));
+
+    await act(async () => session().handleSave());
+
+    expect(tauriMocks.writeFile).toHaveBeenCalledWith(
+      '/workspace/notes.md', '# Dirty', fileVersion, expect.stringMatching(/^document-save-/),
+    );
+    expect(session().dirty).toBe(true);
+    expect(session().saveConflict).toEqual({ busy: false, path: '/workspace/notes.md' });
+    expect(afterConfirmedSave).not.toHaveBeenCalled();
+
+    await act(async () => session().handleOverwriteSaveConflict());
+
+    const operationId = tauriMocks.writeFile.mock.calls[0]?.[3];
+    expect(tauriMocks.issueDocumentOverwriteToken).toHaveBeenCalledWith(
+      '/workspace/notes.md', '# Dirty', operationId,
+    );
+    expect(tauriMocks.retryDocumentSaveWithToken).toHaveBeenCalledWith(
+      '/workspace/notes.md', '# Dirty', operationId, 'e'.repeat(64),
+    );
+    expect(session().dirty).toBe(false);
+    expect(session().saveConflict).toBeNull();
+    expect(afterConfirmedSave).toHaveBeenCalledWith(expect.stringMatching(/^[0-9a-f]{32}$/));
+  });
+
+  it('cancels an ordinary save conflict without issuing an overwrite token', async () => {
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.writeFile.mockResolvedValueOnce({
+      status: 'conflict', path: '/workspace/notes.md', message: 'changed',
+    });
+    act(() => root.render(<SessionHarness />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Dirty'));
+    await act(async () => session().handleSave());
+
+    act(() => session().handleCancelSaveConflict());
+
+    expect(session().saveConflict).toBeNull();
+    expect(session().dirty).toBe(true);
+    expect(tauriMocks.issueDocumentOverwriteToken).not.toHaveBeenCalled();
+    expect(tauriMocks.cancelDocumentOverwriteToken).not.toHaveBeenCalled();
+  });
+
+  it('locks the document after an indeterminate overwrite and cannot replay the decision', async () => {
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.writeFile.mockResolvedValueOnce({ status: 'conflict', path: '/workspace/notes.md', message: 'changed' });
+    tauriMocks.retryDocumentSaveWithToken.mockResolvedValueOnce({
+      status: 'indeterminate', path: '/workspace/notes.md', message: 'Inspect the file before continuing.',
+    });
+    act(() => root.render(<SessionHarness />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Dirty'));
+    await act(async () => session().handleSave());
+    await act(async () => session().handleOverwriteSaveConflict());
+    await act(async () => session().handleOverwriteSaveConflict());
+
+    expect(session().authorityStatus).toBe('unknown');
+    expect(session().dirty).toBe(true);
+    expect(session().saveConflict).toBeNull();
+    expect(tauriMocks.issueDocumentOverwriteToken).toHaveBeenCalledOnce();
+    expect(tauriMocks.retryDocumentSaveWithToken).toHaveBeenCalledOnce();
+  });
+
+  it('uses and cancels only the preissued token from a Save As race', async () => {
+    const overwriteToken = 'f'.repeat(64);
+    tauriMocks.saveAsDialog.mockResolvedValueOnce({
+      status: 'conflict', path: '/workspace/new.md', message: 'already exists', overwrite_token: overwriteToken,
+    });
+    act(() => root.render(<SessionHarness />));
+    act(() => session().updateContent('# New draft'));
+    await act(async () => session().handleSave());
+    expect(session().saveConflict).toEqual({ busy: false, path: '/workspace/new.md' });
+
+    act(() => session().handleCancelSaveConflict());
+    await flushSessionEffects();
+    expect(tauriMocks.cancelDocumentOverwriteToken).toHaveBeenCalledWith('/workspace/new.md', overwriteToken);
+    expect(tauriMocks.issueDocumentOverwriteToken).not.toHaveBeenCalled();
+
+    tauriMocks.saveAsDialog.mockResolvedValueOnce({
+      status: 'conflict', path: '/workspace/new.md', message: 'already exists', overwrite_token: overwriteToken,
+    });
+    await act(async () => session().handleSave());
+    tauriMocks.retryDocumentSaveWithToken.mockResolvedValueOnce({
+      status: 'confirmed_committed',
+      path: '/workspace/new.md',
+      version: { ...fileVersion, canonicalPath: '/workspace/new.md' },
+    });
+    await act(async () => session().handleOverwriteSaveConflict());
+    expect(tauriMocks.issueDocumentOverwriteToken).not.toHaveBeenCalled();
+    expect(tauriMocks.retryDocumentSaveWithToken).toHaveBeenCalledWith(
+      '/workspace/new.md', '# New draft', expect.stringMatching(/^document-save-/), overwriteToken,
+    );
+    expect(session().activePath).toBe('/workspace/new.md');
+    expect(session().dirty).toBe(false);
+    expect(session().saveConflict).toBeNull();
+  });
+
+  it('autosaves the latest dirty content after the configured delay and cancels on New', async () => {
+    vi.useFakeTimers();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    act(() => root.render(<SessionHarness autosaveEnabled autosaveDelayMs={500} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# First'));
+    await act(async () => vi.advanceTimersByTimeAsync(300));
+    act(() => session().updateContent('# Latest'));
+    await act(async () => vi.advanceTimersByTimeAsync(499));
+    expect(tauriMocks.writeFile).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(tauriMocks.writeFile).toHaveBeenCalledWith(
+      '/workspace/notes.md', '# Latest', fileVersion, expect.stringMatching(/^document-save-/),
+    );
+
+    act(() => session().updateContent('# Again'));
+    await act(async () => session().handleNew());
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(tauriMocks.writeFile).toHaveBeenCalledOnce();
+  });
+
+  it('owns one main-window crash scheduler with exact existing-file metadata', async () => {
+    vi.useFakeTimers();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    act(() => root.render(<SessionHarness />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Crash protected'));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(crashDraftMocks.write).toHaveBeenCalledOnce();
+    expect(crashDraftMocks.write).toHaveBeenCalledWith(expect.objectContaining({
+      documentId: expect.stringMatching(/^[0-9a-f]{32}$/),
+      fileKind: 'markdown',
+      pathHint: '/workspace/notes.md',
+      baseVersionToken: fileVersion.sha256,
+      content: '# Crash protected',
+      draftRevision: 1,
+    }));
+  });
+
+  it('never schedules crash drafts from an editor popout', async () => {
+    vi.useFakeTimers();
+    act(() => root.render(<SessionHarness isPopout popoutPane="editor" />));
+    const replication = paneMocks.instances[0]!;
+    act(() => replication.options.observe({
+      ...provisionalPaneSnapshot(),
+      revision: 2,
+      state: { ...provisionalPaneSnapshot().state, authorityStatus: 'committed' },
+    }));
+    act(() => session().updateContent('# Popout edit'));
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(crashDraftMocks.write).not.toHaveBeenCalled();
+  });
+
+  it('flushes the current crash draft before New invalidates the logical document', async () => {
+    vi.useFakeTimers();
+    act(() => root.render(<SessionHarness />));
+    act(() => session().updateContent('# Untitled draft'));
+    await act(async () => session().handleNew());
+    expect(crashDraftMocks.write).toHaveBeenCalledWith(expect.objectContaining({
+      pathHint: null, baseVersionToken: null, content: '# Untitled draft',
+    }));
+    expect(session().content).toBe(EMPTY_MARKDOWN);
+  });
+
+  it('hydrates recovery as a detached dirty document without following the path hint', async () => {
+    act(() => root.render(<SessionHarness />));
+    const recoveredId = '7'.repeat(32);
+    await act(async () => session().recoverCrashDraft({
+      documentId: recoveredId,
+      draftRevision: 3,
+      fileKind: 'html',
+      pathHint: '/private/original.html',
+      baseVersionToken: '8'.repeat(64),
+      content: '<h1>Recovered</h1>',
+      updatedAtUnixMs: 1,
+      entryToken: '9'.repeat(64),
+    }));
+    expect(session().activePath).toBeNull();
+    expect(session().content).toBe('<h1>Recovered</h1>');
+    expect(session().dirty).toBe(true);
+    expect(tauriMocks.openWorkspaceFile).not.toHaveBeenCalled();
+    expect(tauriMocks.openRecentFile).not.toHaveBeenCalled();
+    expect(tauriMocks.openFileDialog).not.toHaveBeenCalled();
+  });
+
+  it('preserves the recovered crash document ID through confirmed-save cleanup', async () => {
+    const afterConfirmedSave = vi.fn<(documentId: string) => Promise<boolean>>(async () => true);
+    const recoveredId = '7'.repeat(32);
+    tauriMocks.saveAsDialog.mockResolvedValueOnce({
+      status: 'confirmed_committed', path: '/workspace/recovered.md',
+      version: { ...fileVersion, canonicalPath: '/workspace/recovered.md' },
+    });
+    act(() => root.render(<SessionHarness afterConfirmedSave={afterConfirmedSave} />));
+    await act(async () => session().recoverCrashDraft({
+      documentId: recoveredId, draftRevision: 3, fileKind: 'markdown',
+      pathHint: '/private/original.md', baseVersionToken: '8'.repeat(64), content: '# Recovered',
+      updatedAtUnixMs: 1, entryToken: '9'.repeat(64),
+    }));
+    await act(async () => session().handleSave());
+    expect(afterConfirmedSave).toHaveBeenCalledWith(recoveredId);
+    expect(session().activePath).toBe('/workspace/recovered.md');
+    expect(session().dirty).toBe(false);
+  });
+
+  it('flushes a dirty crash draft before committing an actual document switch', async () => {
+    const events: string[] = [];
+    tauriMocks.openFileDialog
+      .mockResolvedValueOnce(preparedOpen('first'))
+      .mockResolvedValueOnce(preparedOpen('second'));
+    crashDraftMocks.write.mockImplementation(async (request) => {
+      events.push(`draft:${request.content}`);
+      return {
+        status: 'stored', documentId: request.documentId, draftRevision: request.draftRevision,
+        entryToken: '9'.repeat(64), updatedAtUnixMs: 1, evictedDocumentIds: [],
+      };
+    });
+    tauriMocks.commitRecentOpen.mockImplementation(async () => {
+      events.push('open:commit');
+      return committed();
+    });
+    act(() => root.render(<SessionHarness />));
+    await act(async () => session().handleOpenFile());
+    events.length = 0;
+    act(() => session().updateContent('# Before switch'));
+    await act(async () => session().handleOpenFile());
+    expect(events).toEqual(['draft:# Before switch', 'open:commit']);
+    expect(session().activePath).toBe('/workspace/second.md');
+  });
+
+  it('retains and reschedules newer edits when an older save commits', async () => {
+    vi.useFakeTimers();
+    const afterConfirmedSave = vi.fn<(documentId: string) => Promise<boolean>>(async () => true);
+    const write = deferred<Awaited<ReturnType<typeof tauriMocks.writeFile>>>();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.writeFile.mockReturnValueOnce(write.promise);
+    act(() => root.render(<SessionHarness afterConfirmedSave={afterConfirmedSave} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Saving'));
+    let completion!: Promise<boolean>;
+    act(() => { completion = session().saveCurrentDocument(); });
+    act(() => session().updateContent('# Newer edit'));
+    write.resolve({
+      status: 'confirmed_committed', path: '/workspace/notes.md',
+      version: { ...fileVersion, sha256: 'f'.repeat(64) },
+    });
+    await expect(act(async () => completion)).resolves.toBe(false);
+    expect(session().dirty).toBe(true);
+    expect(afterConfirmedSave).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(crashDraftMocks.write).toHaveBeenLastCalledWith(expect.objectContaining({
+      content: '# Newer edit', baseVersionToken: 'f'.repeat(64),
+    }));
+  });
+
+  it('returns false when newer edits remain after an older Save As snapshot commits', async () => {
+    const saveAs = deferred<Awaited<ReturnType<typeof tauriMocks.saveAsDialog>>>();
+    tauriMocks.saveAsDialog.mockReturnValueOnce(saveAs.promise);
+    act(() => root.render(<SessionHarness />));
+    act(() => session().updateContent('# Saving'));
+
+    let completion!: Promise<boolean>;
+    act(() => { completion = session().saveCurrentDocument(); });
+    act(() => session().updateContent('# Newer edit'));
+    saveAs.resolve({
+      status: 'confirmed_committed', path: '/workspace/notes.md', version: fileVersion,
+    });
+
+    await expect(act(async () => completion)).resolves.toBe(false);
+    expect(session().activePath).toBe('/workspace/notes.md');
+    expect(session().content).toBe('# Newer edit');
+    expect(session().dirty).toBe(true);
+  });
+
+  it('locks initial indeterminate saves and never schedules another autosave', async () => {
+    vi.useFakeTimers();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.writeFile.mockResolvedValueOnce({
+      status: 'indeterminate', path: '/workspace/notes.md', message: 'Inspect before retrying.',
+    });
+    act(() => root.render(<SessionHarness autosaveEnabled autosaveDelayMs={250} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Dirty'));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(session().authorityStatus).toBe('unknown');
+    expect(session().dirty).toBe(true);
+    await expect(session().saveCurrentDocument()).resolves.toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    await act(async () => session().handleSave());
+    expect(tauriMocks.writeFile).toHaveBeenCalledOnce();
+  });
+
+  it('stops autosave after a conflict until the content changes', async () => {
+    vi.useFakeTimers();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.writeFile.mockResolvedValue({ status: 'conflict', path: '/workspace/notes.md', message: 'changed' });
+    act(() => root.render(<SessionHarness autosaveEnabled autosaveDelayMs={250} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Conflict'));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(session().saveConflict).not.toBeNull();
+    act(() => session().handleCancelSaveConflict());
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(tauriMocks.writeFile).toHaveBeenCalledOnce();
+  });
+
+  it('retains dirty content and does not loop autosave after transport failure', async () => {
+    vi.useFakeTimers();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.writeFile.mockRejectedValue(new Error('transport failed'));
+    act(() => root.render(<SessionHarness autosaveEnabled autosaveDelayMs={250} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Offline'));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(session().dirty).toBe(true);
+    expect(session().error).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(tauriMocks.writeFile).toHaveBeenCalledOnce();
+  });
+
+  it('cancels a pending autosave when Save As commits the document', async () => {
+    vi.useFakeTimers();
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.saveAsDialog.mockResolvedValueOnce({
+      status: 'confirmed_committed', path: '/workspace/copy.md',
+      version: { ...fileVersion, canonicalPath: '/workspace/copy.md' },
+    });
+    act(() => root.render(<SessionHarness autosaveEnabled autosaveDelayMs={500} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Save As'));
+    await act(async () => session().handleSaveAs());
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(tauriMocks.writeFile).not.toHaveBeenCalled();
+    expect(session().activePath).toBe('/workspace/copy.md');
+  });
+
+  it('cancels a pending autosave when another document wins the switch', async () => {
+    vi.useFakeTimers();
+    tauriMocks.openFileDialog
+      .mockResolvedValueOnce(preparedOpen('first'))
+      .mockResolvedValueOnce(preparedOpen('second'));
+    act(() => root.render(<SessionHarness autosaveEnabled autosaveDelayMs={500} />));
+    await act(async () => session().handleOpenFile());
+    act(() => session().updateContent('# Before switch'));
+    await act(async () => session().handleOpenFile());
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(tauriMocks.writeFile).not.toHaveBeenCalled();
+    expect(session().activePath).toBe('/workspace/second.md');
+  });
+
+  it('updates the expected version path after an active file rename', async () => {
+    const workspace = workspaceSnapshot([{
+      kind: 'markdown', path: '/workspace/notes.md', relative_path: 'notes.md', name: 'notes.md',
+    }]);
+    tauriMocks.openDirectoryDialog.mockResolvedValueOnce(workspace);
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('notes'));
+    tauriMocks.renameWorkspaceEntry.mockResolvedValueOnce({
+      status: 'confirmed-committed',
+      receipt: {
+        committed: { entry_kind: 'file', old_path: '/workspace/notes.md', new_path: '/workspace/renamed.md' },
+        workspace: { status: 'fresh', snapshot: { ...workspace, files: [] } },
+      },
+    });
+    act(() => root.render(<SessionHarness />));
+    await act(async () => session().handleOpenDirectory());
+    await act(async () => session().handleOpenFile());
+    await act(async () => session().renameWorkspaceEntryPath('/workspace/notes.md', 'renamed.md'));
+    act(() => session().updateContent('# Renamed edit'));
+    await act(async () => session().handleSave());
+    expect(tauriMocks.writeFile).toHaveBeenCalledWith(
+      '/workspace/renamed.md',
+      '# Renamed edit',
+      { ...fileVersion, canonicalPath: '/workspace/renamed.md' },
+      expect.stringMatching(/^document-save-/),
+    );
+  });
+
   it('blocks editor-popout mutation publication while its authoritative snapshot is provisional', async () => {
     act(() => root.render(<SessionHarness isPopout popoutPane="editor" />));
     const replication = paneMocks.instances[0];
@@ -371,6 +782,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
         path: '/workspace/prior.html',
         content_mode: 'text',
         content: '<h1>Saved prior</h1>',
+        file_version: fileVersion,
         mime_type: 'text/html',
       });
       tauriMocks.openFileDialog.mockResolvedValueOnce(priorOpen);
@@ -482,10 +894,8 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     const { completion: olderPromise } = await beginOpen('normal');
     expect(session().authorityStatus).toBe('provisional');
 
-    act(() => {
-      session().handleNew();
-      session().updateContent('# Newer winner');
-    });
+    await act(async () => session().handleNew());
+    act(() => session().updateContent('# Newer winner'));
     const newer = documentSnapshot(session());
     expect(newer).toMatchObject({
       activePath: null,
@@ -611,6 +1021,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
       path: '/outside/notes.md',
       content_mode: 'text',
       content: '# Outside',
+      file_version: fileVersion,
     }));
 
     act(() => root.render(<SessionHarness />));

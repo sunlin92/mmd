@@ -61,6 +61,7 @@ lerna-debug.log*
 .env.*.local
 
 # Project specific
+.perf/
 .omc/
 .omx/
 .codex/

@@ -4,13 +4,15 @@
       "kind": "markdown",
       "path": "/workspace/notes.md",
       "content_mode": "text",
-      "content": "# Notes"
+      "content": "# Notes",
+      "file_version": { "canonicalPath": "/workspace/notes.md", "platformIdentity": "1", "length": "7", "modifiedNanos": "1", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
     },
     {
       "kind": "html",
       "path": "/workspace/page.xhtml",
       "content_mode": "text",
       "content": "<main>Page</main>",
+      "file_version": { "canonicalPath": "/workspace/page.xhtml", "platformIdentity": "2", "length": "17", "modifiedNanos": "2", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
       "mime_type": "application/xhtml+xml"
     },
     {
@@ -162,7 +164,8 @@
       "kind": "markdown",
       "path": "/workspace/notes.md",
       "content_mode": "text",
-      "content": "# Notes"
+      "content": "# Notes",
+      "file_version": { "canonicalPath": "/workspace/notes.md", "platformIdentity": "1", "length": "7", "modifiedNanos": "1", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
     },
     "open_receipt": "11111111111111111111111111111111",
     "commit_operation_id": "22222222222222222222222222222222"
@@ -232,7 +235,8 @@
           "kind": "markdown",
           "path": "/workspace/notes.md",
           "content_mode": "text",
-          "content": "# External"
+          "content": "# External",
+          "file_version": { "canonicalPath": "/workspace/notes.md", "platformIdentity": "1", "length": "10", "modifiedNanos": "3", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
         },
         "preview_revision": 1
       }
@@ -280,7 +284,8 @@
           "kind": "markdown",
           "path": "/workspace/notes.md",
           "content_mode": "text",
-          "content": "# Resynced"
+          "content": "# Resynced",
+          "file_version": { "canonicalPath": "/workspace/notes.md", "platformIdentity": "1", "length": "10", "modifiedNanos": "4", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
         },
         "preview_revision": 2
       }
@@ -301,7 +306,8 @@
             "kind": "markdown",
             "path": "/workspace/notes.md",
             "content_mode": "text",
-            "content": "# Changed"
+            "content": "# Changed",
+            "file_version": { "canonicalPath": "/workspace/notes.md", "platformIdentity": "1", "length": "9", "modifiedNanos": "5", "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
           },
           "preview_revision": 3
         }
@@ -323,7 +329,8 @@
             "kind": "markdown",
             "path": "/workspace/renamed.md",
             "content_mode": "text",
-            "content": "# Renamed"
+            "content": "# Renamed",
+            "file_version": { "canonicalPath": "/workspace/renamed.md", "platformIdentity": "1", "length": "9", "modifiedNanos": "6", "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }
           },
           "preview_revision": 4
         }

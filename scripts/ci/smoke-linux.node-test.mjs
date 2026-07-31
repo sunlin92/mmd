@@ -47,7 +47,7 @@ exit 42
 `,
   );
 
-  const result = spawnSync('/bin/bash', [script, artifactName], {
+  const result = spawnSync('/bin/bash', [script, artifactName, 'x86_64-unknown-linux-gnu'], {
     cwd: root,
     encoding: 'utf8',
     env: {

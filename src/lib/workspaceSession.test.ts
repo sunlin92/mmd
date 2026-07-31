@@ -19,6 +19,7 @@ const activeFile = {
     path: '/workspace/notes.md',
     content_mode: 'text',
     content: '# Notes',
+    file_version: { canonicalPath: '/workspace/notes.md', platformIdentity: '1', length: '7', modifiedNanos: '1', sha256: 'c'.repeat(64) },
   },
   open_receipt: '0123456789abcdef0123456789abcdef',
   commit_operation_id: 'fedcba9876543210fedcba9876543210',

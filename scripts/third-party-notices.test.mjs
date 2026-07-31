@@ -7,9 +7,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DOMPURIFY_VERSION,
   EXCALIDRAW_VERSION,
+  LIBC_VERSION,
   MAMMOTH_VERSION,
   MERMAID_VERSION,
   NOTICE_SPECS,
+  OBJC2_FOUNDATION_VERSION,
+  WINDOWS_CORE_VERSION,
+  WINDOWS_SYS_VERSION,
+  WINDOWS_VERSION,
   collectSynchronizedThirdPartyNotices,
   joinPortableNoticePath,
   syncThirdPartyNotices,
@@ -45,6 +50,20 @@ async function createFixtureProject() {
   const staticLicenseDirectory = path.join(root, 'scripts', 'licenses');
   await mkdir(staticLicenseDirectory, { recursive: true });
   await writeFile(path.join(staticLicenseDirectory, 'excalidraw-0.18.1-LICENSE'), 'excalidraw-license\n');
+  for (const spec of NOTICE_SPECS.filter(({ ecosystem }) => ecosystem === 'cargo')) {
+    const destination = path.join(root, spec.sourcePath);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, await readFile(path.join(projectRoot, spec.sourcePath)));
+  }
+  const cargoDirectory = path.join(root, 'src-tauri');
+  await mkdir(cargoDirectory, { recursive: true });
+  await writeFile(path.join(cargoDirectory, 'Cargo.lock'), [
+    ['libc', LIBC_VERSION],
+    ['objc2-foundation', OBJC2_FOUNDATION_VERSION],
+    ['windows', WINDOWS_VERSION],
+    ['windows-core', WINDOWS_CORE_VERSION],
+    ['windows-sys', WINDOWS_SYS_VERSION],
+  ].map(([name, version]) => `[[package]]\nname = "${name}"\nversion = "${version}"\n`).join('\n'));
   return root;
 }
 
@@ -69,6 +88,11 @@ describe('third-party notice synchronization', () => {
     expect(DOMPURIFY_VERSION).toBe('3.4.12');
     expect(EXCALIDRAW_VERSION).toBe('0.18.1');
     expect(MERMAID_VERSION).toBe('11.16.0');
+    expect(LIBC_VERSION).toBe('0.2.186');
+    expect(OBJC2_FOUNDATION_VERSION).toBe('0.3.2');
+    expect(WINDOWS_VERSION).toBe('0.61.3');
+    expect(WINDOWS_CORE_VERSION).toBe('0.61.2');
+    expect(WINDOWS_SYS_VERSION).toBe('0.61.2');
     expect(packageManifest.scripts).toMatchObject({
       postinstall: 'npm run sync:vendor-assets',
       prebuild: 'npm run sync:vendor-assets',
@@ -83,10 +107,33 @@ describe('third-party notice synchronization', () => {
       'mammoth/LICENSE',
       'excalidraw/LICENSE',
       'mermaid/LICENSE',
+      'rust/libc/LICENSE-APACHE',
+      'rust/libc/LICENSE-MIT',
+      'rust/objc2-foundation/LICENSE-MIT',
+      'rust/windows/LICENSE-APACHE',
+      'rust/windows/LICENSE-MIT',
+      'rust/windows-core/LICENSE-APACHE',
+      'rust/windows-core/LICENSE-MIT',
+      'rust/windows-sys/LICENSE-APACHE',
+      'rust/windows-sys/LICENSE-MIT',
     ]);
+    expect(Object.fromEntries(NOTICE_SPECS.map(({ packageName, license }) => (
+      [packageName, license]
+    )))).toEqual({
+      dompurify: '(MPL-2.0 OR Apache-2.0)',
+      mammoth: 'BSD-2-Clause',
+      '@excalidraw/excalidraw': 'MIT',
+      mermaid: 'MIT',
+      libc: '(MIT OR Apache-2.0)',
+      'objc2-foundation': 'MIT',
+      windows: '(MIT OR Apache-2.0)',
+      'windows-core': '(MIT OR Apache-2.0)',
+      'windows-sys': '(MIT OR Apache-2.0)',
+    });
 
     const synchronized = await collectSynchronizedThirdPartyNotices({ projectRoot });
-    expect(synchronized).toHaveLength(5);
+    expect(synchronized).toHaveLength(14);
+    const cargoHashMismatches = [];
     for (const entry of synchronized) {
       const source = await readFile(entry.sourcePath
         ? path.join(projectRoot, entry.sourcePath)
@@ -100,7 +147,15 @@ describe('third-party notice synchronization', () => {
       ));
       expect(copied).toEqual(source);
       expect(entry.sha256).toBe(sha256(source));
+      expect(entry.license).toBe(
+        NOTICE_SPECS.find((spec) => spec.packageName === entry.packageName)?.license,
+      );
+      const spec = NOTICE_SPECS.find(({ destination }) => destination === entry.destination);
+      if (spec?.ecosystem === 'cargo' && spec.sha256 !== sha256(source)) {
+        cargoHashMismatches.push(entry.destination);
+      }
     }
+    expect(cargoHashMismatches).toEqual([]);
   });
 
   it('removes stale files and is idempotent with an exact output set', async () => {
@@ -131,5 +186,20 @@ describe('third-party notice synchronization', () => {
 
     await expect(syncThirdPartyNotices({ projectRoot: fixtureRoot }))
       .rejects.toThrow('Expected mammoth 1.12.0, found 1.12.1');
+  });
+
+  it('fails closed on native Rust dependency version drift', async () => {
+    const fixtureRoot = await createFixtureProject();
+    const cargoLock = path.join(fixtureRoot, 'src-tauri', 'Cargo.lock');
+    await writeFile(
+      cargoLock,
+      (await readFile(cargoLock, 'utf8')).replace(
+        `name = "libc"\nversion = "${LIBC_VERSION}"`,
+        'name = "libc"\nversion = "0.2.187"',
+      ),
+    );
+
+    await expect(syncThirdPartyNotices({ projectRoot: fixtureRoot }))
+      .rejects.toThrow('Expected Cargo package libc 0.2.186, found 0.2.187');
   });
 });

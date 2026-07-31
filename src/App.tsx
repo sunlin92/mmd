@@ -8,12 +8,17 @@ import {
   useState,
   type ComponentProps,
 } from 'react';
+import { Settings } from 'lucide-react';
 import { emit, emitTo, listen } from '@tauri-apps/api/event';
 import { AppToolbar } from './components/AppToolbar';
 import type { DocxPreviewFeedback } from './components/DocxPreview';
 import { EditorPane } from './components/EditorPane';
 import { ExternalFileChangeDialog } from './components/ExternalFileChangeDialog';
+import { DocumentSaveConflictDialog } from './components/DocumentSaveConflictDialog';
+import { CrashDraftRecoveryDialog } from './components/CrashDraftRecoveryDialog';
+import { CrashDraftStoreRepairDialog } from './components/CrashDraftStoreRepairDialog';
 import { FeedbackDialog } from './components/FeedbackDialog';
+import { SettingsDialog } from './components/SettingsDialog';
 import { FileSidebar } from './components/FileSidebar';
 import JinxiuMarkdown from './components/JinxiuMarkdown';
 import { LazyPreviewBoundary } from './components/LazyPreviewBoundary';
@@ -29,9 +34,11 @@ import { WorkspaceMediaPreview } from './components/WorkspaceMediaPreview';
 import { WorkspaceMoveDialog, type WorkspaceMoveOperation } from './components/WorkspaceMoveDialog';
 import { WorkspaceSidebarResizer } from './components/WorkspaceSidebarResizer';
 import { useDocumentSession } from './hooks/useDocumentSession';
+import { useCrashDraftRecovery } from './hooks/useCrashDraftRecovery';
 import { usePanePopouts } from './hooks/usePanePopouts';
 import { usePaneResize } from './hooks/usePaneResize';
 import { useProgramCloseGuard } from './hooks/useProgramCloseGuard';
+import { useSettings } from './hooks/useSettings';
 import { useI18n } from './lib/i18n';
 import type { EffectiveLocale } from './lib/locale';
 import { useWorkspaceSidebarResize } from './hooks/useWorkspaceSidebarResize';
@@ -80,6 +87,7 @@ import {
   getWorkspaceSidebarLayoutStyle,
 } from './lib/sidebarLayout';
 import { setNativeSaveMenuEnabled } from './lib/tauriCommands';
+import { crashDraftCommands } from './lib/crashDraftCommands';
 import { getWorkspaceMoveDestinations } from './lib/fileTreeOperations';
 import { getWorkspacePresentation } from './lib/workspaceFileKind';
 import type { WorkspaceFileEntry } from './types';
@@ -243,6 +251,7 @@ export default function App() {
   const [pendingFileSwitchPath, setPendingFileSwitchPath] = useState<string | null>(null);
   const [workspaceEntryOperation, setWorkspaceEntryOperation] = useState<WorkspaceEntryOperation | null>(null);
   const [workspaceMoveOperation, setWorkspaceMoveOperation] = useState<WorkspaceMoveOperation | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
   const [fileTreeCollapsed, setFileTreeCollapsed] = useState(false);
   const [editorPaneRatio, setEditorPaneRatio] = useState(0.5);
@@ -266,6 +275,15 @@ export default function App() {
   const markdownMediaRetryControllerRef = useRef(createMarkdownMediaRetryController());
   const mountedRef = useRef(true);
   const paneLayoutStyle = useMemo(() => getPaneLayoutStyle(editorPaneRatio), [editorPaneRatio]);
+  const settingsState = useSettings();
+  const afterConfirmedCrashDraftSaveRef = useRef<((documentId: string) => Promise<boolean>) | null>(null);
+  const afterConfirmedCrashDraftSave = useCallback((documentId: string) => (
+    afterConfirmedCrashDraftSaveRef.current?.(documentId) ?? Promise.resolve(true)
+  ), []);
+
+  useEffect(() => {
+    if (settingsState.settings) setEditorPaneRatio(settingsState.settings.editorPaneRatio);
+  }, [settingsState.settings]);
 
   const {
     activeFileKind,
@@ -287,6 +305,7 @@ export default function App() {
     files = [],
     fileTree,
     flushWorkspaceSession,
+    flushCrashDraft,
     handleNew,
     handleOpenDirectory,
     handleOpenFile,
@@ -294,6 +313,8 @@ export default function App() {
     handleClearRecent,
     handleCloseDeletedDraft,
     handleKeepCurrentExternal,
+    handleCancelSaveConflict,
+    handleOverwriteSaveConflict,
     handleSave,
     handleSaveAs,
     handleSaveDeletedDraftAs,
@@ -304,12 +325,33 @@ export default function App() {
     previewRevision,
     renameWorkspaceEntryPath,
     refreshWorkspace,
+    recoverCrashDraft,
     saveCurrentDocument,
+    saveConflict,
+    seedCrashDraftRevision,
+    getCrashDraftStoredEntryToken,
+    confirmCrashDraftDiscarded,
     setError,
     setNotice,
     updateContent,
     workspaceRoot,
-  } = useDocumentSession({ isPopout, popoutPane });
+  } = useDocumentSession({
+    isPopout,
+    popoutPane,
+    autosaveEnabled: settingsState.settings?.autosaveEnabled ?? false,
+    autosaveDelayMs: settingsState.settings?.autosaveDelayMs ?? 1500,
+    afterConfirmedSave: afterConfirmedCrashDraftSave,
+  });
+
+  const crashDraftRecovery = useCrashDraftRecovery({
+    enabled: !isPopout,
+    commands: crashDraftCommands,
+    onRecoverDraft: recoverCrashDraft,
+    seedRevision: seedCrashDraftRevision,
+    getStoredEntryToken: getCrashDraftStoredEntryToken,
+    confirmDiscarded: confirmCrashDraftDiscarded,
+  });
+  afterConfirmedCrashDraftSaveRef.current = crashDraftRecovery.afterConfirmedSave;
 
   const feedbackDialog = useMemo(() => getFeedbackDialog({ error, notice }, locale), [error, locale, notice]);
   const unsavedExitPrompt = useMemo(() => getUnsavedExitPrompt(activePath, locale), [activePath, locale]);
@@ -361,7 +403,7 @@ export default function App() {
   }, [fileTree, workspaceMoveOperation, workspaceRoot]);
   const nativeSaveMenuEnabled = isNativeSaveMenuEnabled({
     authorityStatus,
-    busy: busy || externalFileAction !== null,
+    busy: busy || externalFileAction !== null || Boolean(saveConflict),
     fileKind: activeFileKind,
   });
 
@@ -428,10 +470,14 @@ export default function App() {
   const { closePopoutWindows, editorPopoutButton, openPanePopout, previewPopoutButton } = usePanePopouts({ broadcastPaneState, isPopout, setError, setNotice });
   const editorPopoutOpen = editorPopoutButton?.isPoppedOut === true;
   editorPopoutOpenRef.current = editorPopoutOpen || editorPopoutOpenRequestRef.current !== null;
+  const flushSessionBeforeProgramClose = useCallback(async () => {
+    await flushCrashDraft();
+    await flushWorkspaceSession();
+  }, [flushCrashDraft, flushWorkspaceSession]);
   const { forceCloseProgram } = useProgramCloseGuard({
     closePopoutWindows,
     dirty,
-    flushWorkspaceSession,
+    flushWorkspaceSession: flushSessionBeforeProgramClose,
     isPopout,
     setError,
     setNotice,
@@ -1131,7 +1177,8 @@ export default function App() {
   if (popoutPane === 'editor') {
     return (
       <PopoutPaneShell>
-        {feedbackDialog && <FeedbackDialog dialog={feedbackDialog} onDismiss={dismissFeedbackDialog} />}
+        {settingsState.recovery && <SettingsDialog busy={settingsState.busy} locale={locale} recovery={settingsState.recovery} onReset={settingsState.reset} onRetry={settingsState.retry} />}
+        {!settingsState.recovery && feedbackDialog && <FeedbackDialog dialog={feedbackDialog} onDismiss={dismissFeedbackDialog} />}
         {isExcalidrawFile
           ? (
             <ExcalidrawPane
@@ -1161,7 +1208,8 @@ export default function App() {
   if (popoutPane === 'preview') {
     return (
       <PopoutPaneShell>
-        {feedbackDialog && <FeedbackDialog dialog={feedbackDialog} onDismiss={dismissFeedbackDialog} />}
+        {settingsState.recovery && <SettingsDialog busy={settingsState.busy} locale={locale} recovery={settingsState.recovery} onReset={settingsState.reset} onRetry={settingsState.retry} />}
+        {!settingsState.recovery && feedbackDialog && <FeedbackDialog dialog={feedbackDialog} onDismiss={dismissFeedbackDialog} />}
         {isExcalidrawFile
           ? (
             <ExcalidrawPane
@@ -1201,14 +1249,57 @@ export default function App() {
         busy={busy}
         dirty={dirty}
       />
+      <button
+        type="button"
+        className="settings-launch-button"
+        aria-label={locale === 'zh-CN' ? '打开设置' : 'Open settings'}
+        title={locale === 'zh-CN' ? '设置' : 'Settings'}
+        disabled={settingsState.busy || settingsState.settings === null}
+        onClick={() => setShowSettings(true)}
+      >
+        <Settings size={17} />
+      </button>
 
-      {externalFileAction ? (
+      {crashDraftRecovery.error ? (
+        <CrashDraftStoreRepairDialog
+          busy={crashDraftRecovery.busy}
+          canRepairOverflow={crashDraftRecovery.canRepairOverflow}
+          error={crashDraftRecovery.error}
+          locale={locale}
+          overflowRepairProgress={crashDraftRecovery.overflowRepairProgress}
+          onRepairOverflow={crashDraftRecovery.repairOverflowBatch}
+          onRetry={crashDraftRecovery.retry}
+        />
+      ) : crashDraftRecovery.catalog && crashDraftRecovery.catalog.entries.length > 0 ? (
+        <CrashDraftRecoveryDialog
+          busy={crashDraftRecovery.busy}
+          catalog={crashDraftRecovery.catalog}
+          locale={locale}
+          onRecover={(entry) => void crashDraftRecovery.recover(entry)}
+          onDiscard={(entry) => void crashDraftRecovery.discard(entry)}
+          onDiscardAll={(token) => void crashDraftRecovery.discardAll(token)}
+        />
+      ) : settingsState.recovery ? (
+        <SettingsDialog
+          busy={settingsState.busy}
+          locale={locale}
+          recovery={settingsState.recovery}
+          onReset={settingsState.reset}
+          onRetry={settingsState.retry}
+        />
+      ) : externalFileAction ? (
         <ExternalFileChangeDialog
           action={externalFileAction}
           onCloseDeletedDraft={() => void handleCloseDeletedDraft()}
           onKeepCurrent={() => void handleKeepCurrentExternal()}
           onSaveDeletedDraftAs={() => void handleSaveDeletedDraftAs()}
           onUseExternal={() => void handleUseExternal()}
+        />
+      ) : saveConflict ? (
+        <DocumentSaveConflictDialog
+          conflict={saveConflict}
+          onCancel={handleCancelSaveConflict}
+          onOverwrite={() => void handleOverwriteSaveConflict()}
         />
       ) : showUnsavedExitPrompt ? (
         <UnsavedExitDialog
@@ -1240,6 +1331,21 @@ export default function App() {
           operation={workspaceMoveOperation}
           onCancel={() => setWorkspaceMoveOperation(null)}
           onConfirm={handleWorkspaceMoveConfirm}
+        />
+      ) : showSettings && settingsState.settings ? (
+        <SettingsDialog
+          busy={settingsState.busy}
+          locale={locale}
+          settings={settingsState.settings}
+          onClose={() => setShowSettings(false)}
+          onReset={async () => {
+            await settingsState.reset();
+            setShowSettings(false);
+          }}
+          onSave={async (nextSettings) => {
+            await settingsState.updateSettings(nextSettings);
+            setShowSettings(false);
+          }}
         />
       ) : feedbackDialog ? (
         <FeedbackDialog dialog={feedbackDialog} onDismiss={dismissFeedbackDialog} />

@@ -5,6 +5,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{
     ffi::{CStr, CString},
@@ -20,32 +21,34 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::{
+    document_save::{DocumentSaveDisposition, OverwriteToken, MAIN_SAVE_OWNER},
     docx_preflight::{preflight_docx_zip, DOCX_SOURCE_LIMIT_BYTES},
+    durable_write::FileVersion,
     excalidraw_scene::{default_excalidraw_scene, validate_excalidraw_scene},
     image_resolver::{resolve_relative_excalidraw_path_inner, resolve_relative_image_path_inner},
-    markdown_files::read_markdown_file,
     models::{
-        DeleteWorkspaceEntryResponse, MutationCommitReceipt, MutationOutcome, OpenCommitResult,
-        OpenCommitStatus, OpenFileResponse, PreparedOpenFileResponse, RecentFilesSnapshot,
-        RenameWorkspaceEntryResponse, SnapshotReceipt, WorkspaceMutation, WorkspaceSessionRestore,
-        WorkspaceSnapshot,
+        DeleteWorkspaceEntryResponse, DocumentSaveResponse, MutationCommitReceipt, MutationOutcome,
+        OpenCommitResult, OpenCommitStatus, OpenFileResponse, OverwriteTokenResponse,
+        PreparedOpenFileResponse, RecentFilesSnapshot, RenameWorkspaceEntryResponse, Settings,
+        SettingsEnvelope, SettingsError, SnapshotReceipt, WorkspaceMutation,
+        WorkspaceSessionRestore, WorkspaceSnapshot,
     },
     native_menu,
     path_auth::{
-        commit_indeterminate_delete_inner, delete_authorized_workspace_entry_inner,
         ensure_authorized_existing_file_inner, move_authorized_workspace_entry_inner,
         normalize_existing_path, normalize_file_for_write, path_is_under,
         rename_authorized_workspace_entry_inner,
         resolve_authorized_workspace_directory_for_token_inner,
-        resolve_authorized_workspace_root_for_token_inner, save_document_as_inner,
-        write_authorized_document_inner, AuthorizedDeleteOutcome, AuthorizedRenameOutcome,
-        AuthorizedWorkspace, AuthorizedWriteOutcome, DeleteFileObservation, RenameErrorObservation,
-        WorkspaceSnapshotSource,
+        resolve_authorized_workspace_root_for_token_inner, trash_authorized_workspace_entry_inner,
+        AuthorizedDeleteOutcome, AuthorizedRenameOutcome, AuthorizedWorkspace,
+        RenameErrorObservation, TrashAuthorizationDisposition, WorkspaceSnapshotSource,
     },
     state::AppState,
     workspace_file_kind::{ContentMode, WorkspaceFileKind},
     workspace_session::WorkspaceSessionRecord,
     workspace_snapshot::{capture_workspace_snapshot, CapturedWorkspaceSnapshot},
+    workspace_trash::{classify_trash, TrashClassification, TrashEntryKind, TrashPort},
+    workspace_trash_native::NativeTrashPort,
 };
 
 #[cfg(test)]
@@ -53,8 +56,10 @@ use crate::path_auth::authorize_workspace_file_inner;
 
 #[cfg(test)]
 use crate::path_auth::{
-    authorize_directory_root_inner, ensure_authorized_directory_inner,
-    ensure_authorized_write_file_inner, GrantStatus, WorkspaceCandidate,
+    authorize_directory_root_inner, commit_indeterminate_delete_inner,
+    delete_authorized_workspace_entry_inner, ensure_authorized_directory_inner,
+    ensure_authorized_write_file_inner, save_document_as_inner, write_authorized_document_inner,
+    AuthorizedWriteOutcome, DeleteFileObservation, GrantStatus, WorkspaceCandidate,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +74,64 @@ const RECENT_MENU_SYNC_ERROR: &str = "Recent files menu synchronization failed";
 const IMAGE_SOURCE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const EXCALIDRAW_EMBED_SOURCE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const PDF_SOURCE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const SETTINGS_CHANGED_EVENT: &str = "mmd:settings-changed";
+
+fn get_settings_inner(state: &AppState) -> Result<SettingsEnvelope, SettingsError> {
+    state.settings()?.load_or_create()
+}
+
+fn update_settings_inner(
+    state: &AppState,
+    expected_revision: u64,
+    settings: Settings,
+) -> Result<SettingsEnvelope, SettingsError> {
+    state.settings()?.update(expected_revision, settings)
+}
+
+fn reset_settings_inner(
+    state: &AppState,
+    expected_revision: Option<u64>,
+) -> Result<SettingsEnvelope, SettingsError> {
+    state.settings()?.reset(expected_revision)
+}
+
+#[tauri::command]
+pub(crate) fn get_settings(state: State<'_, AppState>) -> Result<SettingsEnvelope, SettingsError> {
+    get_settings_inner(&state)
+}
+
+#[tauri::command]
+pub(crate) fn update_settings(
+    expected_revision: u64,
+    settings: Settings,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SettingsEnvelope, SettingsError> {
+    let envelope = update_settings_inner(&state, expected_revision, settings)?;
+    app.emit(SETTINGS_CHANGED_EVENT, &envelope)
+        .map_err(|error| SettingsError {
+            code: crate::models::SettingsErrorCode::Persistence,
+            message: format!("Settings were saved, but open windows could not be updated: {error}"),
+            can_reset: false,
+        })?;
+    Ok(envelope)
+}
+
+#[tauri::command]
+pub(crate) fn reset_settings(
+    expected_revision: Option<u64>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SettingsEnvelope, SettingsError> {
+    let envelope = reset_settings_inner(&state, expected_revision)?;
+    app.emit(SETTINGS_CHANGED_EVENT, &envelope)
+        .map_err(|error| SettingsError {
+            code: crate::models::SettingsErrorCode::Persistence,
+            message: format!("Settings were reset, but open windows could not be updated: {error}"),
+            can_reset: false,
+        })?;
+    Ok(envelope)
+}
 
 fn refresh_recent_menu_with_retry(
     snapshot: &RecentFilesSnapshot,
@@ -897,7 +960,9 @@ trait FileSystemPort {
     }
     fn create_dir(&self, path: &Path) -> std::io::Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    #[cfg(test)]
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+    #[cfg(test)]
     fn remove_dir_all(&self, path: &Path) -> std::io::Result<()>;
 
     fn observe(&self, path: &Path, expected_bytes: Option<&[u8]>) -> std::io::Result<ObservedPath> {
@@ -936,10 +1001,12 @@ impl FileSystemPort for SystemFileSystemPort {
         rename_no_replace(from, to)
     }
 
+    #[cfg(test)]
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
         fs::remove_file(path)
     }
 
+    #[cfg(test)]
     fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
         fs::remove_dir_all(path)
     }
@@ -997,6 +1064,7 @@ fn embedded_binary_open_response(
         kind,
         path: path.to_string_lossy().to_string(),
         content_mode: ContentMode::Binary,
+        file_version: None,
         content: None,
         mime_type: kind.mime_type(path),
         bytes_base64: Some(BASE64_STANDARD.encode(bytes)),
@@ -1297,12 +1365,20 @@ pub(crate) fn clear_recent_files(
     Ok(snapshot)
 }
 
-pub(crate) fn read_file_inner(state: &AppState, path: impl AsRef<Path>) -> Result<String, String> {
+pub(crate) fn read_file_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+) -> Result<OpenFileResponse, String> {
     let path = ensure_authorized_existing_file_inner(state, path)?;
-    if !WorkspaceFileKind::classify(&path).is_some_and(WorkspaceFileKind::is_editable) {
+    let kind = WorkspaceFileKind::classify(&path)
+        .filter(|kind| kind.is_editable())
+        .ok_or_else(|| {
+            "Only Markdown, HTML, and Excalidraw files can be read as text".to_string()
+        })?;
+    if !kind.is_editable() {
         return Err("Only Markdown, HTML, and Excalidraw files can be read as text".into());
     }
-    read_markdown_file(&path)
+    kind.open_response(&path)
 }
 
 fn validate_editable_content(path: &Path, content: &str, action: &str) -> Result<(), String> {
@@ -1320,10 +1396,104 @@ fn validate_editable_content(path: &Path, content: &str, action: &str) -> Result
 }
 
 #[tauri::command]
-pub(crate) fn read_file(path: String, state: State<'_, AppState>) -> Result<String, String> {
+pub(crate) fn read_file(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<OpenFileResponse, String> {
     read_file_inner(&state, path)
 }
 
+fn document_save_response(
+    path: &Path,
+    disposition: DocumentSaveDisposition,
+) -> DocumentSaveResponse {
+    document_save_response_with_cleanup(path, disposition, |displaced| fs::remove_file(displaced))
+}
+
+fn document_save_response_with_cleanup(
+    path: &Path,
+    disposition: DocumentSaveDisposition,
+    cleanup: impl FnOnce(&Path) -> io::Result<()>,
+) -> DocumentSaveResponse {
+    let path = path.to_string_lossy().to_string();
+    match disposition {
+        DocumentSaveDisposition::ConfirmedCommitted {
+            version,
+            displaced_path,
+        } => {
+            let cleanup_repair_receipt =
+                displaced_path.and_then(|displaced_path| match cleanup(&displaced_path) {
+                    Ok(()) => None,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(_) => Some(format!(
+                        "cleanup-{:x}",
+                        Sha256::digest(displaced_path.to_string_lossy().as_bytes())
+                    )),
+                });
+            DocumentSaveResponse::ConfirmedCommitted {
+                path,
+                version,
+                cleanup_repair_receipt,
+            }
+        }
+        DocumentSaveDisposition::ConfirmedNotCommitted {
+            current_version,
+            message,
+            ..
+        } => DocumentSaveResponse::ConfirmedNotCommitted {
+            path,
+            current_version,
+            message,
+        },
+        DocumentSaveDisposition::Conflict {
+            current_version,
+            overwrite_token,
+            ..
+        } => DocumentSaveResponse::Conflict {
+            path,
+            current_version,
+            overwrite_token: overwrite_token.map(|token| token.as_str().to_string()),
+            message: "The file changed on disk. Review the newer version before overwriting."
+                .to_string(),
+        },
+        DocumentSaveDisposition::Indeterminate { message, .. } => {
+            DocumentSaveResponse::Indeterminate { path, message }
+        }
+    }
+}
+
+fn document_save_committed(response: &Result<DocumentSaveResponse, String>) -> bool {
+    matches!(
+        response,
+        Ok(DocumentSaveResponse::ConfirmedCommitted { .. })
+    )
+}
+
+fn save_expected_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+    content: &str,
+    expected_version: FileVersion,
+    operation_id: &str,
+    owner: &str,
+) -> Result<DocumentSaveResponse, String> {
+    if owner != MAIN_SAVE_OWNER {
+        return Err("Document saves are owned by the main window".to_string());
+    }
+    let path = normalize_file_for_write(path)?;
+    validate_editable_content(&path, content, "edited")?;
+    let disposition = state.document_save().save_expected(
+        state.file_authorization(),
+        &path,
+        content.as_bytes(),
+        expected_version,
+        operation_id,
+        owner,
+    )?;
+    Ok(document_save_response(&path, disposition))
+}
+
+#[cfg(test)]
 fn write_with_observation(
     path: &Path,
     content: &str,
@@ -1353,6 +1523,7 @@ fn write_with_observation(
     }
 }
 
+#[cfg(test)]
 fn write_file_with_preflight_and_ports_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1387,6 +1558,7 @@ fn write_file_with_preflight_and_ports_inner(
     })
 }
 
+#[cfg(test)]
 fn write_file_with_ports_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1402,6 +1574,7 @@ fn write_file_with_ports_inner(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn write_file_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1414,24 +1587,145 @@ pub(crate) fn write_file_inner(
 pub(crate) fn write_file(
     path: String,
     content: String,
+    expected_version: FileVersion,
+    operation_id: String,
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
-) -> Result<MutationOutcome<WorkspaceMutation, WorkspaceSnapshot>, String> {
+) -> Result<DocumentSaveResponse, String> {
     let write_token = normalize_file_for_write(&path).ok().and_then(|normalized| {
         state
             .active_document_watch()
             .begin_app_write(&normalized, content.as_bytes().to_vec())
     });
-    let result = write_file_inner(&state, path, &content);
+    let result = save_expected_inner(
+        &state,
+        path,
+        &content,
+        expected_version,
+        &operation_id,
+        window.label(),
+    );
     if let Some(write_token) = write_token {
-        let committed = matches!(&result, Ok(MutationOutcome::ConfirmedCommitted { .. }));
-        state
-            .active_document_watch()
-            .settle_app_write_and_schedule(&app, write_token, committed);
+        state.active_document_watch().settle_app_write_and_schedule(
+            &app,
+            write_token,
+            document_save_committed(&result),
+        );
     }
     result
 }
 
+#[tauri::command]
+pub(crate) fn issue_document_overwrite_token(
+    path: String,
+    content: String,
+    operation_id: String,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<OverwriteTokenResponse, String> {
+    issue_document_overwrite_token_inner(&state, path, &content, &operation_id, window.label())
+}
+
+fn issue_document_overwrite_token_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+    content: &str,
+    operation_id: &str,
+    owner: &str,
+) -> Result<OverwriteTokenResponse, String> {
+    let path = normalize_file_for_write(path)?;
+    validate_editable_content(&path, content, "edited")?;
+    let token = state.document_save().issue_overwrite_token(
+        state.file_authorization(),
+        &path,
+        content.as_bytes(),
+        operation_id,
+        owner,
+        None,
+    )?;
+    Ok(OverwriteTokenResponse {
+        overwrite_token: token.as_str().to_string(),
+    })
+}
+
+#[tauri::command]
+pub(crate) fn retry_document_save_with_token(
+    path: String,
+    content: String,
+    operation_id: String,
+    overwrite_token: String,
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<DocumentSaveResponse, String> {
+    let write_token = normalize_file_for_write(&path).ok().and_then(|normalized| {
+        state
+            .active_document_watch()
+            .begin_app_write(&normalized, content.as_bytes().to_vec())
+    });
+    let result = retry_document_save_with_token_inner(
+        &state,
+        &path,
+        &content,
+        &operation_id,
+        &overwrite_token,
+        window.label(),
+    );
+    if let Some(write_token) = write_token {
+        state.active_document_watch().settle_app_write_and_schedule(
+            &app,
+            write_token,
+            document_save_committed(&result),
+        );
+    }
+    result
+}
+
+fn retry_document_save_with_token_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+    content: &str,
+    operation_id: &str,
+    overwrite_token: &str,
+    owner: &str,
+) -> Result<DocumentSaveResponse, String> {
+    let token = OverwriteToken::from_wire(overwrite_token)?;
+    let (path, disposition) = state.document_save().retry_with_token_and_path(
+        state.file_authorization(),
+        &token,
+        path.as_ref(),
+        content.as_bytes(),
+        operation_id,
+        owner,
+        |path| validate_editable_content(path, content, "edited"),
+    )?;
+    Ok(document_save_response(&path, disposition))
+}
+
+#[tauri::command]
+pub(crate) fn cancel_document_overwrite_token(
+    path: String,
+    overwrite_token: String,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    cancel_document_overwrite_token_inner(&state, path, &overwrite_token, window.label())
+}
+
+fn cancel_document_overwrite_token_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+    overwrite_token: &str,
+    owner: &str,
+) -> Result<(), String> {
+    let token = OverwriteToken::from_wire(overwrite_token)?;
+    state
+        .document_save()
+        .cancel_overwrite_token(state.file_authorization(), &token, path, owner)
+}
+
+#[cfg(test)]
 pub(crate) fn save_as_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1440,6 +1734,7 @@ pub(crate) fn save_as_inner(
     save_as_with_ports_inner(state, path, &content, &SystemFileSystemPort)
 }
 
+#[cfg(test)]
 pub(crate) fn save_as_for_kind_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1449,6 +1744,7 @@ pub(crate) fn save_as_for_kind_inner(
     save_as_with_kind_and_ports_inner(state, path, &content, file_kind, &SystemFileSystemPort)
 }
 
+#[cfg(test)]
 fn save_as_with_ports_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1458,6 +1754,7 @@ fn save_as_with_ports_inner(
     save_as_with_kind_and_ports_inner(state, path, content, None, filesystem)
 }
 
+#[cfg(test)]
 fn save_as_with_kind_and_ports_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1508,6 +1805,85 @@ fn validate_save_as_content(
     validate_editable_content(path, content, "saved")
 }
 
+fn save_as_coordinated_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+    content: &str,
+    file_kind: Option<WorkspaceFileKind>,
+    operation_id: &str,
+    owner: &str,
+) -> Result<DocumentSaveResponse, String> {
+    if owner != MAIN_SAVE_OWNER {
+        return Err("Document saves are owned by the main window".to_string());
+    }
+    let path = normalize_file_for_write(path)?;
+    validate_save_as_content(&path, content, file_kind)?;
+    let destination_existed_when_accepted = path.is_file();
+    let pending = state
+        .file_authorization()
+        .reserve_pending_save_authority(&path)?;
+
+    let disposition = if destination_existed_when_accepted {
+        let token = match state.document_save().issue_overwrite_token(
+            state.file_authorization(),
+            &path,
+            content.as_bytes(),
+            operation_id,
+            owner,
+            Some(&pending),
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = state
+                    .file_authorization()
+                    .cancel_pending_save_authority(&pending);
+                return Err(error);
+            }
+        };
+        state.document_save().retry_with_token(
+            state.file_authorization(),
+            &token,
+            &path,
+            content.as_bytes(),
+            operation_id,
+            owner,
+            |_| Ok(()),
+        )
+    } else {
+        state.document_save().save_as_expected(
+            state.file_authorization(),
+            &pending,
+            &path,
+            content.as_bytes(),
+            operation_id,
+            owner,
+        )
+    };
+
+    let disposition = match disposition {
+        Ok(disposition) => disposition,
+        Err(error) => {
+            let _ = state
+                .file_authorization()
+                .cancel_pending_save_authority(&pending);
+            return Err(error);
+        }
+    };
+    if !matches!(
+        disposition,
+        DocumentSaveDisposition::ConfirmedCommitted { .. }
+            | DocumentSaveDisposition::Conflict {
+                overwrite_token: Some(_),
+                ..
+            }
+    ) {
+        state
+            .file_authorization()
+            .cancel_pending_save_authority(&pending)?;
+    }
+    Ok(document_save_response(&path, disposition))
+}
+
 fn open_directory_with_ports_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1537,7 +1913,7 @@ fn open_persisted_directory_with_ports_inner(
     snapshot.into_workspace_snapshot(&workspace)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "packaged-lifecycle-e2e"))]
 pub(crate) fn open_directory_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1842,13 +2218,18 @@ fn create_workspace_file_with_kind_and_ports_inner(
             });
         }
     };
-    let committed = OpenFileResponse {
-        kind,
-        path: file.into_path().to_string_lossy().to_string(),
-        content_mode: ContentMode::Text,
-        content: Some(initial_content),
-        mime_type: None,
-        bytes_base64: None,
+    let committed_path = file.into_path();
+    let committed = match kind.open_response(&committed_path) {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(MutationOutcome::Indeterminate {
+                operation: crate::models::MutationKind::Create,
+                paths: vec![committed_path.to_string_lossy().to_string()],
+                recovery_message: format!(
+                    "The file was created, but its committed bytes could not be observed: {error}. Refresh the workspace before editing it."
+                ),
+            });
+        }
     };
     let workspace_receipt = capture_post_commit_workspace_receipt(state, &workspace, snapshot);
     Ok(MutationOutcome::ConfirmedCommitted {
@@ -2274,6 +2655,7 @@ pub(crate) fn move_workspace_entry_inner(
     )
 }
 
+#[cfg(test)]
 fn delete_workspace_entry_with_ports_inner(
     state: &AppState,
     workspace_token: &str,
@@ -2397,6 +2779,7 @@ fn delete_workspace_entry_with_ports_inner(
     }
 }
 
+#[cfg(test)]
 fn delete_workspace_entry_with_snapshot_inner(
     state: &AppState,
     workspace_token: &str,
@@ -2414,7 +2797,8 @@ fn delete_workspace_entry_with_snapshot_inner(
     )
 }
 
-pub(crate) fn delete_workspace_entry_inner(
+#[cfg(test)]
+fn delete_workspace_entry_legacy_inner(
     state: &AppState,
     workspace_token: &str,
     path: impl AsRef<Path>,
@@ -2427,6 +2811,114 @@ pub(crate) fn delete_workspace_entry_inner(
     )
 }
 
+fn friendly_trash_disposition<R, E>(
+    classification: TrashClassification<R, E>,
+) -> TrashAuthorizationDisposition {
+    match classification {
+        TrashClassification::ConfirmedCommitted { .. } => {
+            TrashAuthorizationDisposition::ConfirmedCommitted
+        }
+        TrashClassification::ConfirmedNotCommitted { .. } => {
+            TrashAuthorizationDisposition::ConfirmedNotCommitted {
+                message: "The entry could not be moved to Trash. Check Trash availability and filesystem permissions, then retry."
+                    .to_string(),
+            }
+        }
+        TrashClassification::Indeterminate { .. } => {
+            TrashAuthorizationDisposition::Indeterminate {
+                message: "The Trash operation could not be verified. Refresh the workspace and inspect both the entry and system Trash before retrying."
+                    .to_string(),
+            }
+        }
+    }
+}
+
+fn delete_workspace_entry_with_trash_port_inner<P: TrashPort>(
+    state: &AppState,
+    workspace_token: &str,
+    path: impl AsRef<Path>,
+    trash_port: &mut P,
+    snapshot: impl for<'a> FnOnce(
+        WorkspaceSnapshotSource<'a>,
+    ) -> Result<CapturedWorkspaceSnapshot, String>,
+) -> Result<MutationOutcome<DeleteWorkspaceEntryResponse, WorkspaceSnapshot>, String> {
+    let requested_path = path.as_ref().to_path_buf();
+    let trash_called = std::cell::Cell::new(false);
+    let outcome =
+        trash_authorized_workspace_entry_inner(state, workspace_token, path, |entry, is_file| {
+            trash_called.set(true);
+            let kind = if is_file {
+                TrashEntryKind::File
+            } else {
+                TrashEntryKind::Directory
+            };
+            friendly_trash_disposition(classify_trash(trash_port, entry, kind))
+        });
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(message) if !trash_called.get() => {
+            return Ok(MutationOutcome::ConfirmedNotCommitted { message });
+        }
+        Err(_) => {
+            return Ok(MutationOutcome::Indeterminate {
+                operation: crate::models::MutationKind::Delete,
+                paths: vec![requested_path.to_string_lossy().to_string()],
+                recovery_message: "The entry may have moved to Trash, but application authorization could not be reconciled. Refresh the workspace before retrying."
+                    .to_string(),
+            });
+        }
+    };
+
+    match outcome {
+        AuthorizedDeleteOutcome::ConfirmedNotCommitted { message } => {
+            Ok(MutationOutcome::ConfirmedNotCommitted { message })
+        }
+        AuthorizedDeleteOutcome::Committed(deleted) => {
+            let committed = DeleteWorkspaceEntryResponse {
+                deleted_path: deleted.deleted_path().to_string_lossy().to_string(),
+            };
+            let workspace =
+                capture_post_commit_workspace_receipt(state, deleted.workspace(), snapshot);
+            Ok(MutationOutcome::ConfirmedCommitted {
+                receipt: MutationCommitReceipt {
+                    committed,
+                    workspace,
+                },
+            })
+        }
+        AuthorizedDeleteOutcome::RecoveryRequired {
+            deleted,
+            recovery_message,
+        } => Ok(MutationOutcome::Indeterminate {
+            operation: crate::models::MutationKind::Delete,
+            paths: vec![deleted.deleted_path().to_string_lossy().to_string()],
+            recovery_message,
+        }),
+        AuthorizedDeleteOutcome::Indeterminate {
+            attempted,
+            recovery_message,
+        } => Ok(MutationOutcome::Indeterminate {
+            operation: crate::models::MutationKind::Delete,
+            paths: vec![attempted.deleted_path().to_string_lossy().to_string()],
+            recovery_message,
+        }),
+    }
+}
+
+pub(crate) fn delete_workspace_entry_inner(
+    state: &AppState,
+    workspace_token: &str,
+    path: impl AsRef<Path>,
+) -> Result<MutationOutcome<DeleteWorkspaceEntryResponse, WorkspaceSnapshot>, String> {
+    delete_workspace_entry_with_trash_port_inner(
+        state,
+        workspace_token,
+        path,
+        &mut NativeTrashPort::default(),
+        capture_workspace_snapshot,
+    )
+}
+
 #[tauri::command]
 pub(crate) async fn save_as_dialog(
     app: AppHandle,
@@ -2434,7 +2926,9 @@ pub(crate) async fn save_as_dialog(
     content: String,
     default_name: Option<String>,
     file_kind: Option<WorkspaceFileKind>,
-) -> Result<Option<MutationOutcome<WorkspaceMutation, WorkspaceSnapshot>>, String> {
+    operation_id: String,
+    window: WebviewWindow,
+) -> Result<Option<DocumentSaveResponse>, String> {
     let (filter_name, extensions) = if file_kind == Some(WorkspaceFileKind::Excalidraw) {
         ("Excalidraw", vec!["excalidraw"])
     } else {
@@ -2453,10 +2947,27 @@ pub(crate) async fn save_as_dialog(
     let path = selected
         .into_path()
         .map_err(|err| format!("Invalid save path: {err}"))?;
-    match file_kind {
-        Some(file_kind) => save_as_for_kind_inner(&state, path, content, Some(file_kind)).map(Some),
-        None => save_as_inner(&state, path, content).map(Some),
+    let write_token = normalize_file_for_write(&path).ok().and_then(|normalized| {
+        state
+            .active_document_watch()
+            .begin_app_write(&normalized, content.as_bytes().to_vec())
+    });
+    let result = save_as_coordinated_inner(
+        &state,
+        path,
+        &content,
+        file_kind,
+        &operation_id,
+        window.label(),
+    );
+    if let Some(write_token) = write_token {
+        state.active_document_watch().settle_app_write_and_schedule(
+            &app,
+            write_token,
+            document_save_committed(&result),
+        );
     }
+    result.map(Some)
 }
 
 #[tauri::command]
@@ -2666,6 +3177,84 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::path_auth::{is_authorized_image_path, normalize_existing_path};
+
+    #[derive(Clone, Copy)]
+    enum ScriptedTrashMode {
+        Rejected,
+        Committed,
+        PlacementMismatch,
+        PostMoveWithReceipt,
+        PostMoveWithoutReceipt,
+    }
+
+    struct ScriptedTrashPort {
+        mode: ScriptedTrashMode,
+        recovery_path: PathBuf,
+        calls: usize,
+    }
+
+    impl TrashPort for ScriptedTrashPort {
+        type RecoveryReceipt = PathBuf;
+        type Error = &'static str;
+
+        fn move_to_trash(
+            &mut self,
+            source: &Path,
+            _kind: TrashEntryKind,
+        ) -> crate::workspace_trash::MoveToTrash<Self::RecoveryReceipt, Self::Error> {
+            self.calls += 1;
+            match self.mode {
+                ScriptedTrashMode::Rejected => {
+                    crate::workspace_trash::MoveToTrash::Rejected { error: "rejected" }
+                }
+                ScriptedTrashMode::Committed | ScriptedTrashMode::PlacementMismatch => {
+                    fs::rename(source, &self.recovery_path).unwrap();
+                    crate::workspace_trash::MoveToTrash::Placed {
+                        recovery_receipt: self.recovery_path.clone(),
+                    }
+                }
+                ScriptedTrashMode::PostMoveWithReceipt => {
+                    fs::rename(source, &self.recovery_path).unwrap();
+                    crate::workspace_trash::MoveToTrash::PossiblyMoved {
+                        recovery_receipt: Some(self.recovery_path.clone()),
+                        error: "post-move failure",
+                    }
+                }
+                ScriptedTrashMode::PostMoveWithoutReceipt => {
+                    fs::rename(source, &self.recovery_path).unwrap();
+                    crate::workspace_trash::MoveToTrash::PossiblyMoved {
+                        recovery_receipt: None,
+                        error: "post-move failure",
+                    }
+                }
+            }
+        }
+
+        fn observe_source(
+            &mut self,
+            source: &Path,
+        ) -> crate::workspace_trash::SourceObservation<Self::Error> {
+            if source.exists() {
+                crate::workspace_trash::SourceObservation::Present
+            } else {
+                crate::workspace_trash::SourceObservation::Missing
+            }
+        }
+
+        fn verify_placement(
+            &mut self,
+            recovery_receipt: &Self::RecoveryReceipt,
+        ) -> crate::workspace_trash::PlacementVerification<Self::Error> {
+            match self.mode {
+                ScriptedTrashMode::Committed | ScriptedTrashMode::PostMoveWithReceipt
+                    if recovery_receipt.exists() =>
+                {
+                    crate::workspace_trash::PlacementVerification::Proven
+                }
+                _ => crate::workspace_trash::PlacementVerification::Mismatch,
+            }
+        }
+    }
 
     #[derive(Default)]
     struct ScriptedFileSystemPort {
@@ -3641,7 +4230,7 @@ mod tests {
         assert!(ensure_authorized_write_file_inner(&state, &renamed.new_path).is_ok());
 
         let deleted =
-            delete_workspace_entry_inner(&state, &opened.workspace_token, &renamed.new_path)
+            delete_workspace_entry_legacy_inner(&state, &opened.workspace_token, &renamed.new_path)
                 .unwrap();
         let receipt = match deleted {
             MutationOutcome::ConfirmedCommitted { receipt } => receipt,
@@ -3738,7 +4327,7 @@ mod tests {
         );
 
         let canonical_document = document.canonicalize().unwrap();
-        let deleted = delete_workspace_entry_inner(
+        let deleted = delete_workspace_entry_legacy_inner(
             &state,
             &inner_snapshot.workspace_token,
             &canonical_document,
@@ -6772,7 +7361,7 @@ mod tests {
             &outside_doc,
             "renamed.md",
         ));
-        assert_confirmed_not_committed(delete_workspace_entry_inner(
+        assert_confirmed_not_committed(delete_workspace_entry_legacy_inner(
             &state,
             &opened.workspace_token,
             outside.path(),
@@ -6792,7 +7381,7 @@ mod tests {
             &root,
             "renamed",
         ));
-        assert_confirmed_not_committed(delete_workspace_entry_inner(
+        assert_confirmed_not_committed(delete_workspace_entry_legacy_inner(
             &state,
             &opened.workspace_token,
             &root,
@@ -8036,5 +8625,576 @@ mod tests {
         )
         .is_err());
         assert!(state.workspace_session().unwrap().load().unwrap().is_none());
+    }
+
+    fn opened_editable(state: &AppState, path: &Path) -> OpenFileResponse {
+        authorize_directory_root_inner(state, path.parent().unwrap().to_path_buf()).unwrap();
+        open_workspace_file_inner(state, path).unwrap()
+    }
+
+    #[test]
+    fn coordinated_save_uses_exact_versions_and_preserves_empty_and_shorter_bytes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        fs::write(&path, "a substantially longer document").unwrap();
+        let state = AppState::default();
+        let opened = opened_editable(&state, &path);
+        let reread = read_file_inner(&state, &path).unwrap();
+        assert_eq!(reread.content, opened.content);
+        assert_eq!(reread.file_version, opened.file_version);
+        let wire = serde_json::to_value(&opened).unwrap();
+        assert!(wire["file_version"]["length"].is_string());
+        assert!(wire["file_version"]["modifiedNanos"].is_string());
+        assert_eq!(wire["content"], "a substantially longer document");
+        let original = opened.file_version.unwrap();
+
+        let shorter = save_expected_inner(
+            &state,
+            &path,
+            "short",
+            original.clone(),
+            "shorten",
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        let shorter_version = match shorter {
+            DocumentSaveResponse::ConfirmedCommitted { version, .. } => version,
+            other => panic!("expected committed save, got {other:?}"),
+        };
+        assert_eq!(fs::read(&path).unwrap(), b"short");
+
+        let empty =
+            save_expected_inner(&state, &path, "", shorter_version, "empty", MAIN_SAVE_OWNER)
+                .unwrap();
+        assert!(matches!(
+            empty,
+            DocumentSaveResponse::ConfirmedCommitted { .. }
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"");
+
+        let stale = save_expected_inner(&state, &path, "stale", original, "stale", MAIN_SAVE_OWNER)
+            .unwrap();
+        assert!(matches!(stale, DocumentSaveResponse::Conflict { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn coordinated_save_rejects_wrong_owner_before_writing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        fs::write(&path, "before").unwrap();
+        let state = AppState::default();
+        let version = opened_editable(&state, &path).file_version.unwrap();
+
+        let error =
+            save_expected_inner(&state, &path, "after", version, "owner", "preview").unwrap_err();
+
+        assert_eq!(error, "Document saves are owned by the main window");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+    }
+
+    #[test]
+    fn overwrite_token_is_bound_to_content_and_is_single_use() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        fs::write(&path, "disk").unwrap();
+        let state = AppState::default();
+        opened_editable(&state, &path);
+
+        let mismatched = issue_document_overwrite_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-1",
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        assert!(retry_document_save_with_token_inner(
+            &state,
+            &path,
+            "different",
+            "overwrite-1",
+            &mismatched.overwrite_token,
+            MAIN_SAVE_OWNER,
+        )
+        .is_err());
+        assert!(retry_document_save_with_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-1",
+            &mismatched.overwrite_token,
+            MAIN_SAVE_OWNER,
+        )
+        .is_err());
+
+        let token = issue_document_overwrite_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-2",
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        assert!(retry_document_save_with_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-2",
+            &token.overwrite_token,
+            "preview",
+        )
+        .is_err());
+        assert!(retry_document_save_with_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-2",
+            &token.overwrite_token,
+            MAIN_SAVE_OWNER,
+        )
+        .is_err());
+        let replacement_token = issue_document_overwrite_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-3",
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        let committed = retry_document_save_with_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-3",
+            &replacement_token.overwrite_token,
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        assert!(matches!(
+            committed,
+            DocumentSaveResponse::ConfirmedCommitted { .. }
+        ));
+        assert!(retry_document_save_with_token_inner(
+            &state,
+            &path,
+            "ours",
+            "overwrite-3",
+            &replacement_token.overwrite_token,
+            MAIN_SAVE_OWNER,
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "ours");
+    }
+
+    #[test]
+    fn coordinated_save_as_creates_new_and_overwrites_dialog_accepted_existing_files() {
+        let directory = tempdir().unwrap();
+        let new_path = directory.path().join("new.md");
+        let existing_path = directory.path().join("existing.md");
+        fs::write(&existing_path, "before").unwrap();
+        let state = AppState::default();
+
+        let created = save_as_coordinated_inner(
+            &state,
+            &new_path,
+            "created",
+            None,
+            "save-as-new",
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        assert!(matches!(
+            created,
+            DocumentSaveResponse::ConfirmedCommitted { .. }
+        ));
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "created");
+
+        let overwritten = save_as_coordinated_inner(
+            &state,
+            &existing_path,
+            "replacement",
+            None,
+            "save-as-existing",
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        assert!(matches!(
+            overwritten,
+            DocumentSaveResponse::ConfirmedCommitted {
+                cleanup_repair_receipt: None,
+                ..
+            }
+        ));
+        assert_eq!(fs::read_to_string(&existing_path).unwrap(), "replacement");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn committed_backup_cleanup_success_and_failure_preserve_commit_proof_without_paths() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("note.md");
+        let displaced = directory.path().join(".private-backup");
+        fs::write(&destination, "committed").unwrap();
+        fs::write(&displaced, "old").unwrap();
+        let version = crate::durable_write::capture_file_version(&destination)
+            .unwrap()
+            .unwrap();
+        let success = document_save_response_with_cleanup(
+            &destination,
+            DocumentSaveDisposition::ConfirmedCommitted {
+                version: version.clone(),
+                displaced_path: Some(displaced.clone()),
+            },
+            |path| fs::remove_file(path),
+        );
+        assert!(matches!(
+            success,
+            DocumentSaveResponse::ConfirmedCommitted {
+                cleanup_repair_receipt: None,
+                ..
+            }
+        ));
+        assert!(!displaced.exists());
+
+        let failed = document_save_response_with_cleanup(
+            &destination,
+            DocumentSaveDisposition::ConfirmedCommitted {
+                version,
+                displaced_path: Some(displaced.clone()),
+            },
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure",
+                ))
+            },
+        );
+        let wire = serde_json::to_value(failed).unwrap();
+        let receipt = wire["cleanup_repair_receipt"].as_str().unwrap();
+        assert_eq!(receipt.len(), 72);
+        assert!(receipt.starts_with("cleanup-"));
+        assert!(!wire.to_string().contains(".private-backup"));
+    }
+
+    #[test]
+    fn document_save_and_overwrite_token_dtos_have_exact_wire_contracts() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("note.md");
+        fs::write(&destination, "disk").unwrap();
+        let version = crate::durable_write::capture_file_version(&destination)
+            .unwrap()
+            .unwrap();
+        let path = destination.to_string_lossy().to_string();
+
+        let committed = serde_json::to_value(DocumentSaveResponse::ConfirmedCommitted {
+            path: path.clone(),
+            version: version.clone(),
+            cleanup_repair_receipt: Some("cleanup-opaque".to_string()),
+        })
+        .unwrap();
+        assert_eq!(committed["status"], "confirmed_committed");
+        assert_eq!(committed["path"], path);
+        assert_eq!(committed["cleanup_repair_receipt"], "cleanup-opaque");
+        assert!(committed["version"]["canonicalPath"].is_string());
+        assert!(committed["version"]["platformIdentity"].is_string());
+        assert!(committed["version"]["length"].is_string());
+        assert!(committed["version"]["modifiedNanos"].is_string());
+        assert!(committed["version"]["sha256"].is_string());
+
+        let not_committed = serde_json::to_value(DocumentSaveResponse::ConfirmedNotCommitted {
+            path: path.clone(),
+            current_version: Some(version.clone()),
+            message: "not committed".to_string(),
+        })
+        .unwrap();
+        assert_eq!(not_committed["status"], "confirmed_not_committed");
+        assert!(not_committed.get("current_version").is_some());
+
+        let conflict = serde_json::to_value(DocumentSaveResponse::Conflict {
+            path: path.clone(),
+            current_version: Some(version.clone()),
+            overwrite_token: None,
+            message: "changed".to_string(),
+        })
+        .unwrap();
+        assert_eq!(conflict["status"], "conflict");
+        assert!(conflict.get("current_version").is_some());
+        assert!(conflict.get("overwrite_token").is_none());
+        assert!(conflict.get("recovery_path").is_none());
+
+        let race_token = "b".repeat(64);
+        let race_conflict = serde_json::to_value(document_save_response(
+            &destination,
+            DocumentSaveDisposition::Conflict {
+                current_version: Some(version),
+                recovery_path: directory.path().join("private-recovery"),
+                overwrite_token: Some(OverwriteToken::from_wire(&race_token).unwrap()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(race_conflict["status"], "conflict");
+        assert_eq!(race_conflict["overwrite_token"], race_token);
+        assert!(race_conflict.get("recovery_path").is_none());
+
+        let indeterminate = serde_json::to_value(DocumentSaveResponse::Indeterminate {
+            path,
+            message: "inspect the document".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            indeterminate,
+            serde_json::json!({
+                "status": "indeterminate",
+                "path": destination.to_string_lossy(),
+                "message": "inspect the document",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(OverwriteTokenResponse {
+                overwrite_token: "a".repeat(64),
+            })
+            .unwrap(),
+            serde_json::json!({ "overwriteToken": "a".repeat(64) })
+        );
+    }
+
+    fn scripted_trash(mode: ScriptedTrashMode, recovery_path: PathBuf) -> ScriptedTrashPort {
+        ScriptedTrashPort {
+            mode,
+            recovery_path,
+            calls: 0,
+        }
+    }
+
+    #[test]
+    fn native_trash_classification_preserves_files_and_nonempty_directories_when_rejected() {
+        for directory_case in [false, true] {
+            let workspace = tempdir().unwrap();
+            let recovery = tempdir().unwrap();
+            let source = if directory_case {
+                let source = workspace.path().join("folder");
+                fs::create_dir(&source).unwrap();
+                fs::write(source.join("nested.md"), "nested").unwrap();
+                source
+            } else {
+                let source = workspace.path().join("note.md");
+                fs::write(&source, "note").unwrap();
+                source
+            };
+            let state = AppState::default();
+            let opened = open_directory_inner(&state, workspace.path()).unwrap();
+            if !directory_case {
+                open_workspace_file_inner(&state, &source).unwrap();
+            }
+            let mut port =
+                scripted_trash(ScriptedTrashMode::Rejected, recovery.path().join("unused"));
+
+            let outcome = delete_workspace_entry_with_trash_port_inner(
+                &state,
+                &opened.workspace_token,
+                &source,
+                &mut port,
+                capture_workspace_snapshot,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                outcome,
+                MutationOutcome::ConfirmedNotCommitted { .. }
+            ));
+            assert!(source.exists());
+            assert_eq!(port.calls, 1);
+            if directory_case {
+                assert!(ensure_authorized_directory_inner(&state, &source).is_ok());
+            } else {
+                assert!(ensure_authorized_write_file_inner(&state, &source).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn native_trash_classification_commits_only_with_exact_recovery_placement() {
+        for directory_case in [false, true] {
+            let workspace = tempdir().unwrap();
+            let recovery = tempdir().unwrap();
+            let source = if directory_case {
+                let source = workspace.path().join("folder");
+                fs::create_dir(&source).unwrap();
+                fs::write(source.join("nested.md"), "nested").unwrap();
+                source
+            } else {
+                let source = workspace.path().join("note.md");
+                fs::write(&source, "note").unwrap();
+                source
+            };
+            let recovery_path = recovery.path().join(if directory_case {
+                "folder-recovery"
+            } else {
+                "note-recovery.md"
+            });
+            let state = AppState::default();
+            let opened = open_directory_inner(&state, workspace.path()).unwrap();
+            if !directory_case {
+                open_workspace_file_inner(&state, &source).unwrap();
+            }
+            let mut port = scripted_trash(ScriptedTrashMode::Committed, recovery_path.clone());
+
+            let outcome = delete_workspace_entry_with_trash_port_inner(
+                &state,
+                &opened.workspace_token,
+                &source,
+                &mut port,
+                capture_workspace_snapshot,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                outcome,
+                MutationOutcome::ConfirmedCommitted { .. }
+            ));
+            assert!(!source.exists());
+            assert!(recovery_path.exists());
+            assert_eq!(port.calls, 1);
+            if !directory_case {
+                assert!(ensure_authorized_write_file_inner(&state, &source).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn native_trash_mismatched_recovery_is_indeterminate_and_suspends_file_authority() {
+        let workspace = tempdir().unwrap();
+        let recovery = tempdir().unwrap();
+        let source = workspace.path().join("note.md");
+        let recovery_path = recovery.path().join("unverified.md");
+        fs::write(&source, "before").unwrap();
+        let state = AppState::default();
+        let opened = open_directory_inner(&state, workspace.path()).unwrap();
+        open_workspace_file_inner(&state, &source).unwrap();
+        let mut port = scripted_trash(ScriptedTrashMode::PlacementMismatch, recovery_path.clone());
+
+        let outcome = delete_workspace_entry_with_trash_port_inner(
+            &state,
+            &opened.workspace_token,
+            &source,
+            &mut port,
+            capture_workspace_snapshot,
+        )
+        .unwrap();
+        let wire = serde_json::to_string(&outcome).unwrap();
+
+        assert!(matches!(outcome, MutationOutcome::Indeterminate { .. }));
+        assert!(recovery_path.exists());
+        assert!(!wire.contains(&recovery_path.to_string_lossy().to_string()));
+        assert!(!wire.contains("rejected"));
+        fs::write(&source, "replacement").unwrap();
+        assert!(ensure_authorized_write_file_inner(&state, &source).is_err());
+    }
+
+    #[test]
+    fn native_trash_post_move_error_requires_a_verified_recovery_receipt() {
+        for (mode, expected_committed) in [
+            (ScriptedTrashMode::PostMoveWithReceipt, true),
+            (ScriptedTrashMode::PostMoveWithoutReceipt, false),
+        ] {
+            let workspace = tempdir().unwrap();
+            let recovery = tempdir().unwrap();
+            let source = workspace.path().join("note.md");
+            let recovery_path = recovery.path().join("recovery.md");
+            fs::write(&source, "before").unwrap();
+            let state = AppState::default();
+            let opened = open_directory_inner(&state, workspace.path()).unwrap();
+            open_workspace_file_inner(&state, &source).unwrap();
+            let mut port = scripted_trash(mode, recovery_path.clone());
+
+            let outcome = delete_workspace_entry_with_trash_port_inner(
+                &state,
+                &opened.workspace_token,
+                &source,
+                &mut port,
+                capture_workspace_snapshot,
+            )
+            .unwrap();
+            let wire = serde_json::to_string(&outcome).unwrap();
+
+            assert_eq!(
+                matches!(&outcome, MutationOutcome::ConfirmedCommitted { .. }),
+                expected_committed
+            );
+            if !expected_committed {
+                assert!(matches!(&outcome, MutationOutcome::Indeterminate { .. }));
+            }
+            assert!(recovery_path.exists());
+            assert!(!wire.contains("post-move failure"));
+            assert!(!wire.contains(&recovery_path.to_string_lossy().to_string()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_trash_rejects_root_outside_and_symlink_before_calling_port() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("outside.md");
+        let outside_link = workspace.path().join("outside-link.md");
+        let inside_file = workspace.path().join("inside.md");
+        let inside_link = workspace.path().join("inside-link.md");
+        let inside_directory = workspace.path().join("inside-directory");
+        let directory_link = workspace.path().join("directory-link");
+        let nested_file = inside_directory.join("nested.md");
+        fs::write(&outside_file, "outside").unwrap();
+        fs::write(&inside_file, "inside").unwrap();
+        fs::create_dir(&inside_directory).unwrap();
+        fs::write(&nested_file, "nested").unwrap();
+        symlink(&outside_file, &outside_link).unwrap();
+        symlink(&inside_file, &inside_link).unwrap();
+        symlink(&inside_directory, &directory_link).unwrap();
+        let state = AppState::default();
+        let opened = open_directory_inner(&state, workspace.path()).unwrap();
+        let mut port = scripted_trash(ScriptedTrashMode::Rejected, outside.path().join("unused"));
+
+        for forbidden in [
+            workspace.path(),
+            outside_file.as_path(),
+            outside_link.as_path(),
+            inside_link.as_path(),
+            directory_link.as_path(),
+            directory_link.join("nested.md").as_path(),
+        ] {
+            let outcome = delete_workspace_entry_with_trash_port_inner(
+                &state,
+                &opened.workspace_token,
+                forbidden,
+                &mut port,
+                capture_workspace_snapshot,
+            )
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                MutationOutcome::ConfirmedNotCommitted { .. }
+            ));
+        }
+        assert_eq!(port.calls, 0);
+        assert!(outside_file.exists());
+        assert!(outside_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&inside_file).unwrap(), "inside");
+        assert!(inside_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&nested_file).unwrap(), "nested");
+        assert!(directory_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

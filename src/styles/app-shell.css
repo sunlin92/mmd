@@ -1,4 +1,5 @@
 .app-shell {
+  position: relative;
   height: 100%;
   display: flex;
   flex-direction: column;
@@ -16,13 +17,32 @@
   grid-template-columns: minmax(104px, 1fr) minmax(0, 2fr) minmax(104px, 1fr);
   align-items: center;
   gap: 10px;
-  padding: 0 14px;
+  padding: 0 52px 0 14px;
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--toolbar) 88%, transparent);
   box-shadow: 0 1px 0 var(--shadow-inset) inset;
   backdrop-filter: blur(20px) saturate(160%);
   user-select: none;
 }
+
+.settings-launch-button {
+  position: absolute;
+  z-index: 31;
+  top: 9px;
+  right: 12px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.settings-launch-button:hover,
+.settings-launch-button:focus-visible { border-color: var(--control-border); background: var(--control-hover); color: var(--chrome-text); outline: none; }
+.settings-launch-button:disabled { opacity: 0.42; cursor: not-allowed; }
 
 .brand {
   grid-column: 1;
@@ -258,6 +278,83 @@
 .workspace-entry-dialog-field input:focus,
 .workspace-entry-dialog-field select:focus { border-color: var(--accent); }
 .workspace-move-empty { margin-top: 9px !important; color: var(--warning) !important; }
+
+.settings-dialog-backdrop {
+  position: fixed;
+  z-index: 130;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--overlay);
+  backdrop-filter: blur(4px);
+  animation: shell-overlay-in 160ms ease-out both;
+}
+
+.settings-dialog {
+  position: relative;
+  inset: auto;
+  width: min(500px, 100%);
+  max-height: min(680px, calc(100vh - 48px));
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 0;
+  background: var(--panel-strong);
+  color: var(--chrome-text);
+  box-shadow: 0 20px 54px var(--shadow), 0 1px 0 var(--shadow-inset) inset;
+  animation: shell-materialize-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.settings-dialog form { display: grid; }
+.settings-dialog-header,
+.settings-dialog-heading,
+.settings-dialog-actions,
+.settings-toggle,
+.settings-field,
+.settings-number { display: flex; align-items: center; }
+.settings-dialog-header { justify-content: space-between; padding: 14px 16px 10px; }
+.settings-dialog-heading { gap: 8px; }
+.settings-dialog-heading h2 { margin: 0; font-size: 15px; line-height: 1.35; }
+.settings-dialog-close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.settings-dialog-close:hover,
+.settings-dialog-close:focus-visible { background: var(--control-hover); color: var(--chrome-text); outline: none; }
+.settings-section { display: grid; gap: 11px; padding: 12px 16px; border-top: 1px solid var(--border); }
+.settings-section h3 { margin: 0; font-size: 12px; font-weight: 650; }
+.settings-toggle,
+.settings-field { min-height: 30px; justify-content: space-between; gap: 16px; font-size: 12px; }
+.settings-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
+.settings-field > input,
+.settings-field select {
+  width: min(240px, 58%);
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: var(--control-bg);
+  color: var(--chrome-text);
+}
+.settings-field > input[type="range"] { padding: 0; accent-color: var(--accent); }
+.settings-number { width: min(240px, 58%); gap: 7px; }
+.settings-number input { width: 100%; min-width: 0; height: 30px; border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px; background: var(--control-bg); color: var(--chrome-text); }
+.settings-number small { color: var(--text-muted); }
+.settings-dialog-actions { justify-content: flex-end; gap: 8px; padding: 13px 16px; border-top: 1px solid var(--border); }
+.settings-dialog-actions .dialog-button { display: inline-flex; align-items: center; gap: 6px; }
+.settings-dialog.recovery { padding: 18px; }
+.settings-dialog.recovery > p { margin: 12px 0 0; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
+.settings-dialog.recovery .settings-dialog-actions { margin: 18px -18px -18px; }
 
 .markdown-format-dialog {
   position: absolute;

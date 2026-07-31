@@ -1,4 +1,7 @@
-param([Parameter(Mandatory = $true)][string]$ArtifactDirectory)
+param(
+  [Parameter(Mandatory = $true)][string]$ArtifactDirectory,
+  [Parameter(Mandatory = $true)][string]$Target
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -26,11 +29,25 @@ if (-not $installDirectory -or -not $mainBinary) { throw 'Tauri NSIS install met
 $appPath = Join-Path $installDirectory $mainBinary
 if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) { throw "Installed application is missing: $appPath" }
 
-$app = Start-Process -FilePath $appPath -PassThru
-Start-Sleep -Seconds 5
-if ($app.HasExited) { throw "Installed MMD exited early with code $($app.ExitCode)" }
-$app.Kill()
-$app.WaitForExit()
+$challenge = Join-Path $env:RUNNER_TEMP 'mmd-packaged-lifecycle-nsis.json'
+node scripts/ci/packaged-lifecycle-runner.mjs `
+  --evidence (Join-Path $ArtifactDirectory 'm2-lifecycle-evidence.json') `
+  --package-variant nsis `
+  --target $Target `
+  --challenge-output $challenge `
+  -- $appPath
+if ($LASTEXITCODE -ne 0) { throw 'Packaged lifecycle runner failed' }
+node scripts/ci/lifecycle-evidence.mjs verify-packaged `
+  --evidence (Join-Path $ArtifactDirectory 'm2-lifecycle-evidence.json') `
+  --artifact-directory $ArtifactDirectory `
+  --packaged-challenge $challenge `
+  --output (Join-Path $ArtifactDirectory 'm2-lifecycle-evidence.json')
+if ($LASTEXITCODE -ne 0) { throw 'Packaged lifecycle evidence verification failed' }
+node scripts/ci/artifact-manifest.mjs create $ArtifactDirectory `
+  $installers[0].Name m2-lifecycle-evidence.json
+if ($LASTEXITCODE -ne 0) { throw 'Verified artifact manifest creation failed' }
+node scripts/ci/artifact-manifest.mjs verify $ArtifactDirectory
+if ($LASTEXITCODE -ne 0) { throw 'Verified artifact manifest verification failed' }
 
 $uninstaller = Join-Path $installDirectory 'uninstall.exe'
 if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw 'NSIS uninstaller is missing' }

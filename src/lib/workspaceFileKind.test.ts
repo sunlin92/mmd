@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import canonicalWireFixture from '../../test-fixtures/tauri-wire/canonical.json';
 import malformedWireFixture from '../../test-fixtures/tauri-wire/malformed.json';
 import {
+  decodeFileVersion,
   decodeMutationOutcome,
   decodeOpenFileResponse,
   decodeSnapshotReceipt,
@@ -34,6 +35,39 @@ function decodeCommittedPath(value: unknown): { path: string } {
 }
 
 describe('workspace file kind wire decoding', () => {
+  const fileVersion = {
+    canonicalPath: '/workspace/notes.md',
+    platformIdentity: '1:2',
+    length: '7',
+    modifiedNanos: '123456789',
+    sha256: 'a'.repeat(64),
+  };
+
+  it('decodes the strict camelCase file-version wire contract', () => {
+    expect(decodeFileVersion(fileVersion)).toEqual(fileVersion);
+    expect(decodeFileVersion({
+      ...fileVersion,
+      length: '18446744073709551615',
+      modifiedNanos: '340282366920938463463374607431768211455',
+    })).toMatchObject({
+      length: '18446744073709551615',
+      modifiedNanos: '340282366920938463463374607431768211455',
+    });
+
+    for (const invalid of [
+      { ...fileVersion, canonicalPath: '' },
+      { ...fileVersion, platformIdentity: '' },
+      { ...fileVersion, length: 7 },
+      { ...fileVersion, length: '07' },
+      { ...fileVersion, length: '18446744073709551616' },
+      { ...fileVersion, modifiedNanos: '340282366920938463463374607431768211456' },
+      { ...fileVersion, sha256: 'A'.repeat(64) },
+      { ...fileVersion, unexpected: true },
+    ]) {
+      expect(() => decodeFileVersion(invalid)).toThrow('Invalid file version');
+    }
+  });
+
   it('keeps the shared file-kind fixture exhaustive', () => {
     const allKinds = {
       markdown: 'text',
@@ -75,6 +109,7 @@ describe('workspace file kind wire decoding', () => {
         path: '/workspace/notes.md',
         content_mode: 'text',
         content: '# Notes',
+        file_version: fileVersion,
       },
       {
         kind: 'html',
@@ -82,6 +117,7 @@ describe('workspace file kind wire decoding', () => {
         content_mode: 'text',
         content: '<main>Page</main>',
         mime_type: 'application/xhtml+xml',
+        file_version: fileVersion,
       },
       {
         kind: 'image',
@@ -110,6 +146,7 @@ describe('workspace file kind wire decoding', () => {
     const invalidResponses = [
       { kind: 'markdown', path: '/workspace/notes.md', content_mode: 'binary', content: '# Notes' },
       { kind: 'markdown', path: '/workspace/notes.md', content_mode: 'text' },
+      { kind: 'markdown', path: '/workspace/notes.md', content_mode: 'text', content: '# Notes' },
       {
         kind: 'html',
         path: '/workspace/page.html',
@@ -190,7 +227,13 @@ describe('workspace file kind wire decoding', () => {
   it('typescript_decoders_consume_rust_wire_fixtures_as_unknown', () => {
     const canonical = fixtureRecord(canonicalWireFixture);
     const openFileResponses = fixtureArray(canonical.open_file_responses);
-    expect(openFileResponses.map((value) => decodeOpenFileResponse(value))).toEqual(openFileResponses);
+    const versionedOpenFileResponses = openFileResponses.map((value) => {
+      const response = fixtureRecord(value);
+      return response.content_mode === 'text' ? { ...response, file_version: fileVersion } : response;
+    });
+    expect(versionedOpenFileResponses.map((value) => decodeOpenFileResponse(value))).toEqual(
+      versionedOpenFileResponses,
+    );
 
     const snapshotReceipts = fixtureRecord(canonical.snapshot_receipts);
     for (const key of ['fresh', 'stale', 'not_applicable']) {
