@@ -544,6 +544,8 @@ mod identity_tests {
             .prefix("mmd-native-trash-smoke-")
             .tempdir()
             .unwrap();
+        #[cfg(windows)]
+        crate::crash_drafts::make_directory_private(temp.path()).unwrap();
         for (name, kind) in [
             ("smoke-file.md", TrashEntryKind::File),
             ("smoke-directory", TrashEntryKind::Directory),
@@ -553,6 +555,8 @@ mod identity_tests {
                 TrashEntryKind::File => fs::write(&source, "smoke").unwrap(),
                 TrashEntryKind::Directory => {
                     fs::create_dir(&source).unwrap();
+                    #[cfg(windows)]
+                    crate::crash_drafts::make_directory_private(&source).unwrap();
                     fs::write(source.join("child.md"), "smoke").unwrap();
                 }
             }

@@ -1604,12 +1604,88 @@ fn make_file_private(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn make_directory_private(path: &Path) -> io::Result<()> {
-    apply_and_verify_private_windows_dacl(path, PRIVATE_DIRECTORY_SDDL, 0x03)
+    let sddl = private_windows_sddl(PRIVATE_DIRECTORY_SDDL, "OICI")?;
+    apply_and_verify_private_windows_dacl(path, &sddl, 0x03)
 }
 
 #[cfg(windows)]
 fn make_file_private(path: &Path) -> io::Result<()> {
-    apply_and_verify_private_windows_dacl(path, PRIVATE_FILE_SDDL, 0x00)
+    let sddl = private_windows_sddl(PRIVATE_FILE_SDDL, "")?;
+    apply_and_verify_private_windows_dacl(path, &sddl, 0x00)
+}
+
+#[cfg(windows)]
+fn current_process_token_information(
+    information_class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+) -> io::Result<Vec<usize>> {
+    use std::{mem, ptr};
+    use windows_sys::Win32::{Foundation::HANDLE, Security::GetTokenInformation};
+
+    const CURRENT_PROCESS_TOKEN: HANDLE = (-4_isize) as HANDLE;
+    let mut token_size = 0u32;
+    unsafe {
+        GetTokenInformation(
+            CURRENT_PROCESS_TOKEN,
+            information_class,
+            ptr::null_mut(),
+            0,
+            &mut token_size,
+        );
+    }
+    if token_size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let word_size = mem::size_of::<usize>();
+    let mut token = vec![0usize; (token_size as usize).div_ceil(word_size)];
+    if unsafe {
+        GetTokenInformation(
+            CURRENT_PROCESS_TOKEN,
+            information_class,
+            token.as_mut_ptr().cast(),
+            token_size,
+            &mut token_size,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(token)
+}
+
+#[cfg(windows)]
+fn current_process_user_sid_string() -> io::Result<String> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::ConvertSidToStringSidW, TokenUser, TOKEN_USER},
+    };
+
+    let token = current_process_token_information(TokenUser)?;
+    let token_user = unsafe { &*token.as_ptr().cast::<TOKEN_USER>() };
+    let mut string_sid = ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut string_sid) } == 0
+        || string_sid.is_null()
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let length = unsafe { (0..1024).position(|index| *string_sid.add(index) == 0) }
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "unterminated TokenUser SID")
+            })?;
+        String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, length) })
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid TokenUser SID"))
+    })();
+    unsafe {
+        LocalFree(string_sid.cast());
+    }
+    result
+}
+
+#[cfg(windows)]
+fn private_windows_sddl(base: &str, ace_flags: &str) -> io::Result<String> {
+    let token_user = current_process_user_sid_string()?;
+    Ok(format!("{base}(A;{ace_flags};FA;;;{token_user})"))
 }
 
 #[cfg(windows)]
@@ -1721,7 +1797,7 @@ fn apply_and_verify_private_windows_dacl(
                 AclSizeInformation,
             )
         } == 0
-            || acl_info.AceCount != 3
+            || acl_info.AceCount != 4
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1745,11 +1821,12 @@ fn verify_private_windows_aces(
 ) -> io::Result<()> {
     use std::{mem, ptr};
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, EqualSid, GetAce, WinBuiltinAdministratorsSid,
+        CreateWellKnownSid, EqualSid, GetAce, TokenUser, WinBuiltinAdministratorsSid,
         WinCreatorOwnerRightsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, SECURITY_MAX_SID_SIZE,
+        TOKEN_USER,
     };
 
-    let mut expected_sids = Vec::new();
+    let mut well_known_sids = Vec::new();
     for sid_type in [
         WinCreatorOwnerRightsSid,
         WinLocalSystemSid,
@@ -1769,11 +1846,19 @@ fn verify_private_windows_aces(
             return Err(io::Error::last_os_error());
         }
         sid.truncate(size as usize);
-        expected_sids.push(sid);
+        well_known_sids.push(sid);
     }
 
-    let mut matched = [false; 3];
-    for index in 0..3u32 {
+    let token = current_process_token_information(TokenUser)?;
+    let token_user = unsafe { &*token.as_ptr().cast::<TOKEN_USER>() };
+    let mut expected_sids: Vec<_> = well_known_sids
+        .iter()
+        .map(|sid| sid.as_ptr().cast_mut().cast())
+        .collect();
+    expected_sids.push(token_user.User.Sid);
+
+    let mut matched = vec![false; expected_sids.len()];
+    for index in 0..expected_sids.len() as u32 {
         let mut raw_ace = ptr::null_mut();
         if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
             return Err(io::Error::last_os_error());
@@ -1792,20 +1877,19 @@ fn verify_private_windows_aces(
             ));
         }
         let observed_sid = (&ace.SidStart as *const u32).cast_mut().cast();
-        let Some(expected_index) = expected_sids.iter().position(|expected| unsafe {
-            EqualSid(observed_sid, expected.as_ptr().cast_mut().cast()) != 0
-        }) else {
+        let Some(expected_index) =
+            expected_sids
+                .iter()
+                .enumerate()
+                .position(|(expected_index, expected)| {
+                    !matched[expected_index] && unsafe { EqualSid(observed_sid, *expected) != 0 }
+                })
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "private DACL trustee could not be verified",
             ));
         };
-        if matched[expected_index] {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private DACL contains a duplicate trustee",
-            ));
-        }
         matched[expected_index] = true;
     }
     if !matched.into_iter().all(|value| value) {
