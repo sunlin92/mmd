@@ -41,7 +41,7 @@
     "mpegts.js": "1.8.0",
     "pdfjs-dist": "6.1.200",
     "react": "19.2.7",
-    "react-dom": "19.2.7",
+    "react-dom": "19.2.8",
     "react-markdown": "10.1.0",
     "react-syntax-highlighter": "16.1.1",
     "rehype-katex": "7.0.1",
