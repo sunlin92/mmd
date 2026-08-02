@@ -2,6 +2,25 @@ import type { AppOpenIntent } from './openIntent';
 
 export type { AppOpenIntent } from './openIntent';
 
+const NONCANONICAL_SETTLED_ID_LIMIT = 64;
+const CANONICAL_INTENT_ID_PATTERN = /^(local-open-intent|open-intent)-([1-9]\d{0,19})$/;
+
+type CanonicalIntentNamespace = 'backend' | 'local';
+
+interface CanonicalIntentId {
+  namespace: CanonicalIntentNamespace;
+  sequence: bigint;
+}
+
+function parseCanonicalIntentId(intentId: string): CanonicalIntentId | null {
+  const match = CANONICAL_INTENT_ID_PATTERN.exec(intentId);
+  if (!match) return null;
+  return {
+    namespace: match[1] === 'open-intent' ? 'backend' : 'local',
+    sequence: BigInt(match[2]),
+  };
+}
+
 export type OpenIntentSettlement =
   | { kind: 'accepted' }
   | { kind: 'cancelled' }
@@ -22,6 +41,10 @@ export interface OpenIntentCoordinatorCallbacks {
 export class OpenIntentCoordinator {
   private activeIntent: AppOpenIntent | null = null;
   private readonly pendingIntents: AppOpenIntent[] = [];
+  // Both production namespaces are monotonic, so each high-water tombstones every lower ID.
+  private highestSettledBackendIntentSequence = 0n;
+  private highestSettledLocalIntentSequence = 0n;
+  private readonly settledNoncanonicalIntentIds = new Set<string>();
   private modalActive = false;
   private draining = false;
   private settling = false;
@@ -66,10 +89,41 @@ export class OpenIntentCoordinator {
   }
 
   private contains(intent: AppOpenIntent): boolean {
+    if (this.hasSettledIntentId(intent.id)) return true;
     return [this.activeIntent, ...this.pendingIntents].some((candidate) => {
       if (candidate == null) return false;
       return candidate.id === intent.id || this.hasSameTarget(candidate, intent);
     });
+  }
+
+  private hasSettledIntentId(intentId: string): boolean {
+    const canonical = parseCanonicalIntentId(intentId);
+    if (!canonical) return this.settledNoncanonicalIntentIds.has(intentId);
+    const highWater = canonical.namespace === 'backend'
+      ? this.highestSettledBackendIntentSequence
+      : this.highestSettledLocalIntentSequence;
+    return canonical.sequence <= highWater;
+  }
+
+  private rememberSettledIntentId(intentId: string): void {
+    const canonical = parseCanonicalIntentId(intentId);
+    if (canonical?.namespace === 'backend') {
+      if (canonical.sequence > this.highestSettledBackendIntentSequence) {
+        this.highestSettledBackendIntentSequence = canonical.sequence;
+      }
+      return;
+    }
+    if (canonical?.namespace === 'local') {
+      if (canonical.sequence > this.highestSettledLocalIntentSequence) {
+        this.highestSettledLocalIntentSequence = canonical.sequence;
+      }
+      return;
+    }
+
+    this.settledNoncanonicalIntentIds.add(intentId);
+    if (this.settledNoncanonicalIntentIds.size <= NONCANONICAL_SETTLED_ID_LIMIT) return;
+    const oldest = this.settledNoncanonicalIntentIds.values().next().value;
+    if (oldest !== undefined) this.settledNoncanonicalIntentIds.delete(oldest);
   }
 
   private hasSameTarget(left: AppOpenIntent, right: AppOpenIntent): boolean {
@@ -110,6 +164,7 @@ export class OpenIntentCoordinator {
     if (active == null || active.id !== intentId || this.settling) return false;
 
     this.activeIntent = null;
+    this.rememberSettledIntentId(intentId);
     this.settling = true;
     try {
       this.callbacks.onSettle(active, settlement);

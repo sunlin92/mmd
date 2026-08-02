@@ -22,6 +22,8 @@ const mocks = vi.hoisted(() => ({
   discardOpenIntent: vi.fn<(id: string) => Promise<boolean>>(),
   focusMainWindow: vi.fn<(intentId?: string, coalesced?: boolean) => Promise<void>>(),
   getPackagedOpenE2eConfig: vi.fn<() => Promise<unknown>>(),
+  fileSwitchCancelHandler: null as null | (() => void),
+  fileSwitchQuitHandler: null as null | (() => void),
   listen: vi.fn<(event: string, callback: (event: { payload: unknown }) => void) => Promise<() => void>>(),
   listeners: new Map<string, (event: { payload: unknown }) => void>(),
   crashOnRecoverDraft: null as null | ((draft: unknown) => Promise<void> | void),
@@ -146,13 +148,17 @@ vi.mock('./components/UnsavedExitDialog', () => ({
     onCancelExit: () => void;
     onQuitWithoutSaving: () => void;
     onSaveAndQuit: () => void;
-  }) => (
-    <div className="unsaved-dialog">
-      <button type="button" onClick={onSaveAndQuit}>{prompt.saveLabel}</button>
-      <button type="button" onClick={onCancelExit}>{prompt.cancelLabel}</button>
-      <button type="button" onClick={onQuitWithoutSaving}>{prompt.quitLabel}</button>
-    </div>
-  ),
+  }) => {
+    mocks.fileSwitchCancelHandler = onCancelExit;
+    mocks.fileSwitchQuitHandler = onQuitWithoutSaving;
+    return (
+      <div className="unsaved-dialog">
+        <button type="button" onClick={onSaveAndQuit}>{prompt.saveLabel}</button>
+        <button type="button" onClick={onCancelExit}>{prompt.cancelLabel}</button>
+        <button type="button" onClick={onQuitWithoutSaving}>{prompt.quitLabel}</button>
+      </div>
+    );
+  },
 }));
 vi.mock('./components/PopoutPaneShell', () => ({ PopoutPaneShell: ({ children }: { children?: unknown }) => children ?? null }));
 vi.mock('./components/LazyPreviewBoundary', () => ({ LazyPreviewBoundary: ({ children }: { children?: unknown }) => children ?? null }));
@@ -235,6 +241,8 @@ describe('App open intent routing', () => {
     });
     mocks.discardOpenIntent.mockReset().mockResolvedValue(true);
     mocks.focusMainWindow.mockReset().mockResolvedValue(undefined);
+    mocks.fileSwitchCancelHandler = null;
+    mocks.fileSwitchQuitHandler = null;
     mocks.getPackagedOpenE2eConfig.mockReset().mockResolvedValue(null);
     mocks.peekOpenIntent.mockReset();
     mocks.requestSessionRestore.mockReset().mockResolvedValue(undefined);
@@ -490,6 +498,69 @@ describe('App open intent routing', () => {
     expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(preview.id, preview.targetKind);
   });
 
+  it('does not replay a stale pending intent after an accepted resolve clears active ownership', async () => {
+    vi.stubEnv('VITE_MMD_PACKAGED_OPEN_E2E', '1');
+    const preview = {
+      id: 'open-intent-stale-pending', source: 'secondary_instance',
+      displayPath: '/fixtures/primary.md', targetKind: 'file',
+    };
+    mocks.getPackagedOpenE2eConfig.mockResolvedValue({
+      profile: 'apply-reobserve',
+      unicodeRenameReady: false,
+      paths: {
+        primaryFile: preview.displayPath, unicodeFile: '/fixtures/unicode space.md',
+        renamedUnicodeFile: '/fixtures/unicode renamed.md', associationFile: '/fixtures/association.md',
+        workspaceDirectory: '/fixtures/workspace', staleFile: '/fixtures/stale.md',
+      },
+    });
+    mocks.peekOpenIntent.mockResolvedValue(preview);
+    const session = createSession(true);
+    const accepted = deferred<'accepted'>();
+    let markClean: () => void = () => undefined;
+    mocks.useDocumentSession.mockImplementation(() => {
+      const [dirty, setDirty] = useState(true);
+      markClean = () => setDirty(false);
+      return { ...session, dirty };
+    });
+    mocks.resolveOpenIntentRequest
+      .mockImplementationOnce(async () => {
+        const outcome = await accepted.promise;
+        markClean();
+        return outcome;
+      })
+      .mockResolvedValue('failed');
+
+    await act(async () => root.render(<App />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(mocks.resolveOpenIntentRequest).toHaveBeenCalledOnce();
+    const staleCancelHandler = mocks.fileSwitchCancelHandler;
+    const staleQuitHandler = mocks.fileSwitchQuitHandler;
+    expect(staleCancelHandler).not.toBeNull();
+    expect(staleQuitHandler).not.toBeNull();
+
+    await act(async () => {
+      accepted.resolve('accepted');
+      await accepted.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const dirtyDecisionCountBeforeStaleHandler = mocks.recordPackagedOpenAppEvent.mock.calls.filter(([event]) => (
+      (event as { type: string }).type === 'dirty_decision'
+    )).length;
+    staleCancelHandler?.();
+    staleQuitHandler?.();
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(mocks.peekOpenIntent.mock.calls.length).toBeGreaterThan(1);
+    expect(mocks.resolveOpenIntentRequest).toHaveBeenCalledTimes(1);
+    expect(mocks.recordPackagedOpenAppEvent.mock.calls.filter(([event]) => (
+      (event as { type: string }).type === 'dirty_decision'
+    ))).toHaveLength(dirtyDecisionCountBeforeStaleHandler);
+    expect(mocks.discardOpenIntent).not.toHaveBeenCalled();
+    expect(session.setError).not.toHaveBeenCalled();
+  });
+
   it('records dirty modal decisions for backend intents but ignores local intents', async () => {
     vi.stubEnv('VITE_MMD_PACKAGED_OPEN_E2E', '1');
     const preview = {
@@ -564,6 +635,42 @@ describe('App open intent routing', () => {
       }));
 
       await act(async () => vi.advanceTimersByTimeAsync(500));
+      expect(session.resolveOpenIntentRequest).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits for the Unicode rename gate before resolving a clean packaged intent', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('VITE_MMD_PACKAGED_OPEN_E2E', '1');
+    const config = {
+      profile: 'apply-reobserve' as const,
+      unicodeRenameReady: false,
+      paths: {
+        primaryFile: '/fixtures/primary.md', unicodeFile: '/fixtures/unicode space.md',
+        renamedUnicodeFile: '/fixtures/unicode renamed.md', associationFile: '/fixtures/association.md',
+        workspaceDirectory: '/fixtures/workspace', staleFile: '/fixtures/stale.md',
+      },
+    };
+    mocks.getPackagedOpenE2eConfig
+      .mockResolvedValueOnce(config)
+      .mockResolvedValueOnce(config)
+      .mockResolvedValueOnce({ ...config, unicodeRenameReady: true });
+    const session = createSession(false);
+    mocks.useDocumentSession.mockReturnValue(session);
+    mocks.peekOpenIntent.mockResolvedValueOnce({
+      id: 'open-intent-clean-unicode', source: 'secondary_instance',
+      displayPath: config.paths.unicodeFile, targetKind: 'file',
+    }).mockResolvedValue(null);
+
+    try {
+      await act(async () => root.render(<App />));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      expect(session.resolveOpenIntentRequest).not.toHaveBeenCalled();
+
+      await act(async () => vi.advanceTimersByTimeAsync(50));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
       expect(session.resolveOpenIntentRequest).toHaveBeenCalledOnce();
     } finally {
       vi.useRealTimers();

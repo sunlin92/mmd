@@ -10,6 +10,10 @@ function intent(id: string, displayPath = `/workspace/${id}.md`): AppOpenIntent 
   return adaptBackendOpenIntent({ id, targetKind: 'unknown', displayPath, source: 'startup_args' });
 }
 
+function localIntent(id: string, path = `/workspace/${id}.md`): AppOpenIntent {
+  return createLocalOpenIntent(id, 'sidebar', path, { kind: 'workspace_file', path });
+}
+
 describe('OpenIntentCoordinator', () => {
   it('activates distinct requests in FIFO order', () => {
     const activated: string[] = [];
@@ -45,6 +49,58 @@ describe('OpenIntentCoordinator', () => {
     expect(onActivate).toHaveBeenCalledTimes(1);
     expect(onActivate).toHaveBeenLastCalledWith(intent('one'));
     expect(coordinator.pending).toEqual([]);
+  });
+
+  it('rejects a late duplicate ID after settlement without suppressing a new request', () => {
+    const onActivate = vi.fn<(next: AppOpenIntent) => void>();
+    const coordinator = new OpenIntentCoordinator({
+      onActivate,
+      onSettle: vi.fn<(settled: AppOpenIntent, settlement: OpenIntentSettlement) => void>(),
+    });
+    const first = intent('one');
+
+    expect(coordinator.enqueue(first)).toBe(true);
+    expect(coordinator.acceptActive(first.id)).toBe(true);
+    expect(coordinator.enqueue(first)).toBe(false);
+    expect(coordinator.enqueue(intent('two', first.displayPath))).toBe(true);
+
+    expect(onActivate.mock.calls.map(([activated]) => activated.id)).toEqual(['one', 'two']);
+  });
+
+  it('rejects canonical backend replays beyond 64 settlements while accepting a newer same-target ID', () => {
+    const coordinator = new OpenIntentCoordinator({
+      onActivate: vi.fn<(next: AppOpenIntent) => void>(),
+      onSettle: vi.fn<(settled: AppOpenIntent, settlement: OpenIntentSettlement) => void>(),
+    });
+    let lastPath = '';
+
+    for (let index = 1; index <= 70; index += 1) {
+      const id = `open-intent-${index * 2}`;
+      lastPath = `/workspace/backend-${index}.md`;
+      expect(coordinator.enqueue(intent(id, lastPath))).toBe(true);
+      expect(coordinator.acceptActive(id)).toBe(true);
+    }
+
+    expect(coordinator.enqueue(intent('open-intent-1', '/workspace/stale-backend.md'))).toBe(false);
+    expect(coordinator.enqueue(intent('open-intent-141', lastPath))).toBe(true);
+  });
+
+  it('rejects canonical local replays beyond 64 settlements while accepting a newer same-target ID', () => {
+    const coordinator = new OpenIntentCoordinator({
+      onActivate: vi.fn<(next: AppOpenIntent) => void>(),
+      onSettle: vi.fn<(settled: AppOpenIntent, settlement: OpenIntentSettlement) => void>(),
+    });
+    let lastPath = '';
+
+    for (let index = 1; index <= 70; index += 1) {
+      const id = `local-open-intent-${index * 2}`;
+      lastPath = `/workspace/local-${index}.md`;
+      expect(coordinator.enqueue(localIntent(id, lastPath))).toBe(true);
+      expect(coordinator.acceptActive(id)).toBe(true);
+    }
+
+    expect(coordinator.enqueue(localIntent('local-open-intent-1', '/workspace/stale-local.md'))).toBe(false);
+    expect(coordinator.enqueue(localIntent('local-open-intent-141', lastPath))).toBe(true);
   });
 
   it('coalesces exact duplicate local actions while preserving distinct targets', () => {

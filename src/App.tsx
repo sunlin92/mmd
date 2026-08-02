@@ -1436,7 +1436,11 @@ export default function App() {
     saveBeforeOpen: boolean,
   ): Promise<void> => {
     const intent = pendingOpenIntent;
-    if (!intent || openIntentSettlementRef.current.has(intent.id)) return;
+    if (
+      !intent
+      || activeOpenIntentIdRef.current !== intent.id
+      || openIntentSettlementRef.current.has(intent.id)
+    ) return;
     openIntentSettlementRef.current.add(intent.id);
     try {
       if (intent.origin === 'backend') await packagedEvidenceTailRef.current;
@@ -1510,7 +1514,11 @@ export default function App() {
 
   const cancelOpenIntent = useCallback(async (): Promise<void> => {
     const intent = pendingOpenIntent;
-    if (!intent || openIntentSettlementRef.current.has(intent.id)) return;
+    if (
+      !intent
+      || activeOpenIntentIdRef.current !== intent.id
+      || openIntentSettlementRef.current.has(intent.id)
+    ) return;
     openIntentSettlementRef.current.add(intent.id);
     try {
       if (intent.origin === 'backend' && typeof discardOpenIntent === 'function') {
@@ -1526,6 +1534,39 @@ export default function App() {
     }
   }, [locale, pendingOpenIntent, setError, setNotice, settleOpenIntent, settleWorkspaceSessionRestore]);
 
+  const packagedUnicodeRenamePending = pendingOpenIntent?.origin === 'backend'
+    && packagedOpenConfig != null
+    && pendingOpenIntent.displayPath === packagedOpenConfig.paths.unicodeFile
+    && !packagedOpenConfig.unicodeRenameReady;
+
+  useEffect(() => {
+    if (!packagedUnicodeRenamePending || dirty || unsavedFileSwitchPrompt) return undefined;
+    let disposed = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+    const poll = async () => {
+      attempts += 1;
+      try {
+        const config = await getPackagedOpenE2eConfig();
+        if (disposed || !config) return;
+        if (config.unicodeRenameReady) {
+          setPackagedOpenConfig(config);
+          return;
+        }
+      } catch {
+        // A transient instrumentation read must not bypass the rename gate.
+      }
+      if (!disposed && attempts < PACKAGED_UNICODE_READY_MAX_ATTEMPTS) {
+        timer = globalThis.setTimeout(poll, PACKAGED_UNICODE_READY_POLL_INTERVAL_MS);
+      }
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) globalThis.clearTimeout(timer);
+    };
+  }, [dirty, packagedUnicodeRenamePending, pendingOpenIntent, unsavedFileSwitchPrompt]);
+
   // A clean document can accept an active request without showing a dialog. Dirty requests
   // remain active until one of the explicit save/switch/cancel actions below runs.
   useEffect(() => {
@@ -1534,6 +1575,7 @@ export default function App() {
       || !pendingOpenIntent
       || dirty
       || openIntentModalActive
+      || packagedUnicodeRenamePending
       || openIntentSettlementRef.current.has(pendingOpenIntent.id)
     ) return;
     void processOpenIntent(false);
@@ -1541,14 +1583,16 @@ export default function App() {
     dirty,
     isPopout,
     openIntentModalActive,
+    packagedUnicodeRenamePending,
     pendingOpenIntent,
     processOpenIntent,
   ]);
 
   const handleCancelFileSwitch = useCallback(() => {
-    if (pendingOpenIntent) {
-      if (pendingOpenIntent.origin === 'backend') {
-        void recordPackagedEvidence(pendingOpenIntent, 'dirty_decision', { decision: 'cancel' })
+    const intent = pendingOpenIntent;
+    if (intent && activeOpenIntentIdRef.current === intent.id) {
+      if (intent.origin === 'backend') {
+        void recordPackagedEvidence(intent, 'dirty_decision', { decision: 'cancel' })
           .catch(reportPackagedEvidenceFailure);
       }
       void cancelOpenIntent();
@@ -1556,9 +1600,10 @@ export default function App() {
   }, [cancelOpenIntent, pendingOpenIntent, recordPackagedEvidence, reportPackagedEvidenceFailure]);
 
   const handleFileSwitchWithoutSaving = useCallback(() => {
-    if (pendingOpenIntent) {
-      if (pendingOpenIntent.origin === 'backend') {
-        void recordPackagedEvidence(pendingOpenIntent, 'dirty_decision', { decision: 'discard' })
+    const intent = pendingOpenIntent;
+    if (intent && activeOpenIntentIdRef.current === intent.id) {
+      if (intent.origin === 'backend') {
+        void recordPackagedEvidence(intent, 'dirty_decision', { decision: 'discard' })
           .catch(reportPackagedEvidenceFailure);
       }
       void processOpenIntent(false);
