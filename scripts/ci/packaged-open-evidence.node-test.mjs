@@ -411,7 +411,9 @@ test('accepts app-applied file/workspace evidence with exact Rust authorization 
   assert.equal(verified.scope.realWebviewSpellcheckAttribute, true);
 });
 
-test('accepts Windows receipt identity without weakening exact target spelling', async (t) => {
+test('accepts Windows receipt identity without weakening exact target spelling', {
+  skip: process.platform !== 'win32',
+}, async (t) => {
   const { challengePath, challenge } = await issueChallenge(
     t, 'restore-cancel', 'nsis', 'windows',
   );
@@ -493,12 +495,32 @@ test('limits Windows target equivalence to unambiguous wire spelling differences
   assert.equal(sameEvidenceTarget(
     'C:\\Docs\\File.md:stream', '\\\\?\\C:\\Docs\\File.md:stream', 'windows',
   ), false);
+  for (const invalid of [
+    'C:\\Docs\\.\\File.md',
+    'C:\\Docs\\..\\File.md',
+    'C:\\Docs\\\\File.md',
+    'C:\\Docs\\File.md.',
+    'C:\\Docs\\File.md ',
+    'C:\\Docs\\File.md:stream',
+    'C:\\Docs\\bad\u0001name.md',
+    '\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\secret.md',
+    '\\\\.\\C:\\Docs\\File.md',
+    'C:\\Docs\\NUL.txt',
+    'C:\\Docs\\COM1.md',
+    '\\\\\\share\\File.md',
+    '\\\\server\\\\File.md',
+    'session_restore',
+  ]) {
+    assert.equal(sameEvidenceTarget(invalid, invalid, 'windows'), false, invalid);
+  }
   assert.equal(sameEvidenceTarget(
     'C:\\Docs\\File.md', '\\\\?\\C:\\docs\\file.md', 'macos',
   ), false);
 });
 
-test('rejects a case-only Windows final authorization mismatch', async (t) => {
+test('rejects a case-only Windows final authorization mismatch', {
+  skip: process.platform !== 'win32',
+}, async (t) => {
   const { challengePath, challenge } = await issueChallenge(
     t, 'restore-cancel', 'nsis', 'windows',
   );
@@ -508,6 +530,41 @@ test('rejects a case-only Windows final authorization mismatch', async (t) => {
   const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /final active file lacks authorization/);
+});
+
+test('accepts a Windows apply-reobserve session restore receipt binding', {
+  skip: process.platform !== 'win32',
+}, async (t) => {
+  const { challengePath, challenge } = await issueChallenge(
+    t, 'apply-reobserve', 'nsis', 'windows',
+  );
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file']);
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('rejects an identical ambiguous Windows session restore target', {
+  skip: process.platform !== 'win32',
+}, async (t) => {
+  const { challengePath, challenge } = await issueChallenge(
+    t, 'apply-reobserve', 'nsis', 'windows',
+  );
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file']);
+  const invalidTarget = 'C:\\Docs\\..\\secret.md';
+  const prepared = receipt.events.find((event) => (
+    event.type === 'backend_prepared' && event.step === 'session-restore'
+  ));
+  const settlement = receipt.events.find((event) => (
+    event.type === 'backend_receipt_settled' && event.step === 'session-restore'
+  ));
+  prepared.target = invalidTarget;
+  settlement.target = invalidTarget;
+  normalizeAuthorization(receipt);
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /receipt settlement does not match its preparation/);
 });
 
 test('accepts a zero-receipt session restore lifecycle', async (t) => {

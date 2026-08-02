@@ -231,10 +231,11 @@ function isUnambiguousWindowsComponent(component) {
 }
 
 export function sameEvidenceTarget(left, right, platform) {
-  if (left === right) return true;
-  if (platform !== 'windows' || typeof left !== 'string' || typeof right !== 'string') return false;
+  if (platform !== 'windows') return left === right;
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
   const normalizedLeft = normalizeWindowsEvidenceTarget(left);
-  return normalizedLeft !== null && normalizedLeft === normalizeWindowsEvidenceTarget(right);
+  const normalizedRight = normalizeWindowsEvidenceTarget(right);
+  return normalizedLeft !== null && normalizedRight !== null && normalizedLeft === normalizedRight;
 }
 
 function validateNativeDelivery(receipt, challenge, events) {
@@ -478,7 +479,10 @@ function validateIntentLifecycle(start, events, platform) {
   const receiptSettlements = eventsOfType(intentEvents, 'backend_receipt_settled');
   const applied = exactlyOne(intentEvents, 'app_applied', identity);
   const expectedTarget = start.target ?? reobserved.target;
-  if (!sameEvidenceTarget(reobserved.target, expectedTarget, platform)
+  const targetMatches = sessionRestore
+    ? reobserved.target === 'session_restore'
+    : sameEvidenceTarget(reobserved.target, expectedTarget, platform);
+  if (!targetMatches
     || (sessionRestore && reobserved.targetKind !== 'session_restore')
     || (!sessionRestore && reobserved.targetKind === 'session_restore')
     || applied.status !== 'accepted'
