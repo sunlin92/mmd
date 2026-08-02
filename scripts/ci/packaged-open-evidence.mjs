@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const GATE = 'packaged-native-open-e2e';
 const SCHEMA = 2;
@@ -183,6 +184,23 @@ function assertOrder(identity, ordered) {
   }
 }
 
+function normalizeWindowsEvidenceTarget(target) {
+  const normalized = target.replaceAll('/', '\\');
+  const verbatimDrive = normalized.match(/^\\\\\?\\([a-z]:\\.*)$/i);
+  if (verbatimDrive) return verbatimDrive[1].replace(/[A-Z]/g, (value) => value.toLowerCase());
+  const verbatimUnc = normalized.match(/^\\\\\?\\unc\\(.+)$/i);
+  const wirePath = verbatimUnc ? `\\\\${verbatimUnc[1]}` : normalized;
+  return wirePath.replace(/[A-Z]/g, (value) => value.toLowerCase());
+}
+
+export function sameEvidenceTarget(left, right, platform) {
+  if (left === right) return true;
+  return platform === 'windows'
+    && typeof left === 'string'
+    && typeof right === 'string'
+    && normalizeWindowsEvidenceTarget(left) === normalizeWindowsEvidenceTarget(right);
+}
+
 function validateNativeDelivery(receipt, challenge, events) {
   const primary = requireRecord(receipt.primary, 'primary process evidence');
   const primaryPid = requireSafePositiveInteger(primary.pid, 'primary pid');
@@ -198,8 +216,8 @@ function validateNativeDelivery(receipt, challenge, events) {
   }
   const unicode = deliveries.find((event) => event.step === 'cli-secondary-unicode' && event.outcome === 'enqueued');
   const duplicate = deliveries.find((event) => event.step === 'cli-secondary-duplicate');
-  if (!unicode || unicode.target !== challenge.scenario.paths.unicodeFile
-    || !duplicate || duplicate.target !== challenge.scenario.paths.unicodeFile
+  if (!unicode || !sameEvidenceTarget(unicode.target, challenge.scenario.paths.unicodeFile, challenge.platform)
+    || !duplicate || !sameEvidenceTarget(duplicate.target, challenge.scenario.paths.unicodeFile, challenge.platform)
     || duplicate.outcome !== 'coalesced' || duplicate.intentId !== unicode.intentId) {
     throw new Error('duplicate native delivery was not coalesced onto the original intent');
   }
@@ -209,7 +227,11 @@ function validateNativeDelivery(receipt, challenge, events) {
     ['cli-stale', challenge.scenario.paths.staleFile],
   ]);
   for (const [step, target] of requiredTargets) {
-    if (!deliveries.some((event) => event.step === step && event.target === target && event.outcome === 'enqueued')) {
+    if (!deliveries.some((event) => (
+      event.step === step
+        && sameEvidenceTarget(event.target, target, challenge.platform)
+        && event.outcome === 'enqueued'
+    ))) {
       throw new Error(`${step} native delivery evidence is missing`);
     }
   }
@@ -225,12 +247,12 @@ function validateNativeDelivery(receipt, challenge, events) {
   } else {
     const associationDelivery = deliveries.find((event) => (
       event.step === 'file-association'
-        && event.target === challenge.scenario.paths.associationFile
+        && sameEvidenceTarget(event.target, challenge.scenario.paths.associationFile, challenge.platform)
         && event.outcome === 'enqueued'
     ));
     if (association.status !== 'verified'
       || association.launcher !== 'platform-native'
-      || association.target !== challenge.scenario.paths.associationFile
+      || !sameEvidenceTarget(association.target, challenge.scenario.paths.associationFile, challenge.platform)
       || !associationDelivery) {
       throw new Error('installed package association evidence lacks native delivery');
     }
@@ -315,7 +337,7 @@ function validateDirtyGuard(identity, activated, intentEvents) {
   return { events: [modals[0], decisions[0]], decision: decisions[0].decision, observed: true };
 }
 
-function validatePreparedReceipts(identity, prepared, settlements, sessionRestore) {
+function validatePreparedReceipts(identity, prepared, settlements, sessionRestore, platform) {
   if (sessionRestore) {
     const kinds = prepared.map((event) => event.receiptKind);
     if (prepared.length === 1 && kinds[0] === 'none') {
@@ -349,7 +371,7 @@ function validatePreparedReceipts(identity, prepared, settlements, sessionRestor
     const expectedSettlement = settlement.receiptKind === 'workspace' ? 'applied' : 'committed';
     if (!preparedEvent || settledDigests.has(settlement.receiptDigest)
       || settlement.receiptKind !== preparedEvent.receiptKind
-      || settlement.target !== preparedEvent.target
+      || !sameEvidenceTarget(settlement.target, preparedEvent.target, platform)
       || settlement.settlement !== expectedSettlement) {
       throw new Error(`${identity} receipt settlement does not match its preparation`);
     }
@@ -358,7 +380,7 @@ function validatePreparedReceipts(identity, prepared, settlements, sessionRestor
   return { receiptCount: prepared.length };
 }
 
-function validateIntentLifecycle(start, events) {
+function validateIntentLifecycle(start, events, platform) {
   const identity = `${start.intentId}/${start.step}`;
   const sessionRestore = start.type === 'session_restore_queued';
   const intentEvents = events.filter((event) => (
@@ -399,7 +421,8 @@ function validateIntentLifecycle(start, events) {
       || eventsOfType(intentEvents, 'app_applied').length !== 0) {
       throw new Error(`${identity} rejected lifecycle contains contradictory events`);
     }
-    if (rejected[0].target !== start.target || requireDelta(rejected[0]).added.length !== 0) {
+    if (!sameEvidenceTarget(rejected[0].target, start.target, platform)
+      || requireDelta(rejected[0]).added.length !== 0) {
       throw new Error(`${identity} rejected target or authorization delta is invalid`);
     }
     assertOrder(identity, [...prefix, rejected[0], settled]);
@@ -419,7 +442,7 @@ function validateIntentLifecycle(start, events) {
   const receiptSettlements = eventsOfType(intentEvents, 'backend_receipt_settled');
   const applied = exactlyOne(intentEvents, 'app_applied', identity);
   const expectedTarget = start.target ?? reobserved.target;
-  if (reobserved.target !== expectedTarget
+  if (!sameEvidenceTarget(reobserved.target, expectedTarget, platform)
     || (sessionRestore && reobserved.targetKind !== 'session_restore')
     || (!sessionRestore && reobserved.targetKind === 'session_restore')
     || applied.status !== 'accepted'
@@ -429,11 +452,11 @@ function validateIntentLifecycle(start, events) {
   }
   const expectedReceiptKind = reobserved.targetKind === 'directory' ? 'workspace' : 'file';
   if (!sessionRestore && (prepared[0]?.receiptKind !== expectedReceiptKind
-    || receiptSettlements[0]?.target !== expectedTarget)) {
+    || !sameEvidenceTarget(receiptSettlements[0]?.target, expectedTarget, platform))) {
     throw new Error(`${identity} applied lifecycle binding is invalid`);
   }
   const receiptFacts = validatePreparedReceipts(
-    identity, prepared, receiptSettlements, sessionRestore,
+    identity, prepared, receiptSettlements, sessionRestore, platform,
   );
   assertOrder(identity, [...prefix, reobserved, ...prepared, ...receiptSettlements, applied, settled]);
   return {
@@ -447,7 +470,7 @@ function validateIntentLifecycle(start, events) {
   };
 }
 
-function validateCausalLifecycles(events, deliveries) {
+function validateCausalLifecycles(events, deliveries, platform) {
   const starts = [
     ...deliveries.filter((event) => event.outcome === 'enqueued'),
     ...events.filter((event) => event.type === 'session_restore_queued'),
@@ -457,7 +480,7 @@ function validateCausalLifecycles(events, deliveries) {
   for (const start of starts) {
     if (intentIds.has(start.intentId)) throw new Error(`duplicate enqueued intent ${start.intentId}`);
     intentIds.add(start.intentId);
-    facts.push({ start, ...validateIntentLifecycle(start, events) });
+    facts.push({ start, ...validateIntentLifecycle(start, events, platform) });
   }
   if (events.some((event) => (
     LIFECYCLE_TYPES.has(event.type) && !intentIds.has(event.intentId)
@@ -470,10 +493,12 @@ function validateCausalLifecycles(events, deliveries) {
 function validateApplyReobserve(challenge, lifecycleFacts) {
   const unicode = lifecycleFacts.find(({ start }) => start.step === 'cli-secondary-unicode');
   const stale = lifecycleFacts.find(({ start }) => start.step === 'cli-stale');
-  if (unicode?.kind !== 'rejected' || unicode.rejection.target !== challenge.scenario.paths.unicodeFile) {
+  if (unicode?.kind !== 'rejected'
+    || !sameEvidenceTarget(unicode.rejection.target, challenge.scenario.paths.unicodeFile, challenge.platform)) {
     throw new Error('renamed Unicode target was not rejected separately');
   }
-  if (stale?.kind !== 'rejected' || stale.rejection.target !== challenge.scenario.paths.staleFile) {
+  if (stale?.kind !== 'rejected'
+    || !sameEvidenceTarget(stale.rejection.target, challenge.scenario.paths.staleFile, challenge.platform)) {
     throw new Error('stale target was not rejected separately');
   }
   const appliedFile = lifecycleFacts.some((fact) => fact.kind === 'applied' && fact.targetKind === 'file');
@@ -540,15 +565,15 @@ function validateAuthorizationGrant(item, description) {
 }
 
 function applyGrantDelta(ledger, delta, description) {
-  const removedKeys = new Set();
+  const removedGrants = new Map();
   for (const item of delta.removed) {
     const grant = validateAuthorizationGrant(item, `${description} removed grant`);
     const key = authorizationGrantKey(grant);
-    if (removedKeys.has(key)
+    if (removedGrants.has(key)
       || authorizationGrantSignature(ledger.get(key) ?? {}) !== authorizationGrantSignature(grant)) {
       throw new Error(`${description} removed grant is not present in producer state`);
     }
-    removedKeys.add(key);
+    removedGrants.set(key, grant);
     ledger.delete(key);
   }
   const addedKeys = new Set();
@@ -558,8 +583,20 @@ function applyGrantDelta(ledger, delta, description) {
     if (addedKeys.has(key) || ledger.has(key)) {
       throw new Error(`${description} added grant already exists in producer state`);
     }
+    const removed = removedGrants.get(key);
+    if (!removed && grant.count !== 1) {
+      throw new Error(`${description} new grant count must be 1`);
+    }
+    if (removed && grant.count !== removed.count + 1) {
+      throw new Error(`${description} aggregate grant count must increment by 1`);
+    }
     addedKeys.add(key);
     ledger.set(key, grant);
+  }
+  for (const key of removedGrants.keys()) {
+    if (!addedKeys.has(key)) {
+      throw new Error(`${description} removed grant must be re-added by the same transition`);
+    }
   }
 }
 
@@ -625,30 +662,39 @@ function sortedGrantSignatures(grants) {
   return [...grants].map(authorizationGrantSignature).sort();
 }
 
-function validateFinalAuthorizationBindings(receipt, lifecycleFacts, finalGrants) {
+function validateFinalAuthorizationBindings(receipt, lifecycleFacts, finalGrants, platform) {
   const app = requireRecord(receipt.final.app, 'final app evidence');
   if (app.activeFile !== null
-    && !finalGrants.some((item) => grantMatches(
-      item, 'exact_rw', app.activeFile, 'open_document',
+    && !finalGrants.some((item) => (
+      item.kind === 'exact_rw'
+        && item.origin === 'open_document'
+        && item.status === 'active'
+        && sameEvidenceTarget(item.path, app.activeFile, platform)
     ))) {
     throw new Error('final active file lacks authorization');
   }
   if (app.workspaceRoot !== null
-    && !finalGrants.some((item) => grantMatches(
-      item, 'directory_read', app.workspaceRoot, 'workspace',
+    && !finalGrants.some((item) => (
+      item.kind === 'directory_read'
+        && item.origin === 'workspace'
+        && item.status === 'active'
+        && sameEvidenceTarget(item.path, app.workspaceRoot, platform)
     ))) {
     throw new Error('final workspace root lacks authorization');
   }
 
-  const rejectedTargets = new Set(lifecycleFacts
+  const rejectedTargets = lifecycleFacts
     .filter((fact) => fact.kind === 'rejected')
-    .map((fact) => fact.rejection.target));
-  if (finalGrants.some((item) => item.status === 'active' && rejectedTargets.has(item.path))) {
+    .map((fact) => fact.rejection.target);
+  if (finalGrants.some((item) => (
+    item.status === 'active'
+      && rejectedTargets.some((target) => sameEvidenceTarget(item.path, target, platform))
+  ))) {
     throw new Error('rejected target retains final authorization');
   }
 }
 
-function validateAuthorizationEvidence(receipt, lifecycleFacts) {
+function validateAuthorizationEvidence(receipt, lifecycleFacts, platform) {
   const groups = lifecycleFacts
     .flatMap((fact) => fact.authorizationProducers ?? [])
     .sort((left, right) => left[0].seq - right[0].seq);
@@ -678,7 +724,7 @@ function validateAuthorizationEvidence(receipt, lifecycleFacts) {
     !== JSON.stringify(sortedGrantSignatures(ledger.values()))) {
     throw new Error('final authorization grants do not match producer deltas');
   }
-  validateFinalAuthorizationBindings(receipt, lifecycleFacts, finalGrants);
+  validateFinalAuthorizationBindings(receipt, lifecycleFacts, finalGrants, platform);
   return groups.some((group) => group[0].type === 'backend_receipt_settled');
 }
 
@@ -754,13 +800,13 @@ async function verify(arguments_) {
   const events = validateEvents(receipt);
   const nativeFacts = validateNativeDelivery(receipt, challenge, events);
   const focusFacts = validateFocus(events, nativeFacts.primaryPid, nativeFacts.deliveries);
-  const lifecycleFacts = validateCausalLifecycles(events, nativeFacts.deliveries);
+  const lifecycleFacts = validateCausalLifecycles(events, nativeFacts.deliveries, challenge.platform);
   const profileFacts = challenge.profile === 'apply-reobserve'
     ? validateApplyReobserve(challenge, lifecycleFacts)
     : validateRestoreCancel(lifecycleFacts);
   const fifoQueue = validateFifo(lifecycleFacts);
   validateFinal(receipt);
-  const exactAuthorization = validateAuthorizationEvidence(receipt, lifecycleFacts);
+  const exactAuthorization = validateAuthorizationEvidence(receipt, lifecycleFacts, challenge.platform);
   await validateFixtureState(challenge);
   await writeJsonAtomic(output, {
     ...receipt,
@@ -788,13 +834,15 @@ async function verify(arguments_) {
   });
 }
 
-const operation = process.argv[2];
-const arguments_ = process.argv.slice(3);
-try {
-  if (operation === 'issue') await issue(arguments_);
-  else if (operation === 'verify') await verify(arguments_);
-  else throw new Error('usage: packaged-open-evidence.mjs issue|verify [options]');
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const operation = process.argv[2];
+  const arguments_ = process.argv.slice(3);
+  try {
+    if (operation === 'issue') await issue(arguments_);
+    else if (operation === 'verify') await verify(arguments_);
+    else throw new Error('usage: packaged-open-evidence.mjs issue|verify [options]');
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
 }

@@ -7,6 +7,8 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { sameEvidenceTarget } from './packaged-open-evidence.mjs';
+
 const evidenceScript = fileURLToPath(new URL('./packaged-open-evidence.mjs', import.meta.url));
 
 function run(arguments_) {
@@ -407,6 +409,45 @@ test('accepts app-applied file/workspace evidence with exact Rust authorization 
   assert.equal(verified.scope.cliOpen, true);
   assert.equal(verified.scope.exactAuthorization, true);
   assert.equal(verified.scope.realWebviewSpellcheckAttribute, true);
+});
+
+test('accepts Windows-equivalent queued and canonical target spellings', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(
+    t, 'restore-cancel', 'nsis', 'windows',
+  );
+  const receipt = restoreCancelReceipt(challenge);
+  const duplicate = receipt.events.find((event) => (
+    event.type === 'native_delivery' && event.step === 'cli-secondary-duplicate'
+  ));
+  const reobserved = receipt.events.find((event) => (
+    event.type === 'backend_reobserved' && event.step === 'cli-primary'
+  ));
+  duplicate.target = duplicate.target.toUpperCase();
+  reobserved.target = reobserved.target.toUpperCase();
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('limits Windows target equivalence to wire spelling differences', () => {
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md', '\\\\?\\C:\\docs\\file.md', 'windows',
+  ), true);
+  assert.equal(sameEvidenceTarget(
+    '\\\\server\\share\\Docs\\File.md',
+    '\\\\?\\UNC\\SERVER\\SHARE\\docs\\file.md',
+    'windows',
+  ), true);
+  assert.equal(sameEvidenceTarget('C:\\Docs\\File.md', 'c:/docs/file.md', 'windows'), true);
+  assert.equal(sameEvidenceTarget(
+    'C:\\secret.md', 'C:\\safe\\..\\secret.md', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
+    'C:\\secret.md', '\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\secret.md', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md', '\\\\?\\C:\\docs\\file.md', 'macos',
+  ), false);
 });
 
 test('accepts a zero-receipt session restore lifecycle', async (t) => {
@@ -834,6 +875,71 @@ test('rejects removal of a grant absent from the producer ledger', async (t) => 
   const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /removed grant is not present in producer state/);
+});
+
+test('rejects an inflated count for a newly produced authorization grant', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(t);
+  const receipt = applyReceipt(challenge);
+  const settlement = receipt.events.find((event) => (
+    event.type === 'backend_receipt_settled'
+      && event.step === 'cli-primary'
+  ));
+  const added = settlement.authorizationDelta.added.find((item) => (
+    item.kind === 'exact_rw' && item.path === challenge.scenario.paths.primaryFile
+  ));
+  const finalGrant = receipt.final.authorization.grants.find((item) => (
+    grantKey(item) === grantKey(added)
+  ));
+  added.count = 7;
+  finalGrant.count = 7;
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /new grant count must be 1/);
+});
+
+test('rejects a skipped count in an aggregate authorization increment', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(t);
+  const receipt = applyReceipt(challenge);
+  const settlement = receipt.events.find((event) => (
+    event.type === 'backend_receipt_settled'
+      && event.step === 'file-association'
+  ));
+  const added = settlement.authorizationDelta.added.find((item) => item.kind === 'internal_asset');
+  const removed = settlement.authorizationDelta.removed.find((item) => (
+    grantKey(item) === grantKey(added)
+  ));
+  const finalGrant = receipt.final.authorization.grants.find((item) => (
+    grantKey(item) === grantKey(added)
+  ));
+  assert.equal(removed.count, 1);
+  added.count = 3;
+  finalGrant.count = 3;
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /aggregate grant count must increment by 1/);
+});
+
+test('rejects a settlement that removes an unrelated existing grant', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(t);
+  const receipt = applyReceipt(challenge);
+  const settlement = receipt.events.find((event) => (
+    event.type === 'backend_receipt_settled'
+      && event.step === 'file-association'
+  ));
+  const unrelated = receipt.final.authorization.grants.find((item) => (
+    item.kind === 'exact_rw' && item.path === challenge.scenario.paths.primaryFile
+  ));
+  settlement.authorizationDelta.removed.push(structuredClone(unrelated));
+  receipt.final.authorization.grants = receipt.final.authorization.grants.filter((item) => (
+    grantKey(item) !== grantKey(unrelated)
+  ));
+  receipt.final.app.activeFile = challenge.scenario.paths.associationFile;
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /removed grant must be re-added by the same transition/);
 });
 
 test('rejects final authorization grants that do not match producer deltas', async (t) => {
