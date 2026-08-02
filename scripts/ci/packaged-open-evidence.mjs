@@ -349,7 +349,7 @@ function validatePreparedReceipts(identity, prepared, settlements, sessionRestor
     const expectedSettlement = settlement.receiptKind === 'workspace' ? 'applied' : 'committed';
     if (!preparedEvent || settledDigests.has(settlement.receiptDigest)
       || settlement.receiptKind !== preparedEvent.receiptKind
-      || (sessionRestore && settlement.target !== preparedEvent.target)
+      || settlement.target !== preparedEvent.target
       || settlement.settlement !== expectedSettlement) {
       throw new Error(`${identity} receipt settlement does not match its preparation`);
     }

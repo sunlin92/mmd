@@ -244,7 +244,7 @@ function appliedLifecycle(push, intentId, step, target, targetKind, receiptChara
   push('app', 'app_activated', intentId, step, { dirty: false, activeFileBefore: null });
   push('backend', 'backend_reobserved', intentId, step, { target, targetKind });
   push('backend', 'backend_prepared', intentId, step, {
-    receiptKind, receiptDigest, authorizationDelta: delta([], pendingOptions),
+    receiptKind, receiptDigest, target, authorizationDelta: delta([], pendingOptions),
   });
   push('backend', 'backend_receipt_settled', intentId, step, {
     receiptKind, receiptDigest, settlement, target,
@@ -271,7 +271,10 @@ function applyReceipt(challenge) {
   nativePreamble(challenge, push);
   push('app', 'app_activated', 'open-intent-1', 'cli-primary', { dirty: false, activeFileBefore: null });
   push('backend', 'backend_reobserved', 'open-intent-1', 'cli-primary', { target: challenge.scenario.paths.primaryFile, targetKind: 'file' });
-  push('backend', 'backend_prepared', 'open-intent-1', 'cli-primary', { receiptKind: 'file', receiptDigest: 'a'.repeat(64), authorizationDelta: delta([], { fileAfter: 1 }) });
+  push('backend', 'backend_prepared', 'open-intent-1', 'cli-primary', {
+    receiptKind: 'file', receiptDigest: 'a'.repeat(64), target: challenge.scenario.paths.primaryFile,
+    authorizationDelta: delta([], { fileAfter: 1 }),
+  });
   push('backend', 'backend_receipt_settled', 'open-intent-1', 'cli-primary', {
     receiptKind: 'file', receiptDigest: 'a'.repeat(64), settlement: 'committed', target: challenge.scenario.paths.primaryFile,
     authorizationDelta: delta([
@@ -300,7 +303,10 @@ function applyReceipt(challenge) {
 
   push('app', 'app_activated', 'open-intent-4', 'cli-directory', { dirty: false, activeFileBefore: challenge.scenario.paths.primaryFile });
   push('backend', 'backend_reobserved', 'open-intent-4', 'cli-directory', { target: challenge.scenario.paths.workspaceDirectory, targetKind: 'directory' });
-  push('backend', 'backend_prepared', 'open-intent-4', 'cli-directory', { receiptKind: 'workspace', receiptDigest: 'b'.repeat(64), authorizationDelta: delta([], { workspaceAfter: 1 }) });
+  push('backend', 'backend_prepared', 'open-intent-4', 'cli-directory', {
+    receiptKind: 'workspace', receiptDigest: 'b'.repeat(64), target: challenge.scenario.paths.workspaceDirectory,
+    authorizationDelta: delta([], { workspaceAfter: 1 }),
+  });
   push('backend', 'backend_receipt_settled', 'open-intent-4', 'cli-directory', {
     receiptKind: 'workspace', receiptDigest: 'b'.repeat(64), settlement: 'applied', target: challenge.scenario.paths.workspaceDirectory,
     authorizationDelta: delta([
@@ -442,6 +448,19 @@ test('rejects a session restore settlement for a different prepared target', asy
     event.type === 'backend_prepared' && event.step === 'session-restore'
   ));
   prepared.target = challenge.scenario.paths.unicodeFile;
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /receipt settlement does not match its preparation/);
+});
+
+test('rejects a native settlement for a different prepared target', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(t);
+  const receipt = applyReceipt(challenge);
+  const prepared = receipt.events.find((event) => (
+    event.type === 'backend_prepared' && event.step === 'cli-primary'
+  ));
+  prepared.target = challenge.scenario.paths.unicodeFile;
+
   const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /receipt settlement does not match its preparation/);
@@ -616,6 +635,7 @@ test('rejects apply-reobserve evidence with only the stale rejection', async (t)
     {
       actor: 'backend', type: 'backend_prepared', intentId: 'open-intent-3',
       step: 'cli-secondary-unicode', receiptKind: 'file', receiptDigest: 'd'.repeat(64),
+      target: challenge.scenario.paths.unicodeFile,
       authorizationDelta: delta([], { fileAfter: 1 }),
     },
     {
