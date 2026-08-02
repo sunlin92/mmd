@@ -11,10 +11,13 @@ import type {
   PreparedOpenFileResponse,
   RecentFilesSnapshot,
   RenameWorkspaceEntryResponse,
-  WorkspaceSessionRestore,
   WorkspaceFileKind,
   WorkspaceMutation,
   WorkspaceSnapshot,
+  WorkspaceIndexDiscardResponse,
+  WorkspaceIndexQueryKind,
+  WorkspaceIndexQueryResponse,
+  WorkspaceIndexRebuildResponse,
   AppSettings,
   SettingsEnvelope,
 } from '../types';
@@ -32,11 +35,21 @@ import {
   decodePreparedOpenFileResponse,
   decodeRecentFilesSnapshot,
 } from './recentFiles';
-import { decodeWorkspaceSessionRestore } from './workspaceSession';
 import type { ThemePreference } from './theme';
 import type { EffectiveLocale, LocalePreference } from './locale';
 import { decodeSettingsEnvelope } from './settings';
 import { decodeDocumentSaveResponse, decodeOverwriteTokenResponse } from './documentSave';
+import {
+  decodeWorkspaceIndexDiscardResponse,
+  decodeWorkspaceIndexQueryResponse,
+  decodeWorkspaceIndexRebuildResponse,
+} from './workspaceSearch';
+import {
+  decodeOpenIntentPreview,
+  decodeResolvedOpenIntent,
+  type OpenIntentPreview,
+  type ResolvedOpenIntent,
+} from './openIntent';
 
 export async function getSettings(): Promise<SettingsEnvelope> {
   return decodeSettingsEnvelope(await invoke<unknown>('get_settings'));
@@ -58,6 +71,177 @@ export async function refreshDirectory(workspaceToken: string, path: string): Pr
 export async function openWorkspaceFile(path: string): Promise<PreparedOpenFileResponse> {
   const response = await invoke<unknown>('open_workspace_file', { path });
   return decodePreparedOpenFileResponse(response);
+}
+
+export async function rebuildWorkspaceIndex(
+  workspaceToken: string,
+  workspaceRoot: string,
+  operationId: string,
+): Promise<WorkspaceIndexRebuildResponse> {
+  return decodeWorkspaceIndexRebuildResponse(await invoke<unknown>('rebuild_workspace_index', {
+    workspaceToken,
+    workspaceRoot,
+    operationId,
+  }));
+}
+
+export async function queryWorkspaceIndex(
+  workspaceToken: string,
+  workspaceRoot: string,
+  operationId: string,
+  query: { kind: WorkspaceIndexQueryKind; text: string },
+): Promise<WorkspaceIndexQueryResponse> {
+  return decodeWorkspaceIndexQueryResponse(await invoke<unknown>('query_workspace_index', {
+    workspaceToken,
+    workspaceRoot,
+    operationId,
+    query,
+  }));
+}
+
+export async function discardWorkspaceIndex(
+  workspaceToken: string,
+  workspaceRoot: string,
+): Promise<WorkspaceIndexDiscardResponse> {
+  return decodeWorkspaceIndexDiscardResponse(await invoke<unknown>('discard_workspace_index', {
+    workspaceToken,
+    workspaceRoot,
+  }));
+}
+
+export async function cancelWorkspaceIndexOperation(operationId: string): Promise<boolean> {
+  const response = await invoke<unknown>('cancel_workspace_index_operation', { operationId });
+  if (
+    typeof response !== 'object'
+    || response === null
+    || Array.isArray(response)
+    || Object.keys(response).length !== 1
+    || typeof (response as { cancelled?: unknown }).cancelled !== 'boolean'
+  ) throw new Error('Invalid workspace index cancellation response');
+  return (response as { cancelled: boolean }).cancelled;
+}
+
+export async function openWorkspaceIndexResult(
+  workspaceToken: string,
+  workspaceRoot: string,
+  indexGeneration: number,
+  relativePath: string,
+): Promise<PreparedOpenFileResponse> {
+  return decodePreparedOpenFileResponse(await invoke<unknown>('open_workspace_index_result', {
+    workspaceToken,
+    workspaceRoot,
+    indexGeneration,
+    relativePath,
+  }));
+}
+
+export async function peekOpenIntent(): Promise<OpenIntentPreview | null> {
+  const response = await invoke<unknown>('peek_open_intent');
+  return response === null ? null : decodeOpenIntentPreview(response);
+}
+
+export function requestSessionRestore(): Promise<void> {
+  return invoke<void>('request_session_restore');
+}
+
+export async function resolveOpenIntent(intentId: string): Promise<ResolvedOpenIntent> {
+  return decodeResolvedOpenIntent(await invoke<unknown>('resolve_open_intent', { intentId }));
+}
+
+export function discardOpenIntent(intentId: string): Promise<boolean> {
+  return invoke<boolean>('discard_open_intent', { intentId });
+}
+
+export function focusMainWindow(intentId?: string, coalesced = false): Promise<void> {
+  return invoke<void>('focus_main_window', { intentId, coalesced });
+}
+
+export type WorkspaceOpenSettlement = 'applied' | 'discarded' | 'expired' | 'unknown';
+
+export async function settleOpenIntentWorkspace(
+  workspaceOpenReceipt: string,
+  applied: boolean,
+): Promise<WorkspaceOpenSettlement> {
+  const response = await invoke<unknown>('settle_open_intent_workspace', {
+    workspaceOpenReceipt,
+    applied,
+  });
+  if (
+    response !== 'applied'
+    && response !== 'discarded'
+    && response !== 'expired'
+    && response !== 'unknown'
+  ) throw new Error('Invalid workspace open settlement response');
+  return response;
+}
+
+export interface PackagedOpenE2eConfig {
+  profile: 'apply-reobserve' | 'restore-cancel';
+  unicodeRenameReady: boolean;
+  paths: {
+    primaryFile: string;
+    unicodeFile: string;
+    renamedUnicodeFile: string;
+    associationFile: string;
+    workspaceDirectory: string;
+    staleFile: string;
+  };
+}
+
+export type PackagedOpenAppEventType =
+  | 'app_activated'
+  | 'dirty_modal_opened'
+  | 'dirty_decision'
+  | 'app_applied'
+  | 'app_settled';
+
+export interface PackagedOpenAppEvent {
+  type: PackagedOpenAppEventType;
+  intentId: string;
+  step: string;
+  fields: Record<string, unknown>;
+}
+
+function decodePackagedOpenE2eConfig(value: unknown): PackagedOpenE2eConfig | null {
+  if (value === null) return null;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid packaged open E2E config');
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).length !== 3
+    || (record.profile !== 'apply-reobserve' && record.profile !== 'restore-cancel')
+    || typeof record.unicodeRenameReady !== 'boolean'
+    || typeof record.paths !== 'object'
+    || record.paths === null
+    || Array.isArray(record.paths)) {
+    throw new Error('Invalid packaged open E2E config');
+  }
+  const paths = record.paths as Record<string, unknown>;
+  const pathKeys = [
+    'primaryFile',
+    'unicodeFile',
+    'renamedUnicodeFile',
+    'associationFile',
+    'workspaceDirectory',
+    'staleFile',
+  ] as const;
+  if (Object.keys(paths).length !== pathKeys.length
+    || pathKeys.some((key) => typeof paths[key] !== 'string' || paths[key].trim().length === 0)) {
+    throw new Error('Invalid packaged open E2E config');
+  }
+  return {
+    profile: record.profile,
+    unicodeRenameReady: record.unicodeRenameReady,
+    paths: Object.fromEntries(pathKeys.map((key) => [key, paths[key]])) as PackagedOpenE2eConfig['paths'],
+  };
+}
+
+export async function getPackagedOpenE2eConfig(): Promise<PackagedOpenE2eConfig | null> {
+  return decodePackagedOpenE2eConfig(await invoke<unknown>('get_packaged_open_e2e_config'));
+}
+
+export function recordPackagedOpenAppEvent(event: PackagedOpenAppEvent): Promise<void> {
+  return invoke<void>('record_packaged_open_app_event', { event });
 }
 
 export async function openFileDialog(): Promise<PreparedOpenFileResponse | null> {
@@ -122,11 +306,6 @@ export function setNativeLocalePreference(
 export async function openDirectoryDialog(): Promise<WorkspaceSnapshot | null> {
   const response = await invoke<unknown>('open_directory_dialog');
   return response === null ? null : decodeWorkspaceSnapshot(response);
-}
-
-export async function restoreWorkspaceSession(): Promise<WorkspaceSessionRestore | null> {
-  const response = await invoke<unknown>('restore_workspace_session');
-  return decodeWorkspaceSessionRestore(response);
 }
 
 export function persistWorkspaceSession(

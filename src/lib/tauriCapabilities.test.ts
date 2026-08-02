@@ -5,6 +5,7 @@ import capability from '../../src-tauri/capabilities/default.json';
 import tauriConfig from '../../src-tauri/tauri.conf.json';
 
 const cargoManifest = readFileSync(new URL('../../src-tauri/Cargo.toml', import.meta.url), 'utf8');
+const tauriRustLib = readFileSync(new URL('../../src-tauri/src/lib.rs', import.meta.url), 'utf8');
 
 function releaseProfiles() {
   return [...cargoManifest.matchAll(
@@ -38,6 +39,21 @@ describe('Tauri capabilities', () => {
       'icons/icon.icns',
       'icons/icon.ico',
     ]);
+  });
+
+  it('packages Markdown associations and pins the Rust-only single-instance plugin', () => {
+    expect((tauriConfig.bundle as Record<string, unknown>).fileAssociations).toEqual([{
+      description: 'Markdown Document',
+      ext: ['md', 'mdx', 'markdown', 'mdown', 'mkd'],
+      mimeType: 'text/markdown',
+      name: 'Markdown Document',
+      rank: 'Default',
+      role: 'Editor',
+    }]);
+    expect(cargoManifest.match(/^tauri-plugin-single-instance = "=2\.4\.3"$/gm)).toHaveLength(1);
+    expect(tauriRustLib.indexOf('.plugin(tauri_plugin_single_instance::init(')).toBeGreaterThan(0);
+    expect(tauriRustLib.indexOf('.plugin(tauri_plugin_single_instance::init('))
+      .toBeLessThan(tauriRustLib.indexOf('.plugin(tauri_plugin_dialog::init())'));
   });
 
   it('keeps native watching backend-only with exact dependency pins', () => {

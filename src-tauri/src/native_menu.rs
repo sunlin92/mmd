@@ -9,6 +9,8 @@ pub const NATIVE_MENU_EVENT: &str = "mmd-native-menu";
 pub const MENU_NEW_ID: &str = "new";
 pub const MENU_OPEN_FILE_ID: &str = "open-file";
 pub const MENU_OPEN_DIRECTORY_ID: &str = "open-directory";
+pub const MENU_QUICK_OPEN_ID: &str = "quick-open";
+pub const MENU_WORKSPACE_SEARCH_ID: &str = "workspace-search";
 pub const MENU_SAVE_ID: &str = "save";
 pub const MENU_SAVE_AS_ID: &str = "save-as";
 pub const MENU_CLEAR_RECENT_ID: &str = "clear-recent-files";
@@ -202,6 +204,8 @@ pub fn action_for_menu_id(id: &str) -> Option<String> {
         MENU_NEW_ID
         | MENU_OPEN_FILE_ID
         | MENU_OPEN_DIRECTORY_ID
+        | MENU_QUICK_OPEN_ID
+        | MENU_WORKSPACE_SEARCH_ID
         | MENU_SAVE_ID
         | MENU_SAVE_AS_ID
         | MENU_CLEAR_RECENT_ID => Some(id.to_string()),
@@ -374,6 +378,26 @@ fn build_file_menu_with_locale<R: Runtime>(
     )
     .accelerator("CmdOrCtrl+Shift+O")
     .build(app)?;
+    let quick_open = MenuItemBuilder::with_id(
+        MENU_QUICK_OPEN_ID,
+        if chinese {
+            "快速打开…"
+        } else {
+            "Quick Open…"
+        },
+    )
+    .accelerator("CmdOrCtrl+P")
+    .build(app)?;
+    let workspace_search = MenuItemBuilder::with_id(
+        MENU_WORKSPACE_SEARCH_ID,
+        if chinese {
+            "搜索工作区…"
+        } else {
+            "Search Workspace…"
+        },
+    )
+    .accelerator("CmdOrCtrl+Shift+F")
+    .build(app)?;
     let open_recent = build_open_recent_menu(app, recent_files, chinese)?;
     let save = MenuItemBuilder::with_id(MENU_SAVE_ID, if chinese { "保存" } else { "Save" })
         .accelerator("CmdOrCtrl+S")
@@ -397,6 +421,9 @@ fn build_file_menu_with_locale<R: Runtime>(
         .item(&open_file)
         .item(&open_recent)
         .item(&open_directory)
+        .separator()
+        .item(&quick_open)
+        .item(&workspace_search)
         .separator()
         .item(&save)
         .item(&save_as)
@@ -481,6 +508,14 @@ mod tests {
         assert_eq!(
             action_for_menu_id("open-file"),
             Some("open-file".to_string())
+        );
+        assert_eq!(
+            action_for_menu_id(MENU_QUICK_OPEN_ID),
+            Some(MENU_QUICK_OPEN_ID.to_string())
+        );
+        assert_eq!(
+            action_for_menu_id(MENU_WORKSPACE_SEARCH_ID),
+            Some(MENU_WORKSPACE_SEARCH_ID.to_string())
         );
         assert_eq!(
             action_for_menu_id("open-recent:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),

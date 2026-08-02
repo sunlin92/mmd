@@ -9,6 +9,8 @@ export const NATIVE_MENU_ACTIONS = [
   'new',
   'open-file',
   'open-directory',
+  'quick-open',
+  'workspace-search',
   'save',
   'save-as',
 ] as const;

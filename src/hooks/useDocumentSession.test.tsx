@@ -11,6 +11,7 @@ import type { PaneSnapshotEnvelope } from '../lib/paneSync';
 import type {
   OpenCommitResult,
   PreparedOpenFileResponse,
+  WorkspaceSessionRestore,
   WorkspaceSnapshot,
 } from '../types';
 import { useDocumentSession } from './useDocumentSession';
@@ -51,7 +52,8 @@ const tauriMocks = vi.hoisted(() => ({
   persistWorkspaceSession: vi.fn<typeof import('../lib/tauriCommands').persistWorkspaceSession>(),
   refreshDirectory: vi.fn<typeof import('../lib/tauriCommands').refreshDirectory>(),
   renameWorkspaceEntry: vi.fn<typeof import('../lib/tauriCommands').renameWorkspaceEntry>(),
-  restoreWorkspaceSession: vi.fn<typeof import('../lib/tauriCommands').restoreWorkspaceSession>(),
+  resolveOpenIntent: vi.fn<typeof import('../lib/tauriCommands').resolveOpenIntent>(),
+  settleOpenIntentWorkspace: vi.fn<typeof import('../lib/tauriCommands').settleOpenIntentWorkspace>(),
   saveAsDialog: vi.fn<typeof import('../lib/tauriCommands').saveAsDialog>(),
   writeFile: vi.fn<typeof import('../lib/tauriCommands').writeFile>(),
 }));
@@ -183,6 +185,22 @@ async function flushSessionEffects() {
   });
 }
 
+function mockWorkspaceSessionRestore(restore: WorkspaceSessionRestore | null) {
+  tauriMocks.resolveOpenIntent.mockResolvedValue({
+    kind: 'session_restore',
+    restore,
+    workspace_open_receipt: restore ? 'workspace-open-restore' : null,
+  });
+}
+
+async function requestWorkspaceSessionRestore(intentId = 'session-restore-intent') {
+  let outcome!: Awaited<ReturnType<Session['resolveOpenIntentRequest']>>;
+  await act(async () => {
+    outcome = await session().resolveOpenIntentRequest(intentId, 'session_restore');
+  });
+  return outcome;
+}
+
 function documentSnapshot(value: Session) {
   return {
     activeFileKind: value.activeFileKind,
@@ -269,7 +287,8 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     tauriMocks.persistWorkspaceSession.mockReset();
     tauriMocks.refreshDirectory.mockReset();
     tauriMocks.renameWorkspaceEntry.mockReset();
-    tauriMocks.restoreWorkspaceSession.mockReset();
+    tauriMocks.resolveOpenIntent.mockReset();
+    tauriMocks.settleOpenIntentWorkspace.mockReset();
     tauriMocks.saveAsDialog.mockReset();
     tauriMocks.writeFile.mockReset();
     crashDraftMocks.write.mockReset();
@@ -287,7 +306,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     tauriMocks.cancelDocumentOverwriteToken.mockResolvedValue(undefined);
     tauriMocks.openFileDialog.mockResolvedValue(null);
     tauriMocks.persistWorkspaceSession.mockResolvedValue(undefined);
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue(null);
+    tauriMocks.settleOpenIntentWorkspace.mockResolvedValue('applied');
     tauriMocks.saveAsDialog.mockResolvedValue(null);
     tauriMocks.writeFile.mockResolvedValue({
       status: 'confirmed_committed', path: '/workspace/notes.md', version: fileVersion,
@@ -918,7 +937,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
   it('restores the main workspace before committing its prepared active document', async () => {
     enableTauriRuntime();
     const restored = preparedOpen('restored');
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue({
+    mockWorkspaceSessionRestore({
       workspace: workspaceSnapshot([{
         kind: 'markdown',
         path: restored.file.path,
@@ -929,6 +948,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     });
 
     act(() => root.render(<SessionHarness />));
+    await requestWorkspaceSessionRestore();
     await flushSessionEffects();
 
     expect(session()).toMatchObject({
@@ -937,7 +957,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
       authorityStatus: 'committed',
       content: '# restored',
     });
-    expect(tauriMocks.restoreWorkspaceSession).toHaveBeenCalledOnce();
+    expect(tauriMocks.resolveOpenIntent).toHaveBeenCalledWith('session-restore-intent');
     expect(tauriMocks.commitRecentOpen).toHaveBeenCalledWith(restored.open_receipt);
     expect(tauriMocks.persistWorkspaceSession).toHaveBeenLastCalledWith(
       'restored-workspace-token',
@@ -946,10 +966,198 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     );
   });
 
+  it('does not restore on mount and restores once when explicitly requested', async () => {
+    enableTauriRuntime();
+    const restored = preparedOpen('restored-session');
+    mockWorkspaceSessionRestore({
+      workspace: workspaceSnapshot([{
+        kind: 'markdown',
+        path: restored.file.path,
+        relative_path: 'restored-session.md',
+        name: 'restored-session.md',
+      }]),
+      active_file: restored,
+    });
+
+    act(() => root.render(<SessionHarness />));
+    await flushSessionEffects();
+
+    expect(tauriMocks.resolveOpenIntent).not.toHaveBeenCalled();
+    expect(session().workspaceRoot).toBeNull();
+    expect(session().workspaceSessionRestoreSettled).toBe(false);
+    await requestWorkspaceSessionRestore();
+
+    expect(tauriMocks.resolveOpenIntent).toHaveBeenCalledOnce();
+    expect(session()).toMatchObject({
+      activePath: restored.file.path,
+      authorityStatus: 'committed',
+      content: restored.file.content,
+      workspaceSessionRestoreSettled: true,
+    });
+  });
+
+  it('applies a resolved file open intent through the prepared-open commit flow', async () => {
+    const opened = preparedOpen('native-open');
+    tauriMocks.resolveOpenIntent.mockResolvedValueOnce({ kind: 'file', prepared: opened });
+
+    act(() => root.render(<SessionHarness />));
+    let outcome!: Awaited<ReturnType<Session['resolveOpenIntentRequest']>>;
+    await act(async () => {
+      outcome = await session().resolveOpenIntentRequest('open-intent-1');
+    });
+
+    expect(outcome).toBe('accepted');
+    expect(tauriMocks.resolveOpenIntent).toHaveBeenCalledWith('open-intent-1');
+    expect(tauriMocks.commitRecentOpen).toHaveBeenCalledWith(opened.open_receipt);
+    expect(session()).toMatchObject({
+      activePath: opened.file.path,
+      authorityStatus: 'committed',
+      content: opened.file.content,
+    });
+  });
+
+  it('does not accept a resolved file whose prepared authorization cannot commit', async () => {
+    const opened = preparedOpen('native-rejected');
+    tauriMocks.resolveOpenIntent.mockResolvedValueOnce({ kind: 'file', prepared: opened });
+    tauriMocks.commitRecentOpen.mockResolvedValueOnce({
+      status: 'not_committed',
+      message: 'The prepared open was rejected.',
+    });
+
+    act(() => root.render(<SessionHarness />));
+    let outcome!: Awaited<ReturnType<Session['resolveOpenIntentRequest']>>;
+    await act(async () => {
+      outcome = await session().resolveOpenIntentRequest('open-intent-rejected');
+    });
+
+    expect(outcome).toBe('failed');
+    expect(session()).toMatchObject({ activePath: null, authorityStatus: 'committed' });
+  });
+
+  it('applies a resolved directory open intent without replacing the current document', async () => {
+    const current = preparedOpen('current');
+    tauriMocks.openFileDialog.mockResolvedValueOnce(current);
+    tauriMocks.resolveOpenIntent.mockResolvedValueOnce({
+      kind: 'directory',
+      workspace: workspaceSnapshot([{
+        kind: 'markdown', path: current.file.path, relative_path: 'current.md', name: 'current.md',
+      }]),
+      workspace_open_receipt: 'workspace-open-directory',
+    });
+
+    act(() => root.render(<SessionHarness />));
+    await act(async () => session().handleOpenFile());
+    const before = documentSnapshot(session());
+    let outcome!: Awaited<ReturnType<Session['resolveOpenIntentRequest']>>;
+    await act(async () => {
+      outcome = await session().resolveOpenIntentRequest('open-intent-2');
+    });
+
+    expect(outcome).toBe('accepted');
+    expect(session().workspaceRoot).toBe('/workspace');
+    expect(documentSnapshot(session())).toEqual(before);
+    expect(tauriMocks.settleOpenIntentWorkspace).toHaveBeenCalledWith(
+      'workspace-open-directory',
+      true,
+    );
+  });
+
+  it('rejects an applied directory whose provisional workspace receipt expired', async () => {
+    tauriMocks.resolveOpenIntent.mockResolvedValueOnce({
+      kind: 'directory',
+      workspace: workspaceSnapshot(),
+      workspace_open_receipt: 'workspace-open-expired',
+    });
+    tauriMocks.settleOpenIntentWorkspace.mockResolvedValueOnce('expired');
+
+    act(() => root.render(<SessionHarness />));
+    let outcome!: Awaited<ReturnType<Session['resolveOpenIntentRequest']>>;
+    await act(async () => {
+      outcome = await session().resolveOpenIntentRequest('open-intent-expired');
+    });
+
+    expect(outcome).toBe('failed');
+    expect(session().workspaceRoot).toBeNull();
+  });
+
+  it('settles the startup gate only after the session-restore intent resolves', async () => {
+    enableTauriRuntime();
+    const resolution = deferred<Awaited<ReturnType<typeof import('../lib/tauriCommands').resolveOpenIntent>>>();
+    tauriMocks.resolveOpenIntent.mockReturnValueOnce(resolution.promise);
+
+    act(() => root.render(<SessionHarness />));
+    let restoreRequest!: Promise<'blocked' | 'accepted' | 'failed'>;
+    act(() => {
+      restoreRequest = session().resolveOpenIntentRequest('session-restore-intent', 'session_restore');
+    });
+    await act(async () => Promise.resolve());
+    expect(session().workspaceSessionRestoreSettled).toBe(false);
+    expect(tauriMocks.resolveOpenIntent).toHaveBeenCalledWith('session-restore-intent');
+
+    resolution.resolve({
+      kind: 'session_restore',
+      restore: null,
+      workspace_open_receipt: null,
+    });
+    await expect(act(async () => restoreRequest)).resolves.toBe('accepted');
+    await flushSessionEffects();
+    expect(session().workspaceSessionRestoreSettled).toBe(true);
+  });
+
+  it('discards a file receipt when a newer open intent supersedes it', async () => {
+    const first = deferred<Awaited<ReturnType<typeof import('../lib/tauriCommands').resolveOpenIntent>>>();
+    const older = preparedOpen('older-native');
+    const newer = preparedOpen('newer-native');
+    tauriMocks.resolveOpenIntent
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ kind: 'file', prepared: newer });
+
+    act(() => root.render(<SessionHarness />));
+    let olderOutcome!: Promise<'blocked' | 'accepted' | 'failed'>;
+    let newerOutcome!: Promise<'blocked' | 'accepted' | 'failed'>;
+    act(() => {
+      olderOutcome = session().resolveOpenIntentRequest('open-intent-4');
+      newerOutcome = session().resolveOpenIntentRequest('open-intent-5');
+    });
+    first.resolve({ kind: 'file', prepared: older });
+
+    await expect(act(async () => olderOutcome)).resolves.toBe('failed');
+    await expect(act(async () => newerOutcome)).resolves.toBe('accepted');
+    expect(tauriMocks.discardOpenReceipt).toHaveBeenCalledWith(older.open_receipt);
+    expect(session().activePath).toBe(newer.file.path);
+  });
+
+  it('discards both provisional receipts when a session restore becomes stale', async () => {
+    const first = deferred<Awaited<ReturnType<typeof import('../lib/tauriCommands').resolveOpenIntent>>>();
+    const restored = preparedOpen('stale-restored-file');
+    const newer = preparedOpen('newer-after-restore');
+    tauriMocks.resolveOpenIntent
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ kind: 'file', prepared: newer });
+
+    act(() => root.render(<SessionHarness />));
+    let olderOutcome!: Promise<'blocked' | 'accepted' | 'failed'>;
+    let newerOutcome!: Promise<'blocked' | 'accepted' | 'failed'>;
+    act(() => {
+      olderOutcome = session().resolveOpenIntentRequest('open-intent-6', 'session_restore');
+      newerOutcome = session().resolveOpenIntentRequest('open-intent-7');
+    });
+    first.resolve({
+      kind: 'session_restore',
+      restore: { workspace: workspaceSnapshot(), active_file: restored },
+      workspace_open_receipt: 'workspace-open-6',
+    });
+
+    await expect(act(async () => olderOutcome)).resolves.toBe('failed');
+    await expect(act(async () => newerOutcome)).resolves.toBe('accepted');
+    expect(tauriMocks.discardOpenReceipt).toHaveBeenCalledWith(restored.open_receipt);
+    expect(tauriMocks.settleOpenIntentWorkspace).toHaveBeenCalledWith('workspace-open-6', false);
+  });
+
   it('keeps a restored workspace and silently clears an active file whose receipt cannot commit', async () => {
     enableTauriRuntime();
     const restored = preparedOpen('restore-rejected');
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue({
+    mockWorkspaceSessionRestore({
       workspace: workspaceSnapshot([{
         kind: 'markdown',
         path: restored.file.path,
@@ -964,6 +1172,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     });
 
     act(() => root.render(<SessionHarness />));
+    const outcome = await requestWorkspaceSessionRestore();
     await flushSessionEffects();
 
     expect(session()).toMatchObject({
@@ -972,6 +1181,11 @@ describe('useDocumentSession prepared-open authority workflow', () => {
       authorityStatus: 'committed',
       error: null,
     });
+    expect(outcome).toBe('failed');
+    expect(tauriMocks.settleOpenIntentWorkspace).toHaveBeenCalledWith(
+      'workspace-open-restore',
+      true,
+    );
     expect(tauriMocks.persistWorkspaceSession).toHaveBeenLastCalledWith(
       'restored-workspace-token',
       '/workspace',
@@ -981,7 +1195,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
 
   it('settles a missing session to a blank main pane and does not restore or persist in popouts', async () => {
     enableTauriRuntime();
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue(null);
+    mockWorkspaceSessionRestore(null);
 
     act(() => root.render(<SessionHarness isPopout popoutPane="editor" />));
     await flushSessionEffects();
@@ -991,23 +1205,24 @@ describe('useDocumentSession prepared-open authority workflow', () => {
       activePath: null,
       content: EMPTY_MARKDOWN,
     });
-    expect(tauriMocks.restoreWorkspaceSession).not.toHaveBeenCalled();
+    expect(tauriMocks.resolveOpenIntent).not.toHaveBeenCalled();
     expect(tauriMocks.persistWorkspaceSession).not.toHaveBeenCalled();
 
     act(() => root.unmount());
     root = createRoot(container);
     currentSession = null;
     act(() => root.render(<SessionHarness />));
+    await requestWorkspaceSessionRestore();
     await flushSessionEffects();
 
     expect(session()).toMatchObject({ workspaceRoot: null, activePath: null });
-    expect(tauriMocks.restoreWorkspaceSession).toHaveBeenCalledOnce();
+    expect(tauriMocks.resolveOpenIntent).toHaveBeenCalledOnce();
     expect(tauriMocks.persistWorkspaceSession).not.toHaveBeenCalled();
   });
 
   it('persists null for an active document outside the restored workspace', async () => {
     enableTauriRuntime();
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue({
+    mockWorkspaceSessionRestore({
       workspace: workspaceSnapshot([{
         kind: 'markdown',
         path: '/workspace/notes.md',
@@ -1025,6 +1240,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     }));
 
     act(() => root.render(<SessionHarness />));
+    await requestWorkspaceSessionRestore();
     await flushSessionEffects();
     await act(async () => session().handleOpenFile());
     await flushSessionEffects();
@@ -1039,10 +1255,14 @@ describe('useDocumentSession prepared-open authority workflow', () => {
 
   it('blocks user document actions until a pending session restore settles', async () => {
     enableTauriRuntime();
-    const restore = deferred<Awaited<ReturnType<typeof import('../lib/tauriCommands').restoreWorkspaceSession>>>();
-    tauriMocks.restoreWorkspaceSession.mockReturnValue(restore.promise);
+    const resolution = deferred<Awaited<ReturnType<typeof import('../lib/tauriCommands').resolveOpenIntent>>>();
+    tauriMocks.resolveOpenIntent.mockReturnValue(resolution.promise);
 
     act(() => root.render(<SessionHarness />));
+    let restoreRequest!: Promise<'blocked' | 'accepted' | 'failed'>;
+    act(() => {
+      restoreRequest = session().resolveOpenIntentRequest('session-restore-intent', 'session_restore');
+    });
     await act(async () => {
       await Promise.resolve();
     });
@@ -1051,10 +1271,15 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     expect(tauriMocks.openDirectoryDialog).not.toHaveBeenCalled();
     expect(session().content).toBe(EMPTY_MARKDOWN);
 
-    restore.resolve({
-      workspace: workspaceSnapshot(),
-      active_file: null,
+    resolution.resolve({
+      kind: 'session_restore',
+      restore: {
+        workspace: workspaceSnapshot(),
+        active_file: null,
+      },
+      workspace_open_receipt: 'workspace-open-blocked-actions',
     });
+    await act(async () => restoreRequest);
     await flushSessionEffects();
 
     expect(session().workspaceRoot).toBe('/workspace');
@@ -1067,7 +1292,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
 
   it('restores only once when StrictMode replays effects', async () => {
     enableTauriRuntime();
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue({
+    mockWorkspaceSessionRestore({
       workspace: workspaceSnapshot(),
       active_file: null,
     });
@@ -1077,9 +1302,10 @@ describe('useDocumentSession prepared-open authority workflow', () => {
         <SessionHarness />
       </StrictMode>,
     ));
+    await requestWorkspaceSessionRestore();
     await flushSessionEffects();
 
-    expect(tauriMocks.restoreWorkspaceSession).toHaveBeenCalledOnce();
+    expect(tauriMocks.resolveOpenIntent).toHaveBeenCalledOnce();
     expect(session().workspaceRoot).toBe('/workspace');
   });
 
@@ -1087,7 +1313,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     enableTauriRuntime();
     const firstPersist = deferred<void>();
     const opened = preparedOpen('notes');
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue({
+    mockWorkspaceSessionRestore({
       workspace: workspaceSnapshot([{
         kind: 'markdown',
         path: opened.file.path,
@@ -1102,6 +1328,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     tauriMocks.openWorkspaceFile.mockResolvedValue(opened);
 
     act(() => root.render(<SessionHarness />));
+    await requestWorkspaceSessionRestore();
     await flushSessionEffects();
     expect(tauriMocks.persistWorkspaceSession).toHaveBeenCalledOnce();
     expect(tauriMocks.persistWorkspaceSession).toHaveBeenLastCalledWith(
@@ -1128,7 +1355,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     enableTauriRuntime();
     const firstPersist = deferred<void>();
     const opened = preparedOpen('closing');
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue({
+    mockWorkspaceSessionRestore({
       workspace: workspaceSnapshot([{
         kind: 'markdown',
         path: opened.file.path,
@@ -1143,6 +1370,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     tauriMocks.openWorkspaceFile.mockResolvedValue(opened);
 
     act(() => root.render(<SessionHarness />));
+    await requestWorkspaceSessionRestore();
     await flushSessionEffects();
     expect(tauriMocks.persistWorkspaceSession).toHaveBeenLastCalledWith(
       'restored-workspace-token',
@@ -1173,7 +1401,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     const previous = preparedOpen('previous');
     const commit = deferred<OpenCommitResult>();
     const pending = preparedOpen('pending');
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue({
+    mockWorkspaceSessionRestore({
       workspace: workspaceSnapshot([
         {
           kind: 'markdown',
@@ -1193,6 +1421,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     tauriMocks.openWorkspaceFile.mockResolvedValue(pending);
 
     act(() => root.render(<SessionHarness />));
+    await requestWorkspaceSessionRestore();
     await flushSessionEffects();
 
     expect(tauriMocks.persistWorkspaceSession).toHaveBeenLastCalledWith(

@@ -57,6 +57,56 @@ describe('SettingsDialog', () => {
     }));
   });
 
+  it('manages the workspace index when a workspace is available', async () => {
+    const onDiscardWorkspaceIndex = vi.fn<() => Promise<void>>(async () => undefined);
+    const onRebuildWorkspaceIndex = vi.fn<() => Promise<void>>(async () => undefined);
+    await act(async () => root.render(
+      <SettingsDialog
+        busy={false}
+        locale="en"
+        settings={currentSettingsEnvelope.settings}
+        workspaceAvailable
+        onClose={vi.fn<() => void>()}
+        onReset={vi.fn<() => Promise<void>>(async () => undefined)}
+        onSave={vi.fn<(settings: AppSettings) => Promise<void>>(async () => undefined)}
+        onDiscardWorkspaceIndex={onDiscardWorkspaceIndex}
+        onRebuildWorkspaceIndex={onRebuildWorkspaceIndex}
+      />,
+    ));
+
+    expect(container.textContent).toContain('Workspace Index');
+    expect(container.textContent).toContain('Manage the local index used to search workspace files.');
+    const discard = container.querySelector<HTMLButtonElement>('[name="discardWorkspaceIndex"]')!;
+    const rebuild = container.querySelector<HTMLButtonElement>('[name="rebuildWorkspaceIndex"]')!;
+    expect(discard.disabled).toBe(false);
+    expect(rebuild.disabled).toBe(false);
+
+    await act(async () => discard.click());
+    await act(async () => rebuild.click());
+    expect(onDiscardWorkspaceIndex).toHaveBeenCalledTimes(1);
+    expect(onRebuildWorkspaceIndex).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables workspace index controls and explains why without a workspace', async () => {
+    await act(async () => root.render(
+      <SettingsDialog
+        busy={false}
+        locale="en"
+        settings={currentSettingsEnvelope.settings}
+        workspaceAvailable={false}
+        onClose={vi.fn<() => void>()}
+        onReset={vi.fn<() => Promise<void>>(async () => undefined)}
+        onSave={vi.fn<(settings: AppSettings) => Promise<void>>(async () => undefined)}
+        onDiscardWorkspaceIndex={vi.fn<() => Promise<void>>(async () => undefined)}
+        onRebuildWorkspaceIndex={vi.fn<() => Promise<void>>(async () => undefined)}
+      />,
+    ));
+
+    expect(container.textContent).toContain('Open a workspace to manage its index.');
+    expect(container.querySelector<HTMLButtonElement>('[name="discardWorkspaceIndex"]')?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('[name="rebuildWorkspaceIndex"]')?.disabled).toBe(true);
+  });
+
   it('shows reset and retry recovery actions without rendering a raw error', async () => {
     await act(async () => root.render(
       <SettingsDialog

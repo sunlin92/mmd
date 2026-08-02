@@ -37,7 +37,6 @@ const tauriMocks = vi.hoisted(() => ({
   persistWorkspaceSession: vi.fn<typeof import('../lib/tauriCommands').persistWorkspaceSession>(),
   refreshDirectory: vi.fn<typeof import('../lib/tauriCommands').refreshDirectory>(),
   renameWorkspaceEntry: vi.fn<typeof import('../lib/tauriCommands').renameWorkspaceEntry>(),
-  restoreWorkspaceSession: vi.fn<typeof import('../lib/tauriCommands').restoreWorkspaceSession>(),
   saveAsDialog: vi.fn<typeof import('../lib/tauriCommands').saveAsDialog>(),
   writeFile: vi.fn<typeof import('../lib/tauriCommands').writeFile>(),
 }));
@@ -242,7 +241,6 @@ describe('useDocumentSession active document monitoring', () => {
     }));
     tauriMocks.openFileDialog.mockResolvedValue(preparedOpen());
     tauriMocks.persistWorkspaceSession.mockResolvedValue(undefined);
-    tauriMocks.restoreWorkspaceSession.mockResolvedValue(null);
     tauriMocks.commitRecentOpen.mockResolvedValue({
       status: 'committed',
       recent_files: { entries: [] },

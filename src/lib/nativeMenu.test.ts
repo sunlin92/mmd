@@ -12,12 +12,16 @@ import {
 describe('native menu event contract', () => {
   it('lists the file actions emitted by the Tauri system menu bar', () => {
     expect(NATIVE_MENU_EVENT).toBe('mmd-native-menu');
-    expect(NATIVE_MENU_ACTIONS).toEqual(['new', 'open-file', 'open-directory', 'save', 'save-as']);
+    expect(NATIVE_MENU_ACTIONS).toEqual([
+      'new', 'open-file', 'open-directory', 'quick-open', 'workspace-search', 'save', 'save-as',
+    ]);
   });
 
   it('accepts only known native file menu actions', () => {
     expect(isNativeMenuAction('save')).toBe(true);
     expect(isNativeMenuAction('open-directory')).toBe(true);
+    expect(isNativeMenuAction('quick-open')).toBe(true);
+    expect(isNativeMenuAction('workspace-search')).toBe(true);
     expect(isNativeMenuAction('quit')).toBe(false);
     expect(isNativeMenuAction(null)).toBe(false);
   });

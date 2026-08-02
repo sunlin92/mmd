@@ -19,6 +19,12 @@ import { CrashDraftRecoveryDialog } from './components/CrashDraftRecoveryDialog'
 import { CrashDraftStoreRepairDialog } from './components/CrashDraftStoreRepairDialog';
 import { FeedbackDialog } from './components/FeedbackDialog';
 import { SettingsDialog } from './components/SettingsDialog';
+import { QuickOpenDialog } from './components/QuickOpenDialog';
+import {
+  WorkspaceSearchDialog,
+  type WorkspaceSearchMode,
+  type WorkspaceSearchSelection,
+} from './components/WorkspaceSearchDialog';
 import { FileSidebar } from './components/FileSidebar';
 import JinxiuMarkdown from './components/JinxiuMarkdown';
 import { LazyPreviewBoundary } from './components/LazyPreviewBoundary';
@@ -40,6 +46,7 @@ import { usePaneResize } from './hooks/usePaneResize';
 import { useProgramCloseGuard } from './hooks/useProgramCloseGuard';
 import { useSettings } from './hooks/useSettings';
 import { useI18n } from './lib/i18n';
+import { isTauriRuntime } from './lib/activeDocumentWatch';
 import type { EffectiveLocale } from './lib/locale';
 import { useWorkspaceSidebarResize } from './hooks/useWorkspaceSidebarResize';
 import { APP_FEEDBACK_ERROR_EVENT, getFeedbackDialog, normalizeAppError } from './lib/appFeedback';
@@ -86,7 +93,30 @@ import {
   getWorkspaceLayoutClassName,
   getWorkspaceSidebarLayoutStyle,
 } from './lib/sidebarLayout';
-import { setNativeSaveMenuEnabled } from './lib/tauriCommands';
+import {
+  discardWorkspaceIndex,
+  discardOpenIntent,
+  focusMainWindow,
+  getPackagedOpenE2eConfig,
+  peekOpenIntent,
+  recordPackagedOpenAppEvent,
+  rebuildWorkspaceIndex,
+  requestSessionRestore,
+  setNativeSaveMenuEnabled,
+  type PackagedOpenAppEventType,
+  type PackagedOpenE2eConfig,
+} from './lib/tauriCommands';
+import {
+  adaptBackendOpenIntent,
+  createLocalOpenIntent,
+  OPEN_INTENT_FOCUS_EVENT,
+  OPEN_INTENT_PENDING_EVENT,
+  type AppOpenIntent,
+  type LocalOpenIntentAction,
+  type LocalOpenIntentSource,
+} from './lib/openIntent';
+import { OpenIntentCoordinator } from './lib/openIntentCoordinator';
+import { createWorkspaceIndexOperationId } from './lib/workspaceSearch';
 import { crashDraftCommands } from './lib/crashDraftCommands';
 import { getWorkspaceMoveDestinations } from './lib/fileTreeOperations';
 import { getWorkspacePresentation } from './lib/workspaceFileKind';
@@ -238,8 +268,43 @@ function getWorkspaceRelativePath(workspaceRoot: string | null, path: string | n
   return relativePath;
 }
 
+function getPackagedOpenStep(
+  intent: Extract<AppOpenIntent, { origin: 'backend' }>,
+  config: PackagedOpenE2eConfig,
+): string | null {
+  if (intent.source === 'session_restore') return 'session-restore';
+  const { paths } = config;
+  if (intent.displayPath === paths.primaryFile) return 'cli-primary';
+  if (intent.displayPath === paths.unicodeFile) return 'cli-secondary-unicode';
+  if (intent.displayPath === paths.workspaceDirectory) return 'cli-directory';
+  if (intent.displayPath === paths.staleFile) return 'cli-stale';
+  if (intent.displayPath === paths.associationFile) return 'file-association';
+  return null;
+}
+
+function getPackagedSpellcheckEvidence() {
+  const realEditors = [...document.querySelectorAll(
+    '.editor-pane:not(.popout-pane) .editor-host .cm-content',
+  )];
+  const enabledRealEditors = realEditors.filter((editor) => editor.getAttribute('spellcheck') === 'true');
+  const realEditorSet = new Set(realEditors);
+  const enabledNonEditors = [...document.querySelectorAll('[spellcheck="true"]')]
+    .filter((element) => !realEditorSet.has(element));
+  return {
+    realEditorCount: realEditors.length,
+    enabledRealEditorCount: enabledRealEditors.length,
+    enabledNonEditorCount: enabledNonEditors.length,
+    dictionaryConsistency: 'not_claimed',
+  };
+}
+
+const PACKAGED_UNICODE_READY_POLL_INTERVAL_MS = 50;
+const PACKAGED_UNICODE_READY_MAX_ATTEMPTS = 200;
+const PACKAGED_DIRTY_SEED = '<!-- mmd-packaged-open-dirty -->';
+
 export default function App() {
   const { locale, t } = useI18n();
+  const packagedOpenEvidenceEnabled = import.meta.env.VITE_MMD_PACKAGED_OPEN_E2E === '1';
   const popoutPane = useMemo(() => currentPopoutPane(), []);
   const isPopout = popoutPane !== 'main';
   const [editorPopoutInstanceId] = useState(() => (
@@ -248,10 +313,21 @@ export default function App() {
       : null
   ));
   const [showUnsavedExitPrompt, setShowUnsavedExitPrompt] = useState(false);
-  const [pendingFileSwitchPath, setPendingFileSwitchPath] = useState<string | null>(null);
+  const [workspaceSearchMode, setWorkspaceSearchMode] = useState<WorkspaceSearchMode | null>(null);
+  const [pendingOpenIntent, setPendingOpenIntent] = useState<AppOpenIntent | null>(null);
+  const [packagedOpenConfig, setPackagedOpenConfig] = useState<PackagedOpenE2eConfig | null | undefined>(
+    () => packagedOpenEvidenceEnabled ? undefined : null,
+  );
+  const [pendingPackagedSettlement, setPendingPackagedSettlement] = useState<{
+    intent: Extract<AppOpenIntent, { origin: 'backend' }>;
+    status: 'accepted' | 'cancelled' | 'failed';
+  } | null>(null);
+  const [packagedSettlementBarrierActive, setPackagedSettlementBarrierActive] = useState(false);
+  const [openIntentPollRevision, setOpenIntentPollRevision] = useState(0);
   const [workspaceEntryOperation, setWorkspaceEntryOperation] = useState<WorkspaceEntryOperation | null>(null);
   const [workspaceMoveOperation, setWorkspaceMoveOperation] = useState<WorkspaceMoveOperation | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [workspaceIndexActionBusy, setWorkspaceIndexActionBusy] = useState(false);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
   const [fileTreeCollapsed, setFileTreeCollapsed] = useState(false);
   const [editorPaneRatio, setEditorPaneRatio] = useState(0.5);
@@ -274,6 +350,49 @@ export default function App() {
   const editorPopoutOpenRequestRef = useRef<Promise<void> | null>(null);
   const markdownMediaRetryControllerRef = useRef(createMarkdownMediaRetryController());
   const mountedRef = useRef(true);
+  const localOpenIntentSequenceRef = useRef(0);
+  const openIntentSettlementRef = useRef(new Set<string>());
+  const activeOpenIntentIdRef = useRef<string | null>(null);
+  const sessionRestoreRequestStateRef = useRef<'pending' | 'requested' | 'failed'>('pending');
+  const packagedEvidenceTailRef = useRef(Promise.resolve());
+  const packagedActivationEvidenceRef = useRef(new Set<string>());
+  const packagedModalEvidenceRef = useRef(new Set<string>());
+  const packagedDirtySeededRef = useRef(false);
+  const packagedAutomatedDecisionRef = useRef(new Set<string>());
+  const openIntentCoordinatorRef = useRef<OpenIntentCoordinator | null>(null);
+  if (!openIntentCoordinatorRef.current) {
+    openIntentCoordinatorRef.current = new OpenIntentCoordinator({
+      onActivate: (intent) => {
+        activeOpenIntentIdRef.current = intent.id;
+        setPendingOpenIntent(intent);
+        if (intent.origin === 'backend') void focusMainWindow(intent.id, false).catch(() => undefined);
+      },
+      onSettle: (intent, settlement) => {
+        if (activeOpenIntentIdRef.current === intent.id) activeOpenIntentIdRef.current = null;
+        openIntentSettlementRef.current.delete(intent.id);
+        if (intent.origin === 'backend' && packagedOpenEvidenceEnabled) {
+          setPendingPackagedSettlement({ intent, status: settlement.kind });
+        } else {
+          setOpenIntentPollRevision((revision) => revision + 1);
+        }
+        setPendingOpenIntent((current) => current?.id === intent.id ? null : current);
+      },
+    });
+  }
+  const openIntentCoordinator = openIntentCoordinatorRef.current;
+  const enqueueLocalOpenIntent = useCallback((
+    source: LocalOpenIntentSource,
+    displayPath: string,
+    action: LocalOpenIntentAction,
+  ) => {
+    localOpenIntentSequenceRef.current += 1;
+    openIntentCoordinator.enqueue(createLocalOpenIntent(
+      `local-open-intent-${localOpenIntentSequenceRef.current}`,
+      source,
+      displayPath,
+      action,
+    ));
+  }, [openIntentCoordinator]);
   const paneLayoutStyle = useMemo(() => getPaneLayoutStyle(editorPaneRatio), [editorPaneRatio]);
   const settingsState = useSettings();
   const afterConfirmedCrashDraftSaveRef = useRef<((documentId: string) => Promise<boolean>) | null>(null);
@@ -321,7 +440,9 @@ export default function App() {
     handleUseExternal,
     moveWorkspaceEntryPath,
     notice,
+    openWorkspaceIndexResult,
     openWorkspaceFilePath,
+    resolveOpenIntentRequest,
     previewRevision,
     renameWorkspaceEntryPath,
     refreshWorkspace,
@@ -333,8 +454,10 @@ export default function App() {
     confirmCrashDraftDiscarded,
     setError,
     setNotice,
+    settleWorkspaceSessionRestore,
     updateContent,
     workspaceRoot,
+    workspaceToken,
   } = useDocumentSession({
     isPopout,
     popoutPane,
@@ -342,11 +465,21 @@ export default function App() {
     autosaveDelayMs: settingsState.settings?.autosaveDelayMs ?? 1500,
     afterConfirmedSave: afterConfirmedCrashDraftSave,
   });
+  const currentContentRef = useRef(content);
+  currentContentRef.current = content;
+
+  const requestCrashDraftRecovery = useCallback((draft: Parameters<typeof recoverCrashDraft>[0]) => {
+    enqueueLocalOpenIntent(
+      'crash_recovery',
+      draft.pathHint ?? draft.documentId,
+      { kind: 'crash_draft', draft },
+    );
+  }, [enqueueLocalOpenIntent]);
 
   const crashDraftRecovery = useCrashDraftRecovery({
     enabled: !isPopout,
     commands: crashDraftCommands,
-    onRecoverDraft: recoverCrashDraft,
+    onRecoverDraft: requestCrashDraftRecovery,
     seedRevision: seedCrashDraftRevision,
     getStoredEntryToken: getCrashDraftStoredEntryToken,
     confirmDiscarded: confirmCrashDraftDiscarded,
@@ -355,11 +488,12 @@ export default function App() {
 
   const feedbackDialog = useMemo(() => getFeedbackDialog({ error, notice }, locale), [error, locale, notice]);
   const unsavedExitPrompt = useMemo(() => getUnsavedExitPrompt(activePath, locale), [activePath, locale]);
+  const pendingFileSwitchTarget = dirty && pendingOpenIntent ? pendingOpenIntent.displayPath : null;
   const unsavedFileSwitchPrompt = useMemo(() => (
-    pendingFileSwitchPath
-      ? getUnsavedFileSwitchPrompt(activePath, pendingFileSwitchPath, locale)
+    pendingFileSwitchTarget
+      ? getUnsavedFileSwitchPrompt(activePath, pendingFileSwitchTarget, locale)
       : null
-  ), [activePath, locale, pendingFileSwitchPath]);
+  ), [activePath, locale, pendingFileSwitchTarget]);
   const activePresentation = getWorkspacePresentation(activeFileKind);
   const workspaceLayoutStyle = {
     ...getWorkspaceSidebarLayoutStyle(workspaceSidebarWidth),
@@ -406,6 +540,235 @@ export default function App() {
     busy: busy || externalFileAction !== null || Boolean(saveConflict),
     fileKind: activeFileKind,
   });
+
+  // Open intents must wait behind every app-owned modal and in-flight session operation.
+  // This keeps a late OS launch from replacing the target of an existing decision dialog.
+  const openIntentModalActive = Boolean(
+    busy
+      || settingsState.busy
+      || settingsState.recovery
+      || crashDraftRecovery.error
+      || (crashDraftRecovery.catalog && crashDraftRecovery.catalog.entries.length > 0)
+      || externalFileAction
+      || saveConflict
+      || showUnsavedExitPrompt
+      || unsavedFileSwitchPrompt
+      || workspaceSearchMode
+      || workspaceEntryOperation
+      || workspaceMoveOperation
+      || showSettings
+      || workspaceIndexActionBusy
+      || packagedSettlementBarrierActive
+      || feedbackDialog,
+  );
+
+  useEffect(() => {
+    if (!packagedOpenEvidenceEnabled || isPopout || !isTauriRuntime()) {
+      setPackagedOpenConfig(null);
+      return;
+    }
+    let disposed = false;
+    void getPackagedOpenE2eConfig().then((config) => {
+      if (!disposed) setPackagedOpenConfig(config);
+    }).catch(() => {
+      if (!disposed) setPackagedOpenConfig(null);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [isPopout, packagedOpenEvidenceEnabled]);
+
+  const recordPackagedEvidence = useCallback((
+    intent: Extract<AppOpenIntent, { origin: 'backend' }>,
+    type: PackagedOpenAppEventType,
+    fields: Record<string, unknown>,
+  ): Promise<void> => {
+    if (!packagedOpenConfig) return Promise.resolve();
+    const step = getPackagedOpenStep(intent, packagedOpenConfig);
+    if (!step) return Promise.resolve();
+    const record = packagedEvidenceTailRef.current
+      .catch(() => undefined)
+      .then(() => recordPackagedOpenAppEvent({ type, intentId: intent.id, step, fields }));
+    packagedEvidenceTailRef.current = record;
+    return record;
+  }, [packagedOpenConfig]);
+
+  const reportPackagedEvidenceFailure = useCallback((err: unknown) => {
+    if (!mountedRef.current) return;
+    setError(normalizeAppError(err, locale));
+    setNotice(null);
+  }, [locale, setError, setNotice]);
+
+  useEffect(() => {
+    const settlement = pendingPackagedSettlement;
+    if (!settlement || packagedOpenConfig === undefined) return;
+    setPendingPackagedSettlement(null);
+    if (!packagedOpenConfig) {
+      setPackagedSettlementBarrierActive(false);
+      setOpenIntentPollRevision((revision) => revision + 1);
+      return;
+    }
+    const packagedStep = getPackagedOpenStep(settlement.intent, packagedOpenConfig);
+    const shouldSeedDirty = settlement.status === 'accepted'
+      && settlement.intent.targetKind === 'file'
+      && (packagedStep === 'cli-primary' || packagedStep === 'file-association')
+      && !packagedDirtySeededRef.current;
+    void recordPackagedEvidence(settlement.intent, 'app_settled', {
+      status: settlement.status,
+      app: {
+        activeFile: activePath,
+        workspaceRoot,
+        workspaceToken,
+        authorityStatus,
+        dirty,
+      },
+      spellcheck: getPackagedSpellcheckEvidence(),
+    }).then(() => {
+      if (!shouldSeedDirty || !mountedRef.current) return;
+      packagedDirtySeededRef.current = true;
+      const currentContent = currentContentRef.current;
+      updateContent(currentContent.includes(PACKAGED_DIRTY_SEED)
+        ? currentContent
+        : `${currentContent}\n\n${PACKAGED_DIRTY_SEED}`);
+    }).catch(reportPackagedEvidenceFailure).finally(() => {
+      if (!mountedRef.current) return;
+      setPackagedSettlementBarrierActive(false);
+      setOpenIntentPollRevision((revision) => revision + 1);
+    });
+  }, [
+    activePath,
+    authorityStatus,
+    dirty,
+    packagedOpenConfig,
+    pendingPackagedSettlement,
+    recordPackagedEvidence,
+    reportPackagedEvidenceFailure,
+    updateContent,
+    workspaceRoot,
+    workspaceToken,
+  ]);
+
+  useEffect(() => {
+    if (
+      pendingOpenIntent?.origin !== 'backend'
+      || !packagedOpenConfig
+      || packagedActivationEvidenceRef.current.has(pendingOpenIntent.id)
+    ) return;
+    packagedActivationEvidenceRef.current.add(pendingOpenIntent.id);
+    void recordPackagedEvidence(pendingOpenIntent, 'app_activated', {
+      dirty,
+      activeFileBefore: activePath,
+    }).catch(reportPackagedEvidenceFailure);
+  }, [
+    activePath,
+    dirty,
+    packagedOpenConfig,
+    pendingOpenIntent,
+    recordPackagedEvidence,
+    reportPackagedEvidenceFailure,
+  ]);
+
+  useEffect(() => {
+    if (
+      pendingOpenIntent?.origin !== 'backend'
+      || !unsavedFileSwitchPrompt
+      || !packagedOpenConfig
+      || packagedModalEvidenceRef.current.has(pendingOpenIntent.id)
+    ) return;
+    packagedModalEvidenceRef.current.add(pendingOpenIntent.id);
+    void recordPackagedEvidence(pendingOpenIntent, 'dirty_modal_opened', {
+      modalId: `dirty-${pendingOpenIntent.id}`,
+    }).catch(reportPackagedEvidenceFailure);
+  }, [
+    packagedOpenConfig,
+    pendingOpenIntent,
+    recordPackagedEvidence,
+    reportPackagedEvidenceFailure,
+    unsavedFileSwitchPrompt,
+  ]);
+
+  useEffect(() => {
+    if (isPopout || !isTauriRuntime() || typeof peekOpenIntent !== 'function') return undefined;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    Promise.all([
+      listen<unknown>(OPEN_INTENT_PENDING_EVENT, () => {
+        if (!disposed) setOpenIntentPollRevision((revision) => revision + 1);
+      }),
+      listen<unknown>(OPEN_INTENT_FOCUS_EVENT, () => {
+        if (!disposed) {
+          void focusMainWindow(activeOpenIntentIdRef.current ?? undefined, true).catch(() => undefined);
+        }
+      }),
+    ]).then((cleanups) => {
+      if (disposed) cleanups.forEach((cleanup) => cleanup());
+      else {
+        unlisteners.push(...cleanups);
+        if (sessionRestoreRequestStateRef.current === 'pending') {
+          sessionRestoreRequestStateRef.current = 'requested';
+          void requestSessionRestore().then(() => {
+            if (mountedRef.current) setOpenIntentPollRevision((revision) => revision + 1);
+          }).catch((err: unknown) => {
+            sessionRestoreRequestStateRef.current = 'failed';
+            settleWorkspaceSessionRestore();
+            if (mountedRef.current) {
+              setError(normalizeAppError(err, locale));
+              setNotice(null);
+            }
+          });
+        }
+      }
+    }).catch((err: unknown) => {
+      if (!disposed) {
+        if (sessionRestoreRequestStateRef.current === 'pending') {
+          sessionRestoreRequestStateRef.current = 'failed';
+          settleWorkspaceSessionRestore();
+        }
+        setError(normalizeAppError(err, locale));
+        setNotice(null);
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [isPopout, locale, setError, setNotice, settleWorkspaceSessionRestore]);
+
+  useEffect(() => {
+    openIntentCoordinator.setModalActive(openIntentModalActive);
+  }, [openIntentCoordinator, openIntentModalActive]);
+
+  useEffect(() => {
+    if (
+      isPopout
+      || !isTauriRuntime()
+      || typeof peekOpenIntent !== 'function'
+      || (packagedOpenEvidenceEnabled && packagedOpenConfig === undefined)
+      || openIntentModalActive
+    ) return undefined;
+    let disposed = false;
+    void Promise.resolve().then(() => peekOpenIntent()).then((preview) => {
+      if (disposed) return;
+      if (preview) openIntentCoordinator.enqueue(adaptBackendOpenIntent(preview));
+    }).catch((err: unknown) => {
+      if (disposed) return;
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    isPopout,
+    locale,
+    openIntentCoordinator,
+    openIntentModalActive,
+    openIntentPollRevision,
+    packagedOpenConfig,
+    packagedOpenEvidenceEnabled,
+    setError,
+    setNotice,
+  ]);
 
   const handleDocumentPreviewFeedback = useCallback((
     feedback: DocxPreviewFeedback | PdfPreviewFeedback,
@@ -920,6 +1283,57 @@ export default function App() {
     };
   }, [activeFileKind, activePath, authorityStatus, documentEpoch, documentId, editorPopoutInstanceId, locale, popoutPane, setError, setNotice, workspaceRoot]);
 
+  const showWorkspaceSearchDialog = useCallback((mode: WorkspaceSearchMode) => {
+    if (openIntentModalActive) return;
+    if (!workspaceRoot || !workspaceToken) {
+      setError(t('searchUnavailable'));
+      setNotice(null);
+      return;
+    }
+    setWorkspaceSearchMode(mode);
+  }, [openIntentModalActive, setError, setNotice, t, workspaceRoot, workspaceToken]);
+
+  const discardCurrentWorkspaceIndex = useCallback(async () => {
+    if (!workspaceRoot || !workspaceToken) return;
+    setWorkspaceIndexActionBusy(true);
+    try {
+      await discardWorkspaceIndex(workspaceToken, workspaceRoot);
+      setShowSettings(false);
+      setError(null);
+      setNotice(t('workspaceIndexDiscarded'));
+    } catch (err) {
+      setShowSettings(false);
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+    } finally {
+      setWorkspaceIndexActionBusy(false);
+    }
+  }, [locale, setError, setNotice, t, workspaceRoot, workspaceToken]);
+
+  const rebuildCurrentWorkspaceIndex = useCallback(async () => {
+    if (!workspaceRoot || !workspaceToken) return;
+    setWorkspaceIndexActionBusy(true);
+    try {
+      const response = await rebuildWorkspaceIndex(
+        workspaceToken,
+        workspaceRoot,
+        createWorkspaceIndexOperationId('rebuild'),
+      );
+      if (response.status !== 'ready') {
+        throw new Error('Workspace index rebuild did not complete');
+      }
+      setShowSettings(false);
+      setError(null);
+      setNotice(t('workspaceIndexRebuilt'));
+    } catch (err) {
+      setShowSettings(false);
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+    } finally {
+      setWorkspaceIndexActionBusy(false);
+    }
+  }, [locale, setError, setNotice, t, workspaceRoot, workspaceToken]);
+
   useEffect(() => {
     if (isPopout) return undefined;
     let disposed = false;
@@ -928,14 +1342,32 @@ export default function App() {
       const command = decodeNativeMenuCommand(event.payload);
       if (!command) return;
       if (typeof command === 'object') {
-        if (command.type === 'open-recent') void handleOpenRecent(command.entryId);
+        if (command.type === 'open-recent') enqueueLocalOpenIntent(
+          'native_menu',
+          locale === 'zh-CN' ? '最近文档' : 'Recent document',
+          { kind: 'open_recent', entryId: command.entryId },
+        );
         else void handleClearRecent();
         return;
       }
       if (!nativeSaveMenuEnabled && (command === 'save' || command === 'save-as')) return;
-      if (command === 'new') handleNew();
-      else if (command === 'open-file') void handleOpenFile();
-      else if (command === 'open-directory') void handleOpenDirectory();
+      if (command === 'new') enqueueLocalOpenIntent(
+        'native_menu',
+        locale === 'zh-CN' ? '新建文档' : 'New document',
+        { kind: 'new_document' },
+      );
+      else if (command === 'open-file') enqueueLocalOpenIntent(
+        'native_menu',
+        locale === 'zh-CN' ? '选择文件' : 'Choose a file',
+        { kind: 'open_file' },
+      );
+      else if (command === 'open-directory') enqueueLocalOpenIntent(
+        'native_menu',
+        locale === 'zh-CN' ? '选择文件夹' : 'Choose a folder',
+        { kind: 'open_directory' },
+      );
+      else if (command === 'quick-open') showWorkspaceSearchDialog('quick-open');
+      else if (command === 'workspace-search') showWorkspaceSearchDialog('workspace-search');
       else if (command === 'save') void handleSave();
       else if (command === 'save-as') void handleSaveAs();
     }).then((fn) => {
@@ -946,7 +1378,7 @@ export default function App() {
       disposed = true;
       unlistenNativeMenu?.();
     };
-  }, [handleClearRecent, handleNew, handleOpenDirectory, handleOpenFile, handleOpenRecent, handleSave, handleSaveAs, isPopout, locale, nativeSaveMenuEnabled, setError]);
+  }, [enqueueLocalOpenIntent, handleClearRecent, handleSave, handleSaveAs, isPopout, locale, nativeSaveMenuEnabled, setError, showWorkspaceSearchDialog]);
 
   const handleSaveAndQuit = useCallback(async () => {
     const saved = await saveCurrentDocument();
@@ -966,34 +1398,237 @@ export default function App() {
 
   const requestWorkspaceFileOpen = useCallback((path: string) => {
     if (path === activePath) return;
-    if (dirty) {
-      setError(null);
-      setNotice(null);
-      setPendingFileSwitchPath(path);
-      return;
+    setError(null);
+    setNotice(null);
+    enqueueLocalOpenIntent('sidebar', path, { kind: 'workspace_file', path });
+  }, [activePath, enqueueLocalOpenIntent, setError, setNotice]);
+
+  const requestWorkspaceSearchOpen = useCallback((selection: WorkspaceSearchSelection) => {
+    setWorkspaceSearchMode(null);
+    setError(null);
+    setNotice(null);
+    enqueueLocalOpenIntent(
+      'workspace_search',
+      selection.relativePath,
+      { kind: 'workspace_search_result', selection },
+    );
+  }, [enqueueLocalOpenIntent, setError, setNotice]);
+
+  const settleOpenIntent = useCallback((
+    intent: AppOpenIntent,
+    settlement: 'accepted' | 'cancelled' | 'failed',
+    error?: unknown,
+  ) => {
+    const deferSuccessor = packagedOpenEvidenceEnabled && intent.origin === 'backend';
+    if (deferSuccessor) {
+      setPackagedSettlementBarrierActive(true);
+      openIntentCoordinator.setModalActive(true);
     }
-    void openWorkspaceFilePath(path);
-  }, [activePath, dirty, openWorkspaceFilePath, setError, setNotice]);
+    const settled = settlement === 'accepted'
+      ? openIntentCoordinator.acceptActive(intent.id)
+      : settlement === 'cancelled'
+        ? openIntentCoordinator.cancelActive(intent.id)
+        : openIntentCoordinator.failActive(intent.id, error ?? new Error('Open request failed'));
+    if (!settled && deferSuccessor) setPackagedSettlementBarrierActive(false);
+  }, [openIntentCoordinator, packagedOpenEvidenceEnabled]);
+
+  const processOpenIntent = useCallback(async (
+    saveBeforeOpen: boolean,
+  ): Promise<void> => {
+    const intent = pendingOpenIntent;
+    if (!intent || openIntentSettlementRef.current.has(intent.id)) return;
+    openIntentSettlementRef.current.add(intent.id);
+    try {
+      if (intent.origin === 'backend') await packagedEvidenceTailRef.current;
+      if (saveBeforeOpen) {
+        const saved = await saveCurrentDocument();
+        if (!saved) {
+          openIntentSettlementRef.current.delete(intent.id);
+          return;
+        }
+        if (intent.origin === 'backend') {
+          await recordPackagedEvidence(intent, 'dirty_decision', { decision: 'save' });
+        }
+      }
+      if (intent.origin === 'local') {
+        const { action } = intent;
+        if (action.kind === 'new_document') await handleNew();
+        else if (action.kind === 'open_file') await handleOpenFile();
+        else if (action.kind === 'open_directory') await handleOpenDirectory();
+        else if (action.kind === 'open_recent') await handleOpenRecent(action.entryId);
+        else if (action.kind === 'workspace_file') await openWorkspaceFilePath(action.path);
+        else if (action.kind === 'workspace_search_result') {
+          const { selection } = action;
+          await openWorkspaceIndexResult(
+            selection.workspaceToken,
+            selection.workspaceRoot,
+            selection.indexGeneration,
+            selection.relativePath,
+          );
+        } else {
+          await recoverCrashDraft(action.draft);
+        }
+        settleOpenIntent(intent, 'accepted');
+      } else {
+        const outcome = await resolveOpenIntentRequest(intent.id, intent.targetKind);
+        if (outcome === 'accepted') {
+          await recordPackagedEvidence(intent, 'app_applied', {
+            status: 'accepted',
+            targetKind: intent.targetKind,
+          });
+          settleOpenIntent(intent, 'accepted');
+        } else if (outcome === 'blocked') {
+          // A concurrent external/save-conflict modal owns the decision for now.
+          openIntentSettlementRef.current.delete(intent.id);
+        } else {
+          settleOpenIntent(intent, 'failed', new Error('The requested file or directory could not be opened.'));
+        }
+      }
+    } catch (err) {
+      openIntentSettlementRef.current.delete(intent.id);
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+      settleOpenIntent(intent, 'failed', err);
+    }
+  }, [
+    locale,
+    handleNew,
+    handleOpenDirectory,
+    handleOpenFile,
+    handleOpenRecent,
+    openWorkspaceFilePath,
+    openWorkspaceIndexResult,
+    pendingOpenIntent,
+    recoverCrashDraft,
+    recordPackagedEvidence,
+    resolveOpenIntentRequest,
+    saveCurrentDocument,
+    setError,
+    setNotice,
+    settleOpenIntent,
+  ]);
+
+  const cancelOpenIntent = useCallback(async (): Promise<void> => {
+    const intent = pendingOpenIntent;
+    if (!intent || openIntentSettlementRef.current.has(intent.id)) return;
+    openIntentSettlementRef.current.add(intent.id);
+    try {
+      if (intent.origin === 'backend' && typeof discardOpenIntent === 'function') {
+        await packagedEvidenceTailRef.current;
+        await discardOpenIntent(intent.id);
+      }
+      if (intent.origin === 'backend' && intent.targetKind === 'session_restore') settleWorkspaceSessionRestore();
+      settleOpenIntent(intent, 'cancelled');
+    } catch (err) {
+      openIntentSettlementRef.current.delete(intent.id);
+      setError(normalizeAppError(err, locale));
+      setNotice(null);
+    }
+  }, [locale, pendingOpenIntent, setError, setNotice, settleOpenIntent, settleWorkspaceSessionRestore]);
+
+  // A clean document can accept an active request without showing a dialog. Dirty requests
+  // remain active until one of the explicit save/switch/cancel actions below runs.
+  useEffect(() => {
+    if (
+      isPopout
+      || !pendingOpenIntent
+      || dirty
+      || openIntentModalActive
+      || openIntentSettlementRef.current.has(pendingOpenIntent.id)
+    ) return;
+    void processOpenIntent(false);
+  }, [
+    dirty,
+    isPopout,
+    openIntentModalActive,
+    pendingOpenIntent,
+    processOpenIntent,
+  ]);
 
   const handleCancelFileSwitch = useCallback(() => {
-    setPendingFileSwitchPath(null);
-  }, []);
+    if (pendingOpenIntent) {
+      if (pendingOpenIntent.origin === 'backend') {
+        void recordPackagedEvidence(pendingOpenIntent, 'dirty_decision', { decision: 'cancel' })
+          .catch(reportPackagedEvidenceFailure);
+      }
+      void cancelOpenIntent();
+    }
+  }, [cancelOpenIntent, pendingOpenIntent, recordPackagedEvidence, reportPackagedEvidenceFailure]);
 
   const handleFileSwitchWithoutSaving = useCallback(() => {
-    const targetPath = pendingFileSwitchPath;
-    if (!targetPath) return;
-    setPendingFileSwitchPath(null);
-    void openWorkspaceFilePath(targetPath);
-  }, [openWorkspaceFilePath, pendingFileSwitchPath]);
+    if (pendingOpenIntent) {
+      if (pendingOpenIntent.origin === 'backend') {
+        void recordPackagedEvidence(pendingOpenIntent, 'dirty_decision', { decision: 'discard' })
+          .catch(reportPackagedEvidenceFailure);
+      }
+      void processOpenIntent(false);
+    }
+  }, [pendingOpenIntent, processOpenIntent, recordPackagedEvidence, reportPackagedEvidenceFailure]);
 
   const handleSaveAndSwitchFile = useCallback(async () => {
-    const targetPath = pendingFileSwitchPath;
-    if (!targetPath) return;
-    const saved = await saveCurrentDocument();
-    if (!saved) return;
-    setPendingFileSwitchPath(null);
-    await openWorkspaceFilePath(targetPath);
-  }, [openWorkspaceFilePath, pendingFileSwitchPath, saveCurrentDocument]);
+    if (pendingOpenIntent) {
+      await processOpenIntent(true);
+    }
+  }, [pendingOpenIntent, processOpenIntent]);
+
+  useEffect(() => {
+    const intent = pendingOpenIntent;
+    if (
+      intent?.origin !== 'backend'
+      || !packagedOpenConfig
+      || !unsavedFileSwitchPrompt
+      || packagedAutomatedDecisionRef.current.has(intent.id)
+    ) return undefined;
+
+    const decide = (config: PackagedOpenE2eConfig) => {
+      if (packagedAutomatedDecisionRef.current.has(intent.id)) return;
+      packagedAutomatedDecisionRef.current.add(intent.id);
+      if (config.profile === 'restore-cancel' && intent.source === 'session_restore') {
+        handleCancelFileSwitch();
+      } else {
+        handleFileSwitchWithoutSaving();
+      }
+    };
+
+    const waitsForUnicodeRename = intent.displayPath === packagedOpenConfig.paths.unicodeFile
+      && !packagedOpenConfig.unicodeRenameReady;
+    if (!waitsForUnicodeRename) {
+      decide(packagedOpenConfig);
+      return undefined;
+    }
+
+    let disposed = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+    const poll = async () => {
+      attempts += 1;
+      try {
+        const config = await getPackagedOpenE2eConfig();
+        if (disposed || !config) return;
+        if (config.unicodeRenameReady) {
+          setPackagedOpenConfig(config);
+          decide(config);
+          return;
+        }
+      } catch {
+        // A transient instrumentation read must not bypass the rename gate.
+      }
+      if (!disposed && attempts < PACKAGED_UNICODE_READY_MAX_ATTEMPTS) {
+        timer = globalThis.setTimeout(poll, PACKAGED_UNICODE_READY_POLL_INTERVAL_MS);
+      }
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) globalThis.clearTimeout(timer);
+    };
+  }, [
+    handleCancelFileSwitch,
+    handleFileSwitchWithoutSaving,
+    packagedOpenConfig,
+    pendingOpenIntent,
+    unsavedFileSwitchPrompt,
+  ]);
 
   const dismissFeedbackDialog = useCallback(() => {
     setError(null);
@@ -1247,7 +1882,10 @@ export default function App() {
       <AppToolbar
         activePath={activePath}
         busy={busy}
+        canSearch={Boolean(workspaceRoot && workspaceToken) && !busy && workspaceSearchMode === null}
         dirty={dirty}
+        onQuickOpen={() => showWorkspaceSearchDialog('quick-open')}
+        onWorkspaceSearch={() => showWorkspaceSearchDialog('workspace-search')}
       />
       <button
         type="button"
@@ -1260,7 +1898,34 @@ export default function App() {
         <Settings size={17} />
       </button>
 
-      {crashDraftRecovery.error ? (
+      {workspaceSearchMode && workspaceRoot && workspaceToken ? (
+        workspaceSearchMode === 'quick-open' ? (
+          <QuickOpenDialog
+            workspaceRoot={workspaceRoot}
+            workspaceToken={workspaceToken}
+            onCancel={() => setWorkspaceSearchMode(null)}
+            onError={(error) => {
+              setWorkspaceSearchMode(null);
+              setError(normalizeAppError(error, locale));
+              setNotice(null);
+            }}
+            onSelect={requestWorkspaceSearchOpen}
+          />
+        ) : (
+          <WorkspaceSearchDialog
+            mode="workspace-search"
+            workspaceRoot={workspaceRoot}
+            workspaceToken={workspaceToken}
+            onCancel={() => setWorkspaceSearchMode(null)}
+            onError={(error) => {
+              setWorkspaceSearchMode(null);
+              setError(normalizeAppError(error, locale));
+              setNotice(null);
+            }}
+            onSelect={requestWorkspaceSearchOpen}
+          />
+        )
+      ) : crashDraftRecovery.error ? (
         <CrashDraftStoreRepairDialog
           busy={crashDraftRecovery.busy}
           canRepairOverflow={crashDraftRecovery.canRepairOverflow}
@@ -1334,10 +1999,13 @@ export default function App() {
         />
       ) : showSettings && settingsState.settings ? (
         <SettingsDialog
-          busy={settingsState.busy}
+          busy={settingsState.busy || workspaceIndexActionBusy}
           locale={locale}
           settings={settingsState.settings}
+          workspaceAvailable={Boolean(workspaceRoot && workspaceToken)}
           onClose={() => setShowSettings(false)}
+          onDiscardWorkspaceIndex={discardCurrentWorkspaceIndex}
+          onRebuildWorkspaceIndex={rebuildCurrentWorkspaceIndex}
           onReset={async () => {
             await settingsState.reset();
             setShowSettings(false);
@@ -1356,7 +2024,7 @@ export default function App() {
           activePath={activePath}
           collapsed={fileTreeCollapsed}
           collapsedFolders={collapsedFolders}
-          disabled={busy || externalFileAction !== null || pendingFileSwitchPath !== null}
+          disabled={busy || externalFileAction !== null || pendingOpenIntent !== null}
           fileTree={fileTree}
           onCollapseChange={setFileTreeCollapsed}
           onCreateFile={(parentPath, parentName, fileKind) => setWorkspaceEntryOperation({

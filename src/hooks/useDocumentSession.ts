@@ -52,6 +52,7 @@ import {
 } from '../lib/crashDrafts';
 import { crashDraftCommands } from '../lib/crashDraftCommands';
 import { translate, useI18n } from '../lib/i18n';
+import type { OpenIntentTargetKind } from '../lib/openIntent';
 import { createPaneProtocolId, createTauriPaneReplication } from '../lib/tauriPaneReplication';
 import {
   clearRecentFiles,
@@ -66,10 +67,12 @@ import {
   openFileDialog,
   openRecentFile,
   openWorkspaceFile,
+  openWorkspaceIndexResult as openNativeWorkspaceIndexResult,
   persistWorkspaceSession,
   refreshDirectory,
   renameWorkspaceEntry,
-  restoreWorkspaceSession,
+  resolveOpenIntent as resolveNativeOpenIntent,
+  settleOpenIntentWorkspace,
   saveAsDialog,
   issueDocumentOverwriteToken,
   retryDocumentSaveWithToken,
@@ -101,6 +104,8 @@ interface ActiveWorkspaceIdentity {
   workspaceToken: string;
   workspaceRoot: string;
 }
+
+type PreparedOpenApplyResult = 'committed' | 'not_committed' | 'indeterminate' | 'stale';
 
 interface AcceptedActiveDocumentWatch {
   documentGeneration: number;
@@ -200,10 +205,10 @@ export function useDocumentSession({
   const workspaceGenerationRef = useRef(0);
   const workspaceSessionPersistRevisionRef = useRef(0);
   const workspaceSessionPersistTailRef = useRef<Promise<void>>(Promise.resolve());
-  const workspaceSessionRestoreMountedRef = useRef(restoreWorkspaceSessionOnMount);
+  const workspaceSessionRestoreMountedRef = useRef(true);
   const workspaceSessionRestoreSettledRef = useRef(!restoreWorkspaceSessionOnMount);
-  const workspaceSessionRestoreStartedRef = useRef(false);
   const workspaceFilesRef = useRef<WorkspaceFileEntry[]>([]);
+  const workspaceDirectoriesRef = useRef<WorkspaceDirectoryEntry[]>([]);
   const activePathRef = useRef<string | null>(null);
   const activeFileVersionRef = useRef<FileVersion | null>(null);
   const crashDraftSchedulerRef = useRef<CrashDraftScheduler | null>(null);
@@ -234,6 +239,7 @@ export function useDocumentSession({
     || forcedDirtyCrashDraftIdRef.current === crashDraftDocumentIdRef.current;
   const fileTree = useMemo(() => buildWorkspaceFileTree(files, directories), [directories, files]);
   workspaceFilesRef.current = files;
+  workspaceDirectoriesRef.current = directories;
   const paneState = useMemo<PaneReplicatedState>(() => ({
     activeFileKind,
     activeMimeType,
@@ -297,10 +303,25 @@ export function useDocumentSession({
       workspaceRoot: response.root,
     };
     workspaceFilesRef.current = response.files;
+    workspaceDirectoriesRef.current = response.directories ?? [];
     setWorkspaceRoot(response.root);
     setFiles(response.files);
     setDirectories(response.directories ?? []);
   }, []);
+
+  const restoreWorkspaceState = useCallback((snapshot: WorkspaceSnapshot | null) => {
+    if (snapshot) {
+      applyWorkspaceSnapshot(snapshot);
+      return;
+    }
+    workspaceIdentityRef.current = { workspaceRoot: null, workspaceToken: null };
+    workspaceFilesRef.current = [];
+    workspaceDirectoriesRef.current = [];
+    paneStateRef.current = { ...paneStateRef.current, workspaceRoot: null };
+    setWorkspaceRoot(null);
+    setFiles([]);
+    setDirectories([]);
+  }, [applyWorkspaceSnapshot]);
 
   const setActiveDocumentPath = useCallback((path: string | null) => {
     const previousPath = activePathRef.current;
@@ -419,6 +440,11 @@ export function useDocumentSession({
     [isPopout],
   );
 
+  const openIntentResolutionBlocked = useCallback(
+    () => isPopout || externalFileActionRef.current !== null || saveConflictRef.current !== null,
+    [isPopout],
+  );
+
   const stopAcceptedActiveDocumentWatch = useCallback(async () => {
     const accepted = activeDocumentWatchRef.current;
     activeDocumentWatchRef.current = null;
@@ -476,14 +502,14 @@ export function useDocumentSession({
     prepared: PreparedOpenFileResponse,
     requestedGeneration: number,
     reportFailure = true,
-  ) => {
+  ): Promise<PreparedOpenApplyResult> => {
     const priorCrashDocumentId = crashDraftDocumentIdRef.current;
     try {
       await crashDraftSchedulerRef.current?.flush(priorCrashDocumentId);
     } catch {
       await discardOpenReceipt(prepared.open_receipt).catch(() => undefined);
       if (reportFailure) setError('The recovery draft could not be saved. The current document remains open.');
-      return;
+      return 'not_committed';
     }
     const prior = currentDocumentSessionState();
     const priorVersion = activeFileVersionRef.current;
@@ -501,7 +527,7 @@ export function useDocumentSession({
       commit: commitRecentOpen,
       getStatus: getOpenCommitStatus,
     });
-    if (documentGenerationRef.current !== requestedGeneration) return;
+    if (documentGenerationRef.current !== requestedGeneration) return 'stale';
 
     if (outcome.status === 'committed') {
       applyDocumentSessionState({
@@ -510,7 +536,7 @@ export function useDocumentSession({
       });
       activeFileVersionRef.current = editableFileVersion(prepared.file);
       advanceCrashDraftIdentity(priorCrashDocumentId);
-      return;
+      return 'committed';
     }
     if (outcome.status === 'not_committed') {
       try {
@@ -524,7 +550,7 @@ export function useDocumentSession({
         activeFileVersionRef.current = priorVersion;
       }
       if (reportFailure) setError(outcome.message);
-      return;
+      return 'not_committed';
     }
     applyDocumentSessionState({
       ...transition.provisional,
@@ -534,6 +560,7 @@ export function useDocumentSession({
     if (reportFailure) {
       setError('The file authorization result could not be confirmed. Open another file to continue.');
     }
+    return 'indeterminate';
   }, [advanceCrashDraftIdentity, applyDocumentSessionState, currentDocumentSessionState]);
 
   const claimPreparedOpen = useCallback((
@@ -550,63 +577,16 @@ export function useDocumentSession({
   }, []);
 
   useEffect(() => {
-    if (!restoreWorkspaceSessionOnMount) return undefined;
     workspaceSessionRestoreMountedRef.current = true;
-    if (workspaceSessionRestoreStartedRef.current) {
-      return () => {
-        workspaceSessionRestoreMountedRef.current = false;
-      };
-    }
-
-    workspaceSessionRestoreStartedRef.current = true;
-    void (async () => {
-      try {
-        await sessionQueue.enqueue({
-          run: restoreWorkspaceSession,
-          consume: async (restored) => {
-            if (restored?.active_file && !workspaceSessionRestoreMountedRef.current) {
-              await discardOpenReceipt(restored.active_file.open_receipt).catch(() => undefined);
-            }
-          },
-          isCurrent: () => workspaceSessionRestoreMountedRef.current,
-          apply: async (restored) => {
-            if (!restored) return;
-            workspaceGenerationRef.current += 1;
-            applyWorkspaceSnapshot(restored.workspace);
-            if (!restored.active_file) return;
-
-            const requestedDocumentGeneration = documentGenerationRef.current;
-            const appliedGeneration = claimPreparedOpen(
-              restored.active_file,
-              requestedDocumentGeneration,
-            );
-            if (appliedGeneration === null) {
-              await discardOpenReceipt(restored.active_file.open_receipt).catch(() => undefined);
-              return;
-            }
-            await applyPreparedOpen(restored.active_file, appliedGeneration, false);
-          },
-        });
-      } catch {
-        // Startup restoration is best-effort. The user can open a workspace normally.
-      } finally {
-        if (workspaceSessionRestoreMountedRef.current) {
-          workspaceSessionRestoreSettledRef.current = true;
-          setWorkspaceSessionRestoreSettled(true);
-        }
-      }
-    })();
-
     return () => {
       workspaceSessionRestoreMountedRef.current = false;
     };
-  }, [
-    applyPreparedOpen,
-    applyWorkspaceSnapshot,
-    claimPreparedOpen,
-    restoreWorkspaceSessionOnMount,
-    sessionQueue,
-  ]);
+  }, []);
+
+  const settleWorkspaceSessionRestore = useCallback(() => {
+    workspaceSessionRestoreSettledRef.current = true;
+    if (workspaceSessionRestoreMountedRef.current) setWorkspaceSessionRestoreSettled(true);
+  }, []);
 
   const getActiveWorkspace = useCallback((): ActiveWorkspaceIdentity | null => {
     const { workspaceRoot: currentRoot, workspaceToken: currentToken } = workspaceIdentityRef.current;
@@ -1173,6 +1153,55 @@ export function useDocumentSession({
     });
   }, [applyPreparedOpen, claimPreparedOpen, executeSessionOperation, getActiveWorkspace, isCurrentWorkspaceRequest, ordinaryDocumentActionsBlocked]);
 
+  const openWorkspaceIndexResult = useCallback(async (
+    workspaceToken: string,
+    workspaceRoot: string,
+    indexGeneration: number,
+    relativePath: string,
+  ) => {
+    if (ordinaryDocumentActionsBlocked()) return;
+    const requestedWorkspace = getActiveWorkspace();
+    if (
+      !requestedWorkspace
+      || !isCurrentWorkspaceIdentity(requestedWorkspace, { workspaceToken, workspaceRoot })
+    ) return;
+    const requestedWorkspaceGeneration = workspaceGenerationRef.current;
+    const requestedDocumentGeneration = documentGenerationRef.current;
+    const requestedOpen = ++documentOpenRequestRef.current;
+
+    await executeSessionOperation({
+      run: () => openNativeWorkspaceIndexResult(
+        workspaceToken,
+        workspaceRoot,
+        indexGeneration,
+        relativePath,
+      ),
+      consume: async (prepared) => {
+        if (
+          documentOpenRequestRef.current !== requestedOpen
+          || documentGenerationRef.current !== requestedDocumentGeneration
+          || !isCurrentWorkspaceRequest(requestedWorkspace, requestedWorkspaceGeneration)
+        ) {
+          await discardOpenReceipt(prepared.open_receipt).catch(() => undefined);
+        }
+      },
+      isCurrent: () => documentOpenRequestRef.current === requestedOpen
+        && documentGenerationRef.current === requestedDocumentGeneration
+        && isCurrentWorkspaceRequest(requestedWorkspace, requestedWorkspaceGeneration),
+      apply: async (prepared) => {
+        const appliedGeneration = claimPreparedOpen(prepared, requestedDocumentGeneration);
+        if (appliedGeneration !== null) await applyPreparedOpen(prepared, appliedGeneration);
+      },
+    });
+  }, [
+    applyPreparedOpen,
+    claimPreparedOpen,
+    executeSessionOperation,
+    getActiveWorkspace,
+    isCurrentWorkspaceRequest,
+    ordinaryDocumentActionsBlocked,
+  ]);
+
   const handleOpenFile = useCallback(async () => {
     if (ordinaryDocumentActionsBlocked()) return;
     const requestedDocumentGeneration = documentGenerationRef.current;
@@ -1237,6 +1266,152 @@ export function useDocumentSession({
       },
     });
   }, [applyWorkspaceSnapshot, executeSessionOperation, ordinaryDocumentActionsBlocked]);
+
+  const resolveOpenIntentRequest = useCallback(async (
+    intentId: string,
+    targetKind: OpenIntentTargetKind = 'unknown',
+  ): Promise<'blocked' | 'accepted' | 'failed'> => {
+    if (openIntentResolutionBlocked()) return 'blocked';
+    const requestedDocumentGeneration = documentGenerationRef.current;
+    const requestedOpen = ++documentOpenRequestRef.current;
+    let applied = false;
+    const result = await executeSessionOperation({
+      run: () => resolveNativeOpenIntent(intentId),
+      consume: async (resolved) => {
+        if (
+          documentOpenRequestRef.current !== requestedOpen
+          || documentGenerationRef.current !== requestedDocumentGeneration
+          || !workspaceSessionRestoreMountedRef.current
+        ) {
+          const prepared = resolved.kind === 'file'
+            ? resolved.prepared
+            : resolved.kind === 'session_restore'
+              ? resolved.restore?.active_file ?? null
+              : null;
+          if (prepared) {
+            await discardOpenReceipt(prepared.open_receipt).catch(() => undefined);
+          }
+          const workspaceOpenReceipt = resolved.kind === 'directory'
+            ? resolved.workspace_open_receipt
+            : resolved.kind === 'session_restore'
+              ? resolved.workspace_open_receipt
+              : null;
+          if (workspaceOpenReceipt) {
+            await settleOpenIntentWorkspace(workspaceOpenReceipt, false).catch(() => undefined);
+          }
+        }
+      },
+      isCurrent: () => documentOpenRequestRef.current === requestedOpen
+        && documentGenerationRef.current === requestedDocumentGeneration
+        && workspaceSessionRestoreMountedRef.current,
+      apply: async (resolved) => {
+        if (resolved.kind === 'file') {
+          const appliedGeneration = claimPreparedOpen(
+            resolved.prepared,
+            requestedDocumentGeneration,
+          );
+          if (appliedGeneration !== null) {
+            applied = await applyPreparedOpen(resolved.prepared, appliedGeneration) === 'committed';
+          }
+          return;
+        }
+        if (resolved.kind === 'session_restore') {
+          const restored = resolved.restore;
+          if (restored) {
+            const currentWorkspace = workspaceIdentityRef.current;
+            const priorWorkspace = currentWorkspace.workspaceRoot && currentWorkspace.workspaceToken
+              ? {
+                workspace_token: currentWorkspace.workspaceToken,
+                root: currentWorkspace.workspaceRoot,
+                files: [...workspaceFilesRef.current],
+                directories: [...workspaceDirectoriesRef.current],
+              }
+              : null;
+            workspaceGenerationRef.current += 1;
+            applyWorkspaceSnapshot(restored.workspace);
+            const workspaceOpenReceipt = resolved.workspace_open_receipt;
+            if (!workspaceOpenReceipt) {
+              restoreWorkspaceState(priorWorkspace);
+              if (restored.active_file) {
+                await discardOpenReceipt(restored.active_file.open_receipt).catch(() => undefined);
+              }
+              return;
+            }
+            let workspaceSettlement;
+            try {
+              workspaceSettlement = await settleOpenIntentWorkspace(
+                workspaceOpenReceipt,
+                true,
+              );
+            } catch (error) {
+              restoreWorkspaceState(priorWorkspace);
+              if (restored.active_file) {
+                await discardOpenReceipt(restored.active_file.open_receipt).catch(() => undefined);
+              }
+              throw error;
+            }
+            if (workspaceSettlement !== 'applied') {
+              restoreWorkspaceState(priorWorkspace);
+              if (restored.active_file) {
+                await discardOpenReceipt(restored.active_file.open_receipt).catch(() => undefined);
+              }
+              return;
+            }
+            const prepared = restored.active_file;
+            if (prepared) {
+              const appliedGeneration = claimPreparedOpen(
+                prepared,
+                requestedDocumentGeneration,
+              );
+              if (appliedGeneration === null) {
+                await discardOpenReceipt(prepared.open_receipt).catch(() => undefined);
+              } else {
+                applied = await applyPreparedOpen(prepared, appliedGeneration, false) === 'committed';
+              }
+            } else {
+              applied = true;
+            }
+          } else {
+            applied = true;
+          }
+          return;
+        }
+        const currentWorkspace = workspaceIdentityRef.current;
+        const priorWorkspace = currentWorkspace.workspaceRoot && currentWorkspace.workspaceToken
+          ? {
+            workspace_token: currentWorkspace.workspaceToken,
+            root: currentWorkspace.workspaceRoot,
+            files: [...workspaceFilesRef.current],
+            directories: [...workspaceDirectoriesRef.current],
+          }
+          : null;
+        workspaceGenerationRef.current += 1;
+        applyWorkspaceSnapshot(resolved.workspace);
+        try {
+          const workspaceSettlement = await settleOpenIntentWorkspace(
+            resolved.workspace_open_receipt,
+            true,
+          );
+          if (workspaceSettlement === 'applied') applied = true;
+          else restoreWorkspaceState(priorWorkspace);
+        } catch (error) {
+          restoreWorkspaceState(priorWorkspace);
+          throw error;
+        }
+      },
+    });
+    if (targetKind === 'session_restore') settleWorkspaceSessionRestore();
+    if (!result || result.status !== 'applied' || !applied) return 'failed';
+    return 'accepted';
+  }, [
+    applyPreparedOpen,
+    applyWorkspaceSnapshot,
+    claimPreparedOpen,
+    executeSessionOperation,
+    openIntentResolutionBlocked,
+    restoreWorkspaceState,
+    settleWorkspaceSessionRestore,
+  ]);
 
   const saveDocumentAs = useCallback(async (
     defaultName: string,
@@ -2077,7 +2252,10 @@ export function useDocumentSession({
     lastSavedContent,
     moveWorkspaceEntryPath,
     notice,
+    openWorkspaceIndexResult,
     openWorkspaceFilePath,
+    resolveOpenIntentRequest,
+    settleWorkspaceSessionRestore,
     previewRevision,
     renameWorkspaceEntryPath,
     refreshWorkspace,
@@ -2091,5 +2269,7 @@ export function useDocumentSession({
     setNotice,
     updateContent,
     workspaceRoot,
+    workspaceSessionRestoreSettled,
+    workspaceToken: workspaceIdentityRef.current.workspaceToken,
   };
 }

@@ -163,6 +163,83 @@ export interface WorkspaceSnapshot extends WorkspaceDirectoryListing {
   workspace_token: string;
 }
 
+export type WorkspaceIndexStatus = 'ready' | 'cancelled' | 'invalidated';
+export type WorkspaceIndexQueryKind = 'filename' | 'fullText';
+
+export interface WorkspaceIndexLimits {
+  maxFiles: number;
+  maxFileBytes: number;
+  maxAggregateBytes: number;
+  maxResults: number;
+  maxQueryChars: number;
+  maxSnippetChars: number;
+}
+
+export interface WorkspaceIndexSkipCounts {
+  unsupported: number;
+  invalidRelativePath: number;
+  duplicatePath: number;
+  oversized: number;
+  aggregateLimit: number;
+  fileCountLimit: number;
+}
+
+export interface WorkspaceIndexBuildReport {
+  implementationId: string;
+  schemaId: string;
+  corpusDigest: string;
+  limits: WorkspaceIndexLimits;
+  inputFiles: number;
+  indexedFiles: number;
+  indexedBytes: number;
+  estimatedIndexBytes: number;
+  skipped: WorkspaceIndexSkipCounts;
+}
+
+export interface WorkspaceIndexScanReport {
+  scannedFiles: number;
+  collectedFiles: number;
+  collectedBytes: number;
+  readErrors: number;
+  skipped: WorkspaceIndexSkipCounts;
+}
+
+export interface WorkspaceIndexRebuildResponse {
+  status: WorkspaceIndexStatus;
+  workspaceToken: string;
+  indexGeneration: number;
+  implementationId: string;
+  schemaId: string;
+  report: WorkspaceIndexBuildReport;
+  scanReport: WorkspaceIndexScanReport;
+}
+
+export interface WorkspaceIndexQueryLocation {
+  line: number;
+  utf8ByteOffset: number;
+}
+
+export interface WorkspaceIndexQueryResult {
+  relativePath: string;
+  snippet: string | null;
+  location: WorkspaceIndexQueryLocation | null;
+}
+
+export interface WorkspaceIndexQueryResponse {
+  status: WorkspaceIndexStatus;
+  workspaceToken: string;
+  indexGeneration: number;
+  implementationId: string;
+  schemaId: string;
+  truncated: boolean;
+  results: WorkspaceIndexQueryResult[];
+}
+
+export interface WorkspaceIndexDiscardResponse {
+  discarded: boolean;
+  indexGeneration: number | null;
+}
+
 export interface WorkspaceMutation {
   path: string;
 }

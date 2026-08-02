@@ -19,7 +19,10 @@ describe('shell structure accessibility', () => {
       <AppToolbar
         activePath="/workspace/notes/design.md"
         busy={false}
+        canSearch
         dirty={false}
+        onQuickOpen={vi.fn<() => void>()}
+        onWorkspaceSearch={vi.fn<() => void>()}
       />,
     );
 

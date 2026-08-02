@@ -30,6 +30,16 @@
   },
   "bundle": {
     "active": true,
+    "fileAssociations": [
+      {
+        "ext": ["md", "mdx", "markdown", "mdown", "mkd"],
+        "name": "Markdown Document",
+        "description": "Markdown Document",
+        "role": "Editor",
+        "mimeType": "text/markdown",
+        "rank": "Default"
+      }
+    ],
     "resources": {
       "../LICENSE": "LICENSE"
     },

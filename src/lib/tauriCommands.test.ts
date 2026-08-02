@@ -5,10 +5,12 @@ import {
   deleteWorkspaceEntry,
   cancelDocumentOverwriteToken,
   getSettings,
+  getPackagedOpenE2eConfig,
   issueDocumentOverwriteToken,
   moveWorkspaceEntry,
   openDirectoryDialog,
   openFileDialog,
+  peekOpenIntent,
   persistWorkspaceSession,
   prepareHtmlPreview,
   prepareMarkdownHtmlEmbed,
@@ -20,12 +22,22 @@ import {
   renameWorkspaceEntry,
   retryDocumentSaveWithToken,
   resolveWorkspaceMedia,
+  resolveOpenIntent,
+  discardOpenIntent,
+  focusMainWindow,
+  settleOpenIntentWorkspace,
+  cancelWorkspaceIndexOperation,
+  discardWorkspaceIndex,
+  openWorkspaceIndexResult,
+  queryWorkspaceIndex,
+  rebuildWorkspaceIndex,
+  recordPackagedOpenAppEvent,
+  requestSessionRestore,
   saveAsDialog,
   setNativeSaveMenuEnabled,
   setNativeLocalePreference,
   setNativeThemePreference,
   updateSettings,
-  restoreWorkspaceSession,
   writeFile,
 } from './tauriCommands';
 
@@ -163,6 +175,193 @@ describe('Tauri command wrappers', () => {
     expect(invokeMock).toHaveBeenNthCalledWith(1, 'get_settings');
     expect(invokeMock).toHaveBeenNthCalledWith(2, 'update_settings', { expectedRevision: 6, settings: envelope.settings });
     expect(invokeMock).toHaveBeenNthCalledWith(3, 'reset_settings', { expectedRevision: 7 });
+  });
+
+  it('routes opaque open-intent commands without accepting a frontend path', async () => {
+    invokeMock
+      .mockResolvedValueOnce({
+        id: 'open-intent-7',
+        source: 'secondary_instance',
+        displayPath: '/workspace/draft.md',
+        targetKind: 'unknown',
+      })
+      .mockResolvedValueOnce({ kind: 'file', prepared: {
+        file: {
+          kind: 'markdown',
+          path: '/workspace/draft.md',
+          content_mode: 'text',
+          file_version: fileVersion,
+          content: 'draft',
+        },
+        open_receipt: 'a'.repeat(32),
+        commit_operation_id: 'b'.repeat(32),
+      } })
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce('applied');
+
+    await expect(peekOpenIntent()).resolves.toMatchObject({ id: 'open-intent-7' });
+    await expect(resolveOpenIntent('open-intent-7')).resolves.toMatchObject({ kind: 'file' });
+    await expect(discardOpenIntent('open-intent-7')).resolves.toBe(true);
+    await expect(settleOpenIntentWorkspace('workspace-open-7', true)).resolves.toBe('applied');
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'peek_open_intent');
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'resolve_open_intent', { intentId: 'open-intent-7' });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, 'discard_open_intent', { intentId: 'open-intent-7' });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, 'settle_open_intent_workspace', {
+      workspaceOpenReceipt: 'workspace-open-7',
+      applied: true,
+    });
+  });
+
+  it('focuses the existing main window with opaque intent evidence metadata', async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await expect(focusMainWindow('open-intent-7', true)).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenCalledWith('focus_main_window', {
+      intentId: 'open-intent-7',
+      coalesced: true,
+    });
+  });
+
+  it('asks the backend to append one opaque session-restore intent', async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await expect(requestSessionRestore()).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenCalledWith('request_session_restore');
+  });
+
+  it('validates packaged-open config and forwards typed app evidence events', async () => {
+    const config = {
+      profile: 'apply-reobserve',
+      unicodeRenameReady: false,
+      paths: {
+        primaryFile: '/fixtures/primary.md',
+        unicodeFile: '/fixtures/unicode space.md',
+        renamedUnicodeFile: '/fixtures/unicode renamed.md',
+        associationFile: '/fixtures/association.md',
+        workspaceDirectory: '/fixtures/workspace',
+        staleFile: '/fixtures/stale.md',
+      },
+    } as const;
+    const event = {
+      type: 'app_activated',
+      intentId: 'open-intent-1',
+      step: 'cli-primary',
+      fields: { dirty: false },
+    } as const;
+    invokeMock.mockResolvedValueOnce(config).mockResolvedValueOnce(undefined);
+
+    await expect(getPackagedOpenE2eConfig()).resolves.toEqual(config);
+    await expect(recordPackagedOpenAppEvent(event)).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'get_packaged_open_e2e_config');
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'record_packaged_open_app_event', { event });
+  });
+
+  it('rejects malformed packaged-open config instead of guessing fixture paths', async () => {
+    invokeMock.mockResolvedValueOnce({
+      profile: 'apply-reobserve',
+      paths: { primaryFile: '/fixtures/primary.md' },
+    });
+
+    await expect(getPackagedOpenE2eConfig()).rejects.toThrow('Invalid packaged open E2E config');
+  });
+
+  it('uses workspace-token scoped index commands and never sends an absolute result path', async () => {
+    const report = {
+      implementationId: 'mmd-memory-substring-v1',
+      schemaId: 'mmd-workspace-index-v1',
+      corpusDigest: 'a'.repeat(64),
+      limits: {
+        maxFiles: 100000,
+        maxFileBytes: 1048576,
+        maxAggregateBytes: 268435456,
+        maxResults: 100,
+        maxQueryChars: 256,
+        maxSnippetChars: 240,
+      },
+      inputFiles: 1,
+      indexedFiles: 1,
+      indexedBytes: 7,
+      estimatedIndexBytes: 15,
+      skipped: {
+        unsupported: 0,
+        invalidRelativePath: 0,
+        duplicatePath: 0,
+        oversized: 0,
+        aggregateLimit: 0,
+        fileCountLimit: 0,
+      },
+    };
+    invokeMock
+      .mockResolvedValueOnce({
+        status: 'ready',
+        workspaceToken: 'workspace-7',
+        indexGeneration: 3,
+        implementationId: report.implementationId,
+        schemaId: report.schemaId,
+        report,
+        scanReport: {
+          scannedFiles: 1,
+          collectedFiles: 1,
+          collectedBytes: 7,
+          readErrors: 0,
+          skipped: report.skipped,
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 'ready',
+        workspaceToken: 'workspace-7',
+        indexGeneration: 3,
+        implementationId: report.implementationId,
+        schemaId: report.schemaId,
+        truncated: false,
+        results: [{ relativePath: 'notes/draft.md', snippet: 'Draft', location: null }],
+      })
+      .mockResolvedValueOnce({ discarded: true, indexGeneration: 4 })
+      .mockResolvedValueOnce({ cancelled: true })
+      .mockResolvedValueOnce({
+        file: {
+          kind: 'markdown',
+          path: '/workspace/notes/draft.md',
+          content_mode: 'text',
+          file_version: fileVersion,
+          content: 'Draft',
+        },
+        open_receipt: 'a'.repeat(32),
+        commit_operation_id: 'b'.repeat(32),
+      });
+
+    await expect(rebuildWorkspaceIndex('workspace-7', '/workspace', 'build-1')).resolves.toMatchObject({
+      indexGeneration: 3,
+    });
+    await expect(queryWorkspaceIndex('workspace-7', '/workspace', 'query-1', {
+      kind: 'fullText', text: 'draft',
+    })).resolves.toMatchObject({ results: [{ relativePath: 'notes/draft.md' }] });
+    await expect(discardWorkspaceIndex('workspace-7', '/workspace')).resolves.toEqual({
+      discarded: true,
+      indexGeneration: 4,
+    });
+    await expect(cancelWorkspaceIndexOperation('query-1')).resolves.toBe(true);
+    await expect(openWorkspaceIndexResult(
+      'workspace-7', '/workspace', 3, 'notes/draft.md',
+    )).resolves.toMatchObject({ file: { path: '/workspace/notes/draft.md' } });
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'rebuild_workspace_index', {
+      workspaceToken: 'workspace-7', workspaceRoot: '/workspace', operationId: 'build-1',
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'query_workspace_index', {
+      workspaceToken: 'workspace-7',
+      workspaceRoot: '/workspace',
+      operationId: 'query-1',
+      query: { kind: 'fullText', text: 'draft' },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(5, 'open_workspace_index_result', {
+      workspaceToken: 'workspace-7',
+      workspaceRoot: '/workspace',
+      indexGeneration: 3,
+      relativePath: 'notes/draft.md',
+    });
   });
 
   it('syncs the validated frontend theme preference into the native menu projection', async () => {
@@ -418,41 +617,20 @@ describe('Tauri command wrappers', () => {
     });
   });
 
-  it('strictly decodes and persists workspace session state through stable commands', async () => {
-    const activeFile = {
-      file: {
-        kind: 'markdown',
-        path: '/workspace/notes.md',
-        content_mode: 'text',
-        content: '# Notes',
-        file_version: fileVersion,
-      },
-      open_receipt: '0123456789abcdef0123456789abcdef',
-      commit_operation_id: 'fedcba9876543210fedcba9876543210',
-    };
-    invokeMock
-      .mockResolvedValueOnce({ workspace: workspaceSnapshot, active_file: activeFile })
-      .mockResolvedValueOnce(undefined);
+  it('persists workspace session state through the stable command', async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
 
-    await expect(restoreWorkspaceSession()).resolves.toEqual({
-      workspace: workspaceSnapshot,
-      active_file: activeFile,
-    });
     await expect(persistWorkspaceSession(
       'workspace-7',
       '/workspace',
       '/workspace/notes.md',
     )).resolves.toBeUndefined();
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, 'restore_workspace_session');
-    expect(invokeMock).toHaveBeenNthCalledWith(2, 'persist_workspace_session', {
+    expect(invokeMock).toHaveBeenCalledWith('persist_workspace_session', {
       workspaceToken: 'workspace-7',
       workspaceRoot: '/workspace',
       activePath: '/workspace/notes.md',
     });
-
-    invokeMock.mockResolvedValueOnce({ workspace: workspaceSnapshot });
-    await expect(restoreWorkspaceSession()).rejects.toThrow('Invalid workspace session restore');
   });
 
   it('updates native Save and Save As availability through one focused command', async () => {

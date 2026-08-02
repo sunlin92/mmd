@@ -127,11 +127,13 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: '-'
           VITE_MMD_PACKAGED_LIFECYCLE_E2E: '1'
+          VITE_MMD_PACKAGED_OPEN_E2E: '1'
         run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --features packaged-lifecycle-e2e --ci
       - name: Build non-macOS package
         if: runner.os != 'macOS'
         env:
           VITE_MMD_PACKAGED_LIFECYCLE_E2E: '1'
+          VITE_MMD_PACKAGED_OPEN_E2E: '1'
         run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --features packaged-lifecycle-e2e --ci
       - name: Stage macOS artifact
         if: runner.os == 'macOS'
@@ -315,7 +317,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse libfuse2 xvfb
+          sudo apt-get install -y fuse libfuse2 libglib2.0-bin xdotool xvfb
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .node-version

@@ -57,6 +57,22 @@ node scripts/ci/lifecycle-evidence.mjs verify-packaged \
   --artifact-directory "$artifact_dir" \
   --packaged-challenge "$challenge" \
   --output "$artifact_dir/m2-lifecycle-evidence.json"
+
+for profile in apply-reobserve restore-cancel; do
+  open_challenge="$RUNNER_TEMP/mmd-packaged-open-dmg-$profile.json"
+  node scripts/ci/packaged-open-evidence.mjs issue \
+    --target "$target" \
+    --package-variant dmg \
+    --platform macos \
+    --profile "$profile" \
+    --output "$open_challenge"
+  node scripts/ci/packaged-open-runner.mjs \
+    --challenge "$open_challenge" \
+    --binary "$binary" \
+    --association-app "$installed_app" \
+    --output "$artifact_dir/m3-native-open-dmg-$profile.json"
+done
 node scripts/ci/artifact-manifest.mjs create "$artifact_dir" \
-  "$(basename "$dmg")" m2-lifecycle-evidence.json
+  "$(basename "$dmg")" m2-lifecycle-evidence.json \
+  m3-native-open-dmg-apply-reobserve.json m3-native-open-dmg-restore-cancel.json
 node scripts/ci/artifact-manifest.mjs verify "$artifact_dir"

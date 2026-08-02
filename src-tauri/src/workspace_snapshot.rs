@@ -11,9 +11,16 @@ use crate::{
     },
     path_auth::{AuthorizedWorkspace, WorkspaceSnapshotSource, WorkspaceToken},
     workspace_file_kind::WorkspaceFileKind,
+    workspace_index::CancellationToken,
 };
 
 pub(crate) const EXCLUDED_WALK_DIRS: &[&str] = &[".git", ".omx", "node_modules", "target", "dist"];
+pub(crate) const MAX_WORKSPACE_INDEX_WALK_ENTRIES: usize = 200_000;
+
+pub(crate) enum WorkspaceIndexSnapshotCapture {
+    Completed(CapturedWorkspaceSnapshot),
+    Cancelled,
+}
 
 pub(crate) fn is_excluded_walk_dir(path: &Path) -> bool {
     path.file_name()
@@ -115,6 +122,14 @@ impl CapturedWorkspaceSnapshot {
             directories: listing.directories,
         })
     }
+
+    pub(crate) fn into_index_files(
+        self,
+        workspace: &AuthorizedWorkspace,
+    ) -> Result<Vec<MarkdownFileEntry>, String> {
+        self.validate_provenance(workspace)?;
+        Ok(self.files)
+    }
 }
 
 struct WalkDirWorkspaceWalker;
@@ -184,6 +199,17 @@ fn capture_workspace_snapshot_with_canonicalizer(
     walker: &(impl WorkspaceWalker + ?Sized),
     canonicalizer: &(impl WorkspaceCanonicalizer + ?Sized),
 ) -> Result<CapturedWorkspaceSnapshot, String> {
+    capture_workspace_snapshot_with_options(source, walker, canonicalizer, None, None)?
+        .ok_or_else(|| "Workspace snapshot capture was unexpectedly cancelled".to_string())
+}
+
+fn capture_workspace_snapshot_with_options(
+    source: WorkspaceSnapshotSource<'_>,
+    walker: &(impl WorkspaceWalker + ?Sized),
+    canonicalizer: &(impl WorkspaceCanonicalizer + ?Sized),
+    cancellation: Option<&CancellationToken>,
+    max_entries: Option<usize>,
+) -> Result<Option<CapturedWorkspaceSnapshot>, String> {
     let (root, workspace_token) = match source {
         WorkspaceSnapshotSource::Candidate(candidate) => (candidate.root.as_path(), None),
         WorkspaceSnapshotSource::Authorized(workspace) => {
@@ -192,8 +218,19 @@ fn capture_workspace_snapshot_with_canonicalizer(
     };
     let mut files = Vec::new();
     let mut directories = Vec::new();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
+    let mut walked_entries = 0usize;
 
     for entry in walker.walk(root)? {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(None);
+        }
+        walked_entries = walked_entries.saturating_add(1);
+        if max_entries.is_some_and(|limit| walked_entries > limit) {
+            return Err("Workspace index traversal exceeded its entry limit".to_string());
+        }
         let entry = entry?;
         if entry.kind == WorkspaceWalkEntryKind::Symlink {
             continue;
@@ -238,18 +275,34 @@ fn capture_workspace_snapshot_with_canonicalizer(
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     directories.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
-    Ok(CapturedWorkspaceSnapshot {
+    Ok(Some(CapturedWorkspaceSnapshot {
         workspace_token,
         root: root.to_path_buf(),
         files,
         directories,
-    })
+    }))
 }
 
 pub(crate) fn capture_workspace_snapshot(
     source: WorkspaceSnapshotSource<'_>,
 ) -> Result<CapturedWorkspaceSnapshot, String> {
     capture_workspace_snapshot_with(source, &WalkDirWorkspaceWalker)
+}
+
+pub(crate) fn capture_workspace_index_snapshot(
+    workspace: &AuthorizedWorkspace,
+    cancellation: &CancellationToken,
+) -> Result<WorkspaceIndexSnapshotCapture, String> {
+    match capture_workspace_snapshot_with_options(
+        WorkspaceSnapshotSource::Authorized(workspace),
+        &WalkDirWorkspaceWalker,
+        &FileSystemWorkspaceCanonicalizer,
+        Some(cancellation),
+        Some(MAX_WORKSPACE_INDEX_WALK_ENTRIES),
+    )? {
+        Some(snapshot) => Ok(WorkspaceIndexSnapshotCapture::Completed(snapshot)),
+        None => Ok(WorkspaceIndexSnapshotCapture::Cancelled),
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,14 @@ npm run perf:baseline:100k
 npm run test:perf
 ```
 
+The two `perf:baseline:*` commands intentionally replace the committed frozen gate artifacts and are only for an explicit rebaseline. Routine M3 acceptance must use:
+
+```bash
+npm run perf:gate
+```
+
+That command regenerates the deterministic fixtures, writes fresh candidates and gate reports under `.perf/results/`, and never overwrites `scripts/perf/baselines/*.json`. To re-evaluate candidates already captured on the same machine, use `npm run perf:gate:check`.
+
 The deterministic fixture generator uses fixture version `1` and seed `7417`. `run-baselines.mjs` reads those fixture files into `documents[{relativePath,content}]` and calls the release `cargo mmd_bench` binary. Search, build, and cancellation behavior all come from the production `workspace_index` module; the Node harness does not contain an alternate search implementation.
 
 ## Measurement Contract
@@ -19,6 +27,20 @@ The deterministic fixture generator uses fixture version `1` and seed `7417`. `r
 - Cancellation timing cancels that production full-text query after half of the corpus document checks.
 - Peak incremental memory is a distribution from five independent `mmd_bench` processes. Each process reports its maximum resident set size from `getrusage` after its warmup plus one measured build/query sample minus that process's pre-build maximum resident set size; the artifact records all five raw deltas and aggregates them as `independentProcessPeakRssDelta`. The production core's estimated index bytes remain a separate field. Platforms without RSS measurement use the explicitly named `estimatedIndexBytesFallback` only for schema smoke and cannot establish a memory gate.
 - Percentiles use nearest-rank selection. Errors and incomplete runs remain artifacts but cannot validate as baselines.
+
+## Gate Evaluation
+
+The evaluator exits zero only when both artifacts are complete, comparable, and every candidate p95 is less than or equal to its frozen p95. It exits nonzero for a threshold failure, an invalid/incomplete artifact, or a non-comparable candidate.
+
+Comparability requires the same OS/architecture, production implementation ID, production schema ID, deterministic fixture/corpus identity, indexed byte count, configured limits, release runner, and measurement protocol. Peak-memory acceptance additionally requires `independentProcessPeakRssDelta`; `estimatedIndexBytesFallback` is valid only for harness smoke and cannot pass the frozen memory gate. Git commit and dirty state remain recorded evidence but do not change the frozen threshold contract.
+
+Gate reports use three statuses:
+
+- `pass`: all identity/protocol checks match and all four p95 thresholds pass.
+- `fail`: artifacts are comparable, but one or more build/query/memory/cancellation thresholds exceed the frozen values.
+- `not-comparable`: identity, corpus, limits, environment, or measurement protocol changed; this requires a matching-machine rerun or an explicit rebaseline decision, not a performance claim.
+
+For a comparable 100,000-file result, `fts5AdrRequired` is true when any frozen build, query, memory, or cancellation threshold fails. Identity/protocol mismatches do not trigger that ADR because they provide no valid performance comparison.
 
 ## Frozen M3 Gates
 

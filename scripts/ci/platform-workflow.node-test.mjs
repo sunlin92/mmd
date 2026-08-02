@@ -9,6 +9,7 @@ const workflowPath = fileURLToPath(
 const releaseWorkflowPath = fileURLToPath(new URL('../../.github/workflows/release.yml', import.meta.url));
 const windowsSmokePath = fileURLToPath(new URL('./smoke-windows.ps1', import.meta.url));
 const packagedRunnerPath = fileURLToPath(new URL('./packaged-lifecycle-runner.mjs', import.meta.url));
+const packagedOpenRunnerPath = fileURLToPath(new URL('./packaged-open-runner.mjs', import.meta.url));
 const nativeTrashPath = fileURLToPath(
   new URL('../../src-tauri/src/workspace_trash_native.rs', import.meta.url),
 );
@@ -88,6 +89,47 @@ test('builds instrumented packages and promotes only post-smoke verified artifac
   );
 });
 
+test('runs challenge-bound packaged native-open acceptance on every installed package format', async () => {
+  const value = await workflow();
+  const smoke = await smokes();
+  const runner = await readFile(packagedOpenRunnerPath, 'utf8');
+
+  assert.match(value, /VITE_MMD_PACKAGED_OPEN_E2E:\s*'1'/);
+  assert.match(smoke, /packaged-open-evidence\.mjs[\s\\`]+issue/);
+  assert.match(smoke, /packaged-open-runner\.mjs/);
+  for (const profile of ['apply-reobserve', 'restore-cancel']) {
+    assert.match(smoke, new RegExp(profile));
+    for (const variant of ['dmg', 'nsis', 'deb', 'appimage']) {
+      assert.match(smoke, new RegExp(`m3-native-open-${variant}-${profile}\\.json`));
+    }
+  }
+  assert.equal(smoke.match(/packaged-open-runner\.mjs/g)?.length, 4);
+  assert.equal(smoke.match(/--profile[\s\S]{0,20}\$profile/g)?.length, 4);
+  assert.match(runner, /MMD_PACKAGED_OPEN_E2E_PROFILE/);
+  assert.match(runner, /app_settled/);
+  assert.match(runner, /queueEmpty/);
+  assert.doesNotMatch(runner, /receipt\.observations|receipt\.queue/);
+  assert.match(runner, /cli-primary/);
+  assert.match(runner, /workspaceDirectory/);
+  assert.match(runner, /staleFile/);
+  assert.match(runner, /platform-active-window-pid/);
+});
+
+test('uses platform-native association launchers and limits the AppImage exception by package type', async () => {
+  const runner = await readFile(packagedOpenRunnerPath, 'utf8');
+  const evidence = await readFile(
+    fileURLToPath(new URL('./packaged-open-evidence.mjs', import.meta.url)),
+    'utf8',
+  );
+
+  assert.match(runner, /command = 'open'/);
+  assert.match(runner, /Start-Process -FilePath \$args\[0\]/);
+  assert.match(runner, /command = 'gio'/);
+  assert.match(evidence, /association\.status !== 'verified'/);
+  assert.match(evidence, /appimage-has-no-installed-association/);
+  assert.doesNotMatch(evidence, /automation-unavailable|skipped/);
+});
+
 test('runs packaged lifecycle feature tests on every native target before packaging', async () => {
   const value = await workflow();
   const featureTest =
@@ -110,6 +152,7 @@ test('keeps the CI-only instrumentation out of default release packages', async 
 
   assert.doesNotMatch(release, /packaged-lifecycle-e2e/);
   assert.doesNotMatch(release, /VITE_MMD_PACKAGED_LIFECYCLE_E2E/);
+  assert.doesNotMatch(release, /VITE_MMD_PACKAGED_OPEN_E2E/);
 });
 
 test('passes canonical workflow identity to installed packages and runs both Linux formats', async () => {

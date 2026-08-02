@@ -881,6 +881,12 @@ impl RecentFilesState {
         self.store.list()
     }
 
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    pub(crate) fn pending_receipt_count_for_evidence(&self) -> Result<usize, String> {
+        let runtime = self.lock_runtime()?;
+        Ok(runtime.pending_receipts.len())
+    }
+
     pub(crate) fn issue_open(
         &self,
         owner_window: &str,

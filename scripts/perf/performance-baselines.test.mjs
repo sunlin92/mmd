@@ -31,3 +31,15 @@ test('documents the exact FTS5 ADR trigger and memory measurement definition', a
   assert.match(documentation, /100,000-file.*any.*build.*query.*memory.*cancellation.*FTS5 ADR/si);
   assert.match(documentation, /engineering acceptance gates.*not.*product.*promise/si);
 });
+
+test('documents the non-destructive M3 gate command and pass-fail semantics', async () => {
+  const documentation = await readFile(
+    path.join(projectRoot, 'docs', 'performance-baselines.md'),
+    'utf8',
+  );
+
+  assert.match(documentation, /npm run perf:gate/);
+  assert.match(documentation, /never overwrites.*scripts\/perf\/baselines/si);
+  assert.match(documentation, /pass.*fail.*not-comparable/si);
+  assert.match(documentation, /exits zero only when.*complete.*comparable.*p95/si);
+});

@@ -12,6 +12,7 @@ use crate::{
     path_auth::FileAuthorizationSession,
     recent_files::RecentFilesState,
     settings::SettingsStore,
+    workspace_index_runtime::WorkspaceIndexRuntime,
     workspace_session::WorkspaceSessionState,
 };
 
@@ -24,6 +25,7 @@ pub(crate) struct AppState {
     recent_files: OnceLock<RecentFilesState>,
     settings: OnceLock<SettingsStore>,
     workspace_session: OnceLock<WorkspaceSessionState>,
+    workspace_index: WorkspaceIndexRuntime,
     crash_drafts: OnceLock<ProductionCrashDraftStore>,
     crash_draft_startup_error: Mutex<Option<crate::crash_drafts::CrashDraftError>>,
     pub(crate) html_preview_server: HtmlPreviewServerState,
@@ -152,6 +154,10 @@ impl AppState {
         self.workspace_session
             .get()
             .ok_or_else(|| "Workspace session state is not initialized".to_string())
+    }
+
+    pub(crate) fn workspace_index(&self) -> &WorkspaceIndexRuntime {
+        &self.workspace_index
     }
 }
 

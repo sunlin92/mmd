@@ -65,7 +65,14 @@ describe('UI translations', () => {
     const runtime = createTestLocaleRuntime('zh-CN');
     act(() => root.render(
       <LocaleProvider runtime={runtime}>
-        <AppToolbar activePath="/workspace/draft.md" busy={false} dirty />
+        <AppToolbar
+          activePath="/workspace/draft.md"
+          busy={false}
+          canSearch
+          dirty
+          onQuickOpen={() => undefined}
+          onWorkspaceSearch={() => undefined}
+        />
       </LocaleProvider>,
     ));
 

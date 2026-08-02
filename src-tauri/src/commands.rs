@@ -51,6 +51,9 @@ use crate::{
     workspace_trash_native::NativeTrashPort,
 };
 
+#[cfg(feature = "packaged-lifecycle-e2e")]
+use crate::packaged_open_e2e::{authorization_state, observe_receipt_settlement};
+
 #[cfg(test)]
 use crate::path_auth::authorize_workspace_file_inner;
 
@@ -92,7 +95,9 @@ fn reset_settings_inner(
     state: &AppState,
     expected_revision: Option<u64>,
 ) -> Result<SettingsEnvelope, SettingsError> {
-    state.settings()?.reset(expected_revision)
+    let envelope = state.settings()?.reset(expected_revision)?;
+    state.workspace_index().discard_all();
+    Ok(envelope)
 }
 
 #[tauri::command]
@@ -145,7 +150,7 @@ fn refresh_recent_menu_with_retry(
     refresh(&reloaded).map_err(|_| RECENT_MENU_SYNC_ERROR.to_string())
 }
 
-fn emit_app_feedback_error(app: &AppHandle, message: impl Into<String>) {
+pub(crate) fn emit_app_feedback_error(app: &AppHandle, message: impl Into<String>) {
     let _ = app.emit_to("main", APP_FEEDBACK_ERROR_EVENT, message.into());
 }
 
@@ -1100,7 +1105,10 @@ fn allow_asset_preview_file_with_retry(app: &AppHandle, file: &Path) -> Result<(
     retry_asset_scope_sync(|| allow_asset_preview_file(app, file))
 }
 
-fn allow_asset_preview_directory(app: &AppHandle, directory: &Path) -> Result<(), String> {
+pub(crate) fn allow_asset_preview_directory(
+    app: &AppHandle,
+    directory: &Path,
+) -> Result<(), String> {
     app.asset_protocol_scope()
         .allow_directory(directory, true)
         .map_err(|err| format!("Failed to authorize preview assets: {err}"))
@@ -1119,7 +1127,7 @@ fn open_standalone_file_with_ports_inner(
     Ok(response)
 }
 
-fn prepare_standalone_file_with_ports_inner(
+pub(crate) fn prepare_standalone_file_with_ports_inner(
     state: &AppState,
     owner_window: &str,
     path: impl AsRef<Path>,
@@ -1138,7 +1146,7 @@ fn prepare_standalone_file_with_ports_inner(
     })
 }
 
-fn prepare_workspace_file_inner(
+pub(crate) fn prepare_workspace_file_inner(
     state: &AppState,
     owner_window: &str,
     path: impl AsRef<Path>,
@@ -1306,6 +1314,8 @@ pub(crate) fn commit_recent_open(
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<OpenCommitResult, String> {
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    let evidence_before = authorization_state(&state)?;
     let mut asset_scope_error = None;
     let result = state.recent_files()?.commit_open_with_post_commit(
         &open_receipt,
@@ -1314,7 +1324,21 @@ pub(crate) fn commit_recent_open(
         |file| {
             asset_scope_error = allow_asset_preview_file_with_retry(&app, file).err();
         },
-    )?;
+    );
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    if let Ok(outcome) = &result {
+        let evidence_after = authorization_state(&state)?;
+        observe_receipt_settlement(
+            &open_receipt,
+            match outcome {
+                OpenCommitResult::Committed { .. } => "committed",
+                OpenCommitResult::NotCommitted { .. } => "not_committed",
+            },
+            &evidence_before,
+            &evidence_after,
+        );
+    }
+    let result = result?;
     if let Some(error) = asset_scope_error {
         emit_app_feedback_error(&app, error);
     }
@@ -1341,7 +1365,22 @@ pub(crate) fn discard_open_receipt(
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    state.recent_files()?.discard(window.label(), &open_receipt)
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    let evidence_before = authorization_state(&state)?;
+    let discarded = state
+        .recent_files()?
+        .discard(window.label(), &open_receipt)?;
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    if discarded {
+        let evidence_after = authorization_state(&state)?;
+        observe_receipt_settlement(
+            &open_receipt,
+            "discarded",
+            &evidence_before,
+            &evidence_after,
+        );
+    }
+    Ok(discarded)
 }
 
 #[tauri::command]
@@ -1469,6 +1508,15 @@ fn document_save_committed(response: &Result<DocumentSaveResponse, String>) -> b
     )
 }
 
+fn discard_workspace_index_after_workspace_mutation(
+    state: &AppState,
+    workspace: &AuthorizedWorkspace,
+) {
+    let _ = state
+        .workspace_index()
+        .discard(&workspace.wire_token(), workspace.root());
+}
+
 fn save_expected_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -1490,7 +1538,13 @@ fn save_expected_inner(
         operation_id,
         owner,
     )?;
-    Ok(document_save_response(&path, disposition))
+    let response = document_save_response(&path, disposition);
+    if matches!(response, DocumentSaveResponse::ConfirmedCommitted { .. }) {
+        // Document saves do not carry a workspace scope. Discarding the active
+        // index avoids retaining stale full-text content after a confirmed write.
+        state.workspace_index().discard_all();
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1700,7 +1754,11 @@ fn retry_document_save_with_token_inner(
         owner,
         |path| validate_editable_content(path, content, "edited"),
     )?;
-    Ok(document_save_response(&path, disposition))
+    let response = document_save_response(&path, disposition);
+    if matches!(response, DocumentSaveResponse::ConfirmedCommitted { .. }) {
+        state.workspace_index().discard_all();
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -1881,10 +1939,14 @@ fn save_as_coordinated_inner(
             .file_authorization()
             .cancel_pending_save_authority(&pending)?;
     }
-    Ok(document_save_response(&path, disposition))
+    let response = document_save_response(&path, disposition);
+    if matches!(response, DocumentSaveResponse::ConfirmedCommitted { .. }) {
+        state.workspace_index().discard_all();
+    }
+    Ok(response)
 }
 
-fn open_directory_with_ports_inner(
+pub(crate) fn open_directory_with_ports_inner(
     state: &AppState,
     path: impl AsRef<Path>,
     snapshot: impl for<'a> FnOnce(
@@ -1895,7 +1957,9 @@ fn open_directory_with_ports_inner(
     let (workspace, snapshot) = state
         .file_authorization()
         .open_workspace(path, snapshot, transport)?;
-    snapshot.into_workspace_snapshot(&workspace)
+    let snapshot = snapshot.into_workspace_snapshot(&workspace)?;
+    state.workspace_index().discard_all();
+    Ok(snapshot)
 }
 
 fn open_persisted_directory_with_ports_inner(
@@ -1910,7 +1974,9 @@ fn open_persisted_directory_with_ports_inner(
     let (workspace, snapshot) = state
         .file_authorization()
         .open_workspace_at_canonical_root(path, expected_root, snapshot, transport)?;
-    snapshot.into_workspace_snapshot(&workspace)
+    let snapshot = snapshot.into_workspace_snapshot(&workspace)?;
+    state.workspace_index().discard_all();
+    Ok(snapshot)
 }
 
 #[cfg(any(test, feature = "packaged-lifecycle-e2e"))]
@@ -1977,7 +2043,7 @@ fn validate_workspace_session_owner(owner: &str) -> Result<(), String> {
     }
 }
 
-fn restore_workspace_session_with_ports_inner(
+pub(crate) fn restore_workspace_session_with_ports_inner(
     state: &AppState,
     owner_window: &str,
     transport: impl FnOnce(&Path) -> Result<(), String>,
@@ -2044,18 +2110,6 @@ pub(crate) fn restore_workspace_session_inner(
     state: &AppState,
 ) -> Result<Option<WorkspaceSessionRestore>, String> {
     restore_workspace_session_with_ports_inner(state, "main", |_| Ok(()))
-}
-
-#[tauri::command]
-pub(crate) fn restore_workspace_session(
-    app: AppHandle,
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-) -> Result<Option<WorkspaceSessionRestore>, String> {
-    validate_workspace_session_owner(window.label())?;
-    restore_workspace_session_with_ports_inner(&state, window.label(), |root| {
-        allow_asset_preview_directory(&app, root)
-    })
 }
 
 fn persist_workspace_session_inner(
@@ -2232,6 +2286,7 @@ fn create_workspace_file_with_kind_and_ports_inner(
         }
     };
     let workspace_receipt = capture_post_commit_workspace_receipt(state, &workspace, snapshot);
+    discard_workspace_index_after_workspace_mutation(state, &workspace);
     Ok(MutationOutcome::ConfirmedCommitted {
         receipt: MutationCommitReceipt {
             committed,
@@ -2379,6 +2434,7 @@ fn create_workspace_directory_with_ports_inner(
         path: target.to_string_lossy().to_string(),
     };
     let workspace_receipt = capture_post_commit_workspace_receipt(state, &workspace, snapshot);
+    discard_workspace_index_after_workspace_mutation(state, &workspace);
     Ok(MutationOutcome::ConfirmedCommitted {
         receipt: MutationCommitReceipt {
             committed,
@@ -2454,6 +2510,7 @@ fn finish_workspace_entry_relocation_outcome(
             };
             let workspace =
                 capture_post_commit_workspace_receipt(state, renamed.workspace(), snapshot);
+            discard_workspace_index_after_workspace_mutation(state, renamed.workspace());
             Ok(MutationOutcome::ConfirmedCommitted {
                 receipt: MutationCommitReceipt {
                     committed,
@@ -2720,6 +2777,7 @@ fn delete_workspace_entry_with_ports_inner(
             };
             let workspace =
                 capture_post_commit_workspace_receipt(state, deleted.workspace(), snapshot);
+            discard_workspace_index_after_workspace_mutation(state, deleted.workspace());
             Ok(MutationOutcome::ConfirmedCommitted {
                 receipt: MutationCommitReceipt {
                     committed,
@@ -2756,6 +2814,10 @@ fn delete_workspace_entry_with_ports_inner(
                                 state,
                                 attempted.workspace(),
                                 snapshot,
+                            );
+                            discard_workspace_index_after_workspace_mutation(
+                                state,
+                                attempted.workspace(),
                             );
                             return Ok(MutationOutcome::ConfirmedCommitted {
                                 receipt: MutationCommitReceipt {
@@ -2879,6 +2941,7 @@ fn delete_workspace_entry_with_trash_port_inner<P: TrashPort>(
             };
             let workspace =
                 capture_post_commit_workspace_receipt(state, deleted.workspace(), snapshot);
+            discard_workspace_index_after_workspace_mutation(state, deleted.workspace());
             Ok(MutationOutcome::ConfirmedCommitted {
                 receipt: MutationCommitReceipt {
                     committed,
@@ -3176,7 +3239,49 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use crate::path_auth::{is_authorized_image_path, normalize_existing_path};
+    use crate::{
+        path_auth::{is_authorized_image_path, normalize_existing_path},
+        workspace_index::{build_index, CancellationToken, IndexDocument, IndexLimits},
+    };
+
+    fn publish_workspace_index(
+        state: &AppState,
+        workspace_token: &str,
+        workspace_root: &Path,
+        operation_id: &str,
+    ) -> crate::workspace_index_runtime::WorkspaceIndexLease {
+        let lease = state
+            .workspace_index()
+            .begin_rebuild(workspace_token, workspace_root, operation_id)
+            .unwrap();
+        let (index, _) = build_index(
+            vec![IndexDocument {
+                relative_path: "note.md".to_string(),
+                content: "indexed content".to_string(),
+            }],
+            IndexLimits::default(),
+            &CancellationToken::new(),
+        )
+        .completed()
+        .unwrap();
+        assert!(state
+            .workspace_index()
+            .publish_rebuild(&lease, index)
+            .unwrap());
+        lease
+    }
+
+    fn assert_workspace_index_invalidated(
+        state: &AppState,
+        workspace_token: &str,
+        workspace_root: &Path,
+        lease: &crate::workspace_index_runtime::WorkspaceIndexLease,
+    ) {
+        assert!(!state
+            .workspace_index()
+            .is_result_current(workspace_token, workspace_root, lease.generation)
+            .unwrap());
+    }
 
     #[derive(Clone, Copy)]
     enum ScriptedTrashMode {
@@ -3296,6 +3401,24 @@ mod tests {
         match outcome.unwrap() {
             MutationOutcome::ConfirmedCommitted { receipt } => receipt.committed,
             _ => panic!("expected confirmed committed rename outcome"),
+        }
+    }
+
+    fn committed_open_file_response(
+        outcome: Result<MutationOutcome<OpenFileResponse, WorkspaceSnapshot>, String>,
+    ) -> OpenFileResponse {
+        match outcome.unwrap() {
+            MutationOutcome::ConfirmedCommitted { receipt } => receipt.committed,
+            _ => panic!("expected confirmed committed file creation outcome"),
+        }
+    }
+
+    fn committed_workspace_mutation(
+        outcome: Result<MutationOutcome<WorkspaceMutation, WorkspaceSnapshot>, String>,
+    ) -> WorkspaceMutation {
+        match outcome.unwrap() {
+            MutationOutcome::ConfirmedCommitted { receipt } => receipt.committed,
+            _ => panic!("expected confirmed committed workspace mutation outcome"),
         }
     }
 
@@ -4238,6 +4361,133 @@ mod tests {
         };
         assert_eq!(receipt.committed.deleted_path, renamed.new_path);
         assert!(!Path::new(&receipt.committed.deleted_path).exists());
+    }
+
+    #[test]
+    fn confirmed_workspace_mutations_discard_only_the_matching_index_scope() {
+        let dir = tempdir().unwrap();
+        let state = AppState::default();
+        let opened = open_directory_inner(&state, dir.path()).unwrap();
+        let root = Path::new(&opened.root);
+
+        let create_file_index =
+            publish_workspace_index(&state, &opened.workspace_token, root, "create-file-index");
+        let created_file = committed_open_file_response(create_workspace_file_inner(
+            &state,
+            &opened.workspace_token,
+            root,
+            "draft.md",
+        ));
+        assert_workspace_index_invalidated(
+            &state,
+            &opened.workspace_token,
+            root,
+            &create_file_index,
+        );
+
+        let create_directory_index = publish_workspace_index(
+            &state,
+            &opened.workspace_token,
+            root,
+            "create-directory-index",
+        );
+        let directory = committed_workspace_mutation(create_workspace_directory_inner(
+            &state,
+            &opened.workspace_token,
+            root,
+            "notes",
+        ));
+        assert_workspace_index_invalidated(
+            &state,
+            &opened.workspace_token,
+            root,
+            &create_directory_index,
+        );
+
+        let rename_index =
+            publish_workspace_index(&state, &opened.workspace_token, root, "rename-index");
+        let renamed = committed_rename_response(rename_workspace_entry_inner(
+            &state,
+            &opened.workspace_token,
+            &created_file.path,
+            "renamed.md",
+        ));
+        assert_workspace_index_invalidated(&state, &opened.workspace_token, root, &rename_index);
+
+        let move_index =
+            publish_workspace_index(&state, &opened.workspace_token, root, "move-index");
+        let moved = committed_rename_response(move_workspace_entry_inner(
+            &state,
+            &opened.workspace_token,
+            &renamed.new_path,
+            &directory.path,
+        ));
+        assert_workspace_index_invalidated(&state, &opened.workspace_token, root, &move_index);
+
+        let delete_index =
+            publish_workspace_index(&state, &opened.workspace_token, root, "delete-index");
+        let deleted =
+            delete_workspace_entry_legacy_inner(&state, &opened.workspace_token, &moved.new_path)
+                .unwrap();
+        assert!(matches!(
+            deleted,
+            MutationOutcome::ConfirmedCommitted { .. }
+        ));
+        assert_workspace_index_invalidated(&state, &opened.workspace_token, root, &delete_index);
+    }
+
+    #[test]
+    fn confirmed_content_saves_discard_the_active_index_but_rejected_saves_do_not() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "before").unwrap();
+        let state = AppState::default();
+        let opened = open_directory_inner(&state, dir.path()).unwrap();
+        open_workspace_file_inner(&state, &path).unwrap();
+        let root = Path::new(&opened.root);
+
+        let rejected_index =
+            publish_workspace_index(&state, &opened.workspace_token, root, "rejected-save-index");
+        assert!(save_expected_inner(
+            &state,
+            &path,
+            "after",
+            read_file_inner(&state, &path)
+                .unwrap()
+                .file_version
+                .unwrap(),
+            "rejected-save",
+            "preview",
+        )
+        .is_err());
+        assert!(state
+            .workspace_index()
+            .is_result_current(&opened.workspace_token, root, rejected_index.generation)
+            .unwrap());
+
+        let committed_index = publish_workspace_index(
+            &state,
+            &opened.workspace_token,
+            root,
+            "committed-save-index",
+        );
+        let response = save_expected_inner(
+            &state,
+            &path,
+            "after",
+            read_file_inner(&state, &path)
+                .unwrap()
+                .file_version
+                .unwrap(),
+            "committed-save",
+            MAIN_SAVE_OWNER,
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            DocumentSaveResponse::ConfirmedCommitted { .. }
+        ));
+        assert_workspace_index_invalidated(&state, &opened.workspace_token, root, &committed_index);
     }
 
     #[test]

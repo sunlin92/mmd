@@ -6,6 +6,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use crate::workspace_file_kind::WorkspaceFileKind;
+
 pub const INDEX_IMPLEMENTATION_ID: &str = "mmd-memory-substring-v1";
 pub const INDEX_SCHEMA_ID: &str = "mmd-workspace-index-v1";
 const MAX_BENCHMARK_WARMUPS: usize = 20;
@@ -144,6 +146,7 @@ impl BuildOutcome {
 struct CancellationState {
     cancelled: AtomicBool,
     checks_before_cancel: AtomicUsize,
+    deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +157,7 @@ impl Default for CancellationToken {
         Self(Arc::new(CancellationState {
             cancelled: AtomicBool::new(false),
             checks_before_cancel: AtomicUsize::new(usize::MAX),
+            deadline: None,
         }))
     }
 }
@@ -161,6 +165,14 @@ impl Default for CancellationToken {
 impl CancellationToken {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_deadline(deadline: Instant) -> Self {
+        Self(Arc::new(CancellationState {
+            cancelled: AtomicBool::new(false),
+            checks_before_cancel: AtomicUsize::new(usize::MAX),
+            deadline: Some(deadline),
+        }))
     }
 
     pub fn cancel(&self) {
@@ -174,6 +186,13 @@ impl CancellationToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
+        if self
+            .0
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.cancel();
+        }
         if self.0.cancelled.load(Ordering::Acquire) {
             return true;
         }
@@ -228,9 +247,19 @@ impl IndexQuery {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QueryLocation {
+    /// One-based source line for the first full-text match.
+    pub line: usize,
+    /// Zero-based byte offset in the original UTF-8 source.
+    pub utf8_byte_offset: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QueryResult {
     pub relative_path: String,
     pub snippet: Option<String>,
+    pub location: Option<QueryLocation>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -354,7 +383,10 @@ pub fn query_index(
         return response;
     }
     let terms: Vec<&str> = normalized_query.split_whitespace().collect();
-    let mut matches: Vec<(u8, QueryResult)> = Vec::new();
+    let max_results = index.limits.max_results;
+    let mut matched_count = 0usize;
+    let mut ranked_matches: [Vec<&IndexedDocument>; 3] =
+        std::array::from_fn(|_| Vec::with_capacity(max_results.min(index.documents.len())));
 
     for document in &index.documents {
         if cancellation.is_cancelled() {
@@ -362,7 +394,7 @@ pub fn query_index(
             response.results.clear();
             return response;
         }
-        let (matched, rank, snippet) = match query.kind {
+        let (matched, rank) = match query.kind {
             QueryKind::Filename => {
                 let filename = document
                     .normalized_path
@@ -374,51 +406,63 @@ pub fn query_index(
                     .iter()
                     .all(|term| document.normalized_path.contains(term));
                 let rank = if stem == normalized_query {
-                    0
+                    0usize
                 } else if stem.starts_with(&normalized_query) {
                     1
                 } else {
                     2
                 };
-                (matched, rank, None)
+                (matched, rank)
             }
             QueryKind::FullText => {
                 let matched = terms
                     .iter()
                     .all(|term| document.normalized_content.contains(term));
-                let snippet = matched.then(|| {
-                    bounded_snippet(
-                        &document.content,
-                        &document.normalized_content,
-                        terms[0],
-                        index.limits.max_snippet_chars,
-                    )
-                });
-                (matched, 0, snippet)
+                (matched, 0usize)
             }
         };
         if matched {
-            matches.push((
-                rank,
-                QueryResult {
-                    relative_path: document.relative_path.clone(),
-                    snippet,
-                },
-            ));
+            matched_count = matched_count.saturating_add(1);
+            let bucket = &mut ranked_matches[rank];
+            if bucket.len() < max_results {
+                bucket.push(document);
+            }
         }
     }
 
-    matches.sort_by(|left, right| {
-        left.0.cmp(&right.0).then_with(|| {
-            normalize_for_search(&left.1.relative_path)
-                .cmp(&normalize_for_search(&right.1.relative_path))
-        })
-    });
-    response.truncated = matches.len() > index.limits.max_results;
-    response.results = matches
+    // build_index stores documents in normalized-path order. Keeping only the bounded prefix of
+    // each rank preserves the same ordering while avoiding snippets and location scans for results
+    // that will be discarded. The scan itself remains complete so cancellation stays observable.
+    response.truncated = matched_count > max_results;
+    response.results = ranked_matches
         .into_iter()
-        .take(index.limits.max_results)
-        .map(|(_, result)| result)
+        .flatten()
+        .take(max_results)
+        .map(|document| {
+            let (snippet, location) = match query.kind {
+                QueryKind::Filename => (None, None),
+                QueryKind::FullText => {
+                    let normalized_offset = document.normalized_content.find(terms[0]).unwrap_or(0);
+                    (
+                        Some(bounded_snippet(
+                            &document.content,
+                            &document.normalized_content,
+                            terms[0],
+                            index.limits.max_snippet_chars,
+                        )),
+                        Some(source_location_for_normalized_offset(
+                            &document.content,
+                            normalized_offset,
+                        )),
+                    )
+                }
+            };
+            QueryResult {
+                relative_path: document.relative_path.clone(),
+                snippet,
+                location,
+            }
+        })
         .collect();
     response
 }
@@ -632,10 +676,10 @@ fn normalize_relative_path(path: &str) -> Option<String> {
 
 fn is_supported_markdown_path(path: &str) -> bool {
     path.rsplit_once('.').is_some_and(|(_, extension)| {
-        matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "md" | "markdown" | "mdown" | "mkdn"
-        )
+        let normalized = extension.to_ascii_lowercase();
+        WorkspaceFileKind::Markdown
+            .extensions()
+            .contains(&normalized.as_str())
     })
 }
 
@@ -674,6 +718,34 @@ fn bounded_snippet(
     let total_chars = content.chars().count();
     let start = anchor_chars.saturating_sub(max_chars / 3).min(total_chars);
     content.chars().skip(start).take(max_chars).collect()
+}
+
+fn source_location_for_normalized_offset(content: &str, normalized_offset: usize) -> QueryLocation {
+    let mut line = 1usize;
+    let mut original_offset = 0usize;
+    let mut normalized_cursor = 0usize;
+
+    for character in content.chars() {
+        let mut folded = String::new();
+        append_casefolded(&mut folded, character);
+        let next_normalized_cursor = normalized_cursor.saturating_add(folded.len());
+        if normalized_offset < next_normalized_cursor {
+            return QueryLocation {
+                line,
+                utf8_byte_offset: original_offset,
+            };
+        }
+        normalized_cursor = next_normalized_cursor;
+        original_offset = original_offset.saturating_add(character.len_utf8());
+        if character == '\n' {
+            line = line.saturating_add(1);
+        }
+    }
+
+    QueryLocation {
+        line,
+        utf8_byte_offset: original_offset,
+    }
 }
 
 fn corpus_digest(documents: &[IndexDocument]) -> String {
@@ -769,6 +841,40 @@ mod tests {
     }
 
     #[test]
+    fn indexes_the_same_markdown_extensions_as_the_workspace_file_policy() {
+        let (index, report) = build_index(
+            vec![
+                document("notes/readme.mdx", "mdx"),
+                document("notes/readme.mkd", "mkd"),
+                document("notes/legacy.mkdn", "legacy"),
+            ],
+            IndexLimits::default(),
+            &CancellationToken::new(),
+        )
+        .completed()
+        .unwrap();
+
+        assert_eq!(report.indexed_files, 2);
+        assert_eq!(
+            query_index(
+                &index,
+                IndexQuery::full_text("mdx"),
+                &CancellationToken::new()
+            )
+            .results[0]
+                .relative_path,
+            "notes/readme.mdx",
+        );
+        assert!(query_index(
+            &index,
+            IndexQuery::full_text("legacy"),
+            &CancellationToken::new(),
+        )
+        .results
+        .is_empty());
+    }
+
+    #[test]
     fn filename_and_full_text_queries_have_stable_normalized_order_and_bounded_snippets() {
         let limits = IndexLimits {
             max_results: 2,
@@ -841,6 +947,33 @@ mod tests {
     }
 
     #[test]
+    fn full_text_results_report_the_original_utf8_match_location() {
+        let content = "前缀\r\nStraße\nCafe\u{301} needle";
+        let (index, _) = build_index(
+            vec![document("unicode.md", content)],
+            IndexLimits::default(),
+            &CancellationToken::new(),
+        )
+        .completed()
+        .unwrap();
+
+        let response = query_index(
+            &index,
+            IndexQuery::full_text("ss"),
+            &CancellationToken::new(),
+        );
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].location,
+            Some(QueryLocation {
+                line: 2,
+                utf8_byte_offset: "前缀\r\nStra".len(),
+            }),
+        );
+    }
+
+    #[test]
     fn cancellation_is_observed_by_build_and_query() {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
@@ -861,6 +994,13 @@ mod tests {
         let query = query_index(&index, IndexQuery::full_text("needle"), &cancelled);
         assert_eq!(query.status, OperationStatus::Cancelled);
         assert!(query.results.is_empty());
+    }
+
+    #[test]
+    fn deadline_bound_token_cancels_without_an_external_watchdog() {
+        let token = CancellationToken::with_deadline(Instant::now());
+
+        assert!(token.is_cancelled());
     }
 
     #[test]

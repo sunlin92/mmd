@@ -13,6 +13,9 @@ interface SettingsDialogProps {
   onReset: () => Promise<void>;
   onRetry?: () => Promise<void>;
   onSave?: (settings: AppSettings) => Promise<void>;
+  workspaceAvailable?: boolean;
+  onDiscardWorkspaceIndex?: () => Promise<void>;
+  onRebuildWorkspaceIndex?: () => Promise<void>;
 }
 
 const copy = {
@@ -28,6 +31,11 @@ const copy = {
     conflictTitle: 'Settings Changed Elsewhere',
     conflictMessage: 'Settings changed in another window. Reload the latest settings before making changes.',
     reload: 'Reload Settings',
+    workspaceIndex: 'Workspace Index',
+    workspaceIndexDescription: 'Manage the local index used to search workspace files.',
+    workspaceIndexUnavailable: 'Open a workspace to manage its index.',
+    discardIndex: 'Discard index',
+    rebuildIndex: 'Rebuild index',
   },
   'zh-CN': {
     title: '设置', autosave: '自动保存', autosaveDelay: '保存延迟', milliseconds: '毫秒',
@@ -41,6 +49,11 @@ const copy = {
     conflictTitle: '设置已在其他窗口更改',
     conflictMessage: '设置已在其他窗口更新。请先重新加载最新设置，再继续修改。',
     reload: '重新加载设置',
+    workspaceIndex: '工作区索引',
+    workspaceIndexDescription: '管理用于搜索工作区文件的本地索引。',
+    workspaceIndexUnavailable: '请先打开工作区，再管理其索引。',
+    discardIndex: '丢弃索引',
+    rebuildIndex: '重建索引',
   },
 };
 
@@ -53,6 +66,9 @@ export function SettingsDialog({
   onReset,
   onRetry,
   onSave,
+  workspaceAvailable = false,
+  onDiscardWorkspaceIndex,
+  onRebuildWorkspaceIndex,
 }: SettingsDialogProps) {
   const text = copy[locale];
   const [draft, setDraft] = useState<AppSettings | null>(settings ?? null);
@@ -113,6 +129,15 @@ export function SettingsDialog({
             <label className="settings-field"><span>{text.skin}</span><select name="selectedSkin" value={draft.selectedSkin} onChange={(event) => setDraft({ ...draft, selectedSkin: event.target.value as AppSettings['selectedSkin'] })}><option value="jinxiu-zhusha">Jinxiu Zhusha</option><option value="ruyao-tianqing">Ruyao Tianqing</option><option value="qinghua-jilan">Qinghua Jilan</option><option value="songke-zhuying">Songke Zhuying</option><option value="shanshui-yemo">Shanshui Yemo</option></select></label>
             <label className="settings-toggle"><span>{text.followSystem}</span><input name="followSystemTheme" type="checkbox" checked={draft.followSystemTheme} onChange={(event) => setDraft({ ...draft, followSystemTheme: event.target.checked })} /></label>
             <label className="settings-field"><span>{text.language}</span><select name="localeMode" value={draft.localeMode} onChange={(event) => setDraft({ ...draft, localeMode: event.target.value as AppSettings['localeMode'] })}><option value="system">System</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>
+          </section>
+
+          <section className="settings-section" aria-labelledby="workspace-index-heading" aria-describedby="workspace-index-description">
+            <h3 id="workspace-index-heading">{text.workspaceIndex}</h3>
+            <p id="workspace-index-description">{workspaceAvailable ? text.workspaceIndexDescription : text.workspaceIndexUnavailable}</p>
+            <div className="settings-index-actions">
+              <button type="button" name="discardWorkspaceIndex" className="dialog-button ghost" disabled={busy || !workspaceAvailable || !onDiscardWorkspaceIndex} onClick={() => void onDiscardWorkspaceIndex?.()}>{text.discardIndex}</button>
+              <button type="button" name="rebuildWorkspaceIndex" className="dialog-button secondary" disabled={busy || !workspaceAvailable || !onRebuildWorkspaceIndex} onClick={() => void onRebuildWorkspaceIndex?.()}>{text.rebuildIndex}</button>
+            </div>
           </section>
 
           <div className="settings-dialog-actions">

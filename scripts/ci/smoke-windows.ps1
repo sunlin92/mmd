@@ -58,8 +58,24 @@ node scripts/ci/lifecycle-evidence.mjs verify-packaged `
   --packaged-challenge $challenge `
   --output (Join-Path $ArtifactDirectory 'm2-lifecycle-evidence.json')
 if ($LASTEXITCODE -ne 0) { throw 'Packaged lifecycle evidence verification failed' }
+foreach ($profile in @('apply-reobserve', 'restore-cancel')) {
+  $openChallenge = Join-Path $env:RUNNER_TEMP "mmd-packaged-open-nsis-$profile.json"
+  node scripts/ci/packaged-open-evidence.mjs issue `
+    --target $Target `
+    --package-variant nsis `
+    --platform windows `
+    --profile $profile `
+    --output $openChallenge
+  if ($LASTEXITCODE -ne 0) { throw "Packaged native-open challenge creation failed: $profile" }
+  node scripts/ci/packaged-open-runner.mjs `
+    --challenge $openChallenge `
+    --binary $appPath `
+    --output (Join-Path $ArtifactDirectory "m3-native-open-nsis-$profile.json")
+  if ($LASTEXITCODE -ne 0) { throw "Packaged native-open runner failed: $profile" }
+}
 node scripts/ci/artifact-manifest.mjs create $ArtifactDirectory `
-  $installers[0].Name m2-lifecycle-evidence.json
+  $installers[0].Name m2-lifecycle-evidence.json `
+  m3-native-open-nsis-apply-reobserve.json m3-native-open-nsis-restore-cancel.json
 if ($LASTEXITCODE -ne 0) { throw 'Verified artifact manifest creation failed' }
 node scripts/ci/artifact-manifest.mjs verify $ArtifactDirectory
 if ($LASTEXITCODE -ne 0) { throw 'Verified artifact manifest verification failed' }

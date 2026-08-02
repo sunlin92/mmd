@@ -42,6 +42,7 @@
   .settings-launch-button { right: 7px; }
   .brand { min-width: 0; }
   .brand-copy { display: none; }
+  .toolbar-search-actions { display: none; }
   .document-status { min-width: 0; }
   .workspace,
   .workspace.image-mode,

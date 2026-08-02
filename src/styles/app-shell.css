@@ -82,6 +82,34 @@
   font-size: 11px;
 }
 
+.toolbar-search-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.toolbar-icon-button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.toolbar-icon-button:hover:not(:disabled),
+.toolbar-icon-button:focus-visible {
+  border-color: var(--control-border);
+  outline: none;
+  background: var(--control-hover);
+  color: var(--chrome-text);
+}
+
+.toolbar-icon-button:disabled { opacity: 0.42; }
+
 .toolbar-document {
   position: absolute;
   top: 50%;
@@ -172,6 +200,197 @@
 .app-dialog-backdrop { z-index: 120; }
 .workspace-entry-dialog-backdrop { z-index: 110; }
 .unsaved-dialog-backdrop { z-index: 100; }
+
+.workspace-search-dialog-backdrop {
+  position: fixed;
+  z-index: 115;
+  inset: 0;
+  display: grid;
+  place-items: start center;
+  padding: min(12vh, 108px) 18px 24px;
+  background: var(--overlay);
+  backdrop-filter: blur(4px);
+  animation: shell-overlay-in 160ms ease-out both;
+}
+
+.workspace-search-dialog {
+  position: relative;
+  inset: auto;
+  width: min(640px, 100%);
+  max-height: min(580px, calc(100vh - 48px));
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 0;
+  background: var(--panel-strong);
+  color: var(--chrome-text);
+  box-shadow: 0 20px 54px var(--shadow), 0 1px 0 var(--shadow-inset) inset;
+  animation: shell-materialize-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.workspace-search-dialog-header {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace-search-dialog-title-row {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workspace-search-dialog-title-row h2 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 15px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-search-dialog-close,
+.workspace-search-rebuild {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.workspace-search-dialog-close:hover,
+.workspace-search-dialog-close:focus-visible,
+.workspace-search-rebuild:hover:not(:disabled),
+.workspace-search-rebuild:focus-visible {
+  border-color: var(--control-border);
+  outline: none;
+  background: var(--control-hover);
+  color: var(--chrome-text);
+}
+
+.workspace-search-rebuild:disabled { opacity: 0.45; }
+
+.workspace-search-input {
+  min-width: 0;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0 4px 0 10px;
+  background: var(--control-bg);
+  color: var(--text-muted);
+}
+
+.workspace-search-input:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--selection-muted);
+}
+
+.workspace-search-input > svg { flex: 0 0 auto; }
+.workspace-search-input > .lucide-loader-circle { animation: shell-spin 0.9s linear infinite; }
+
+.workspace-search-input input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--chrome-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.workspace-search-result-list {
+  min-height: 126px;
+  max-height: min(450px, calc(100vh - 190px));
+  overflow-y: auto;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+}
+
+.workspace-search-state,
+.workspace-search-truncated {
+  margin: 0;
+  padding: 22px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.workspace-search-truncated {
+  padding-top: 8px;
+  color: var(--warning);
+}
+
+.workspace-search-result {
+  width: 100%;
+  min-height: 52px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 7px 8px;
+  background: transparent;
+  color: var(--chrome-text);
+  text-align: left;
+}
+
+.workspace-search-result:hover,
+.workspace-search-result[aria-current="true"] {
+  border-color: var(--control-border);
+  background: var(--selection-muted);
+}
+
+.workspace-search-result[aria-current="true"] { box-shadow: inset 3px 0 var(--accent); }
+.workspace-search-result > svg { color: var(--text-muted); }
+
+.workspace-search-result-copy {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.workspace-search-result-copy strong,
+.workspace-search-result-copy small,
+.workspace-search-result-copy em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-search-result-copy strong { font-size: 12px; font-weight: 650; }
+.workspace-search-result-copy small { color: var(--text-muted); font-size: 11px; }
+.workspace-search-result-copy em { color: var(--text-faint); font-size: 11px; font-style: normal; }
+
+.workspace-search-result-location {
+  align-self: start;
+  max-width: 90px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 5px;
+  background: var(--panel-muted);
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .app-dialog,
 .unsaved-dialog,
@@ -332,6 +551,8 @@
 .settings-dialog-close:focus-visible { background: var(--control-hover); color: var(--chrome-text); outline: none; }
 .settings-section { display: grid; gap: 11px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .settings-section h3 { margin: 0; font-size: 12px; font-weight: 650; }
+.settings-section > p { margin: 0; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
+.settings-index-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .settings-toggle,
 .settings-field { min-height: 30px; justify-content: space-between; gap: 16px; font-size: 12px; }
 .settings-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }

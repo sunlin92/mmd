@@ -3,11 +3,14 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 
 use crate::state::AppState;
 
 const MAX_PENDING_SAVE_AUTHORITIES: usize = 1;
+const MAX_PENDING_WORKSPACE_AUTHORITIES: usize = 32;
+const PENDING_WORKSPACE_AUTHORITY_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[path = "workspace_snapshot.rs"]
 pub(crate) mod workspace_snapshot;
@@ -271,6 +274,7 @@ struct AuthorizationState {
     workspaces: HashMap<WorkspaceToken, WorkspaceGrant>,
     grants: HashMap<GrantKey, GrantLedger>,
     pending_save_authorities: HashMap<DocumentGrantId, PendingSaveReservation>,
+    pending_workspace_authorities: HashMap<WorkspaceToken, PendingWorkspaceReservation>,
     next_workspace_token_id: u64,
     next_document_grant_id: u64,
     next_preview_lease_id: u64,
@@ -546,6 +550,26 @@ pub(crate) enum GrantOrigin {
     Preview(PreviewLeaseId),
 }
 
+#[cfg(feature = "packaged-lifecycle-e2e")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuthorizationEvidenceGrant {
+    pub(crate) kind: &'static str,
+    pub(crate) path: String,
+    pub(crate) origin: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) count: usize,
+}
+
+#[cfg(feature = "packaged-lifecycle-e2e")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuthorizationEvidenceSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) pending_workspace_receipts: usize,
+    pub(crate) grants: Vec<AuthorizationEvidenceGrant>,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum GrantKey {
     ExactReadWrite(PathBuf),
@@ -573,6 +597,26 @@ enum PreparedGrantMutation {
 struct PendingSaveReservation {
     path: PathBuf,
     mutations: Vec<PreparedGrantMutation>,
+}
+
+struct PendingWorkspaceReservation {
+    owner_window: String,
+    candidate: WorkspaceCandidate,
+    expires_at: Instant,
+}
+
+pub(crate) struct PreparedWorkspaceAuthorization<S> {
+    pub(crate) workspace: AuthorizedWorkspace,
+    pub(crate) snapshot: S,
+    pub(crate) receipt: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparedWorkspaceSettlement {
+    Applied,
+    Discarded,
+    Expired,
+    Unknown,
 }
 
 pub(crate) struct PreparedOpenDocumentGrant<'a> {
@@ -689,6 +733,10 @@ impl AuthorizedWorkspace {
         self.token.to_wire()
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     #[cfg(test)]
     fn into_root(self) -> PathBuf {
         self.root
@@ -730,6 +778,7 @@ impl DeletedWorkspaceEntry {
 
 impl WorkspaceToken {
     const WIRE_PREFIX: &'static str = "workspace-";
+    const RECEIPT_PREFIX: &'static str = "workspace-open-";
 
     fn to_wire(self) -> String {
         format!("{}{id}", Self::WIRE_PREFIX, id = self.0)
@@ -747,6 +796,20 @@ impl WorkspaceToken {
             return Err("Invalid workspace token".to_string());
         }
         Ok(token)
+    }
+
+    fn to_receipt(self) -> String {
+        format!("{}{id}", Self::RECEIPT_PREFIX, id = self.0)
+    }
+
+    fn from_receipt(value: &str) -> Result<Self, String> {
+        let id = value
+            .strip_prefix(Self::RECEIPT_PREFIX)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "Invalid workspace open receipt".to_string())?
+            .parse::<u64>()
+            .map_err(|_| "Invalid workspace open receipt".to_string())?;
+        Ok(Self(id))
     }
 }
 
@@ -1382,6 +1445,62 @@ impl FileAuthorizationSession {
         Ok(self.lock()?.authorization_generation)
     }
 
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    pub(crate) fn evidence_snapshot(&self) -> Result<AuthorizationEvidenceSnapshot, String> {
+        let state = self.lock()?;
+        let mut grants = state
+            .grants
+            .iter()
+            .flat_map(|(key, ledger)| {
+                let (kind, path) = match key {
+                    GrantKey::ExactReadWrite(path) => ("exact_rw", path),
+                    GrantKey::DirectoryRead(path) => ("directory_read", path),
+                    GrantKey::InternalAsset(path) => ("internal_asset", path),
+                };
+                ledger.origins.iter().map(move |(origin, count)| {
+                    let origin = match origin {
+                        GrantOrigin::Workspace(_) => "workspace",
+                        GrantOrigin::OpenDocument(_) => "open_document",
+                        GrantOrigin::SaveAs(_) => "save_as",
+                        GrantOrigin::CreatedDocument(_) => "created_document",
+                        GrantOrigin::Preview(_) => "preview",
+                    };
+                    AuthorizationEvidenceGrant {
+                        kind,
+                        path: path.to_string_lossy().into_owned(),
+                        origin,
+                        status: match ledger.status {
+                            GrantStatus::Active => "active",
+                            GrantStatus::Suspended => "suspended",
+                        },
+                        count: *count,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        grants.sort_by(|left, right| {
+            (
+                left.kind,
+                left.path.as_str(),
+                left.origin,
+                left.status,
+                left.count,
+            )
+                .cmp(&(
+                    right.kind,
+                    right.path.as_str(),
+                    right.origin,
+                    right.status,
+                    right.count,
+                ))
+        });
+        Ok(AuthorizationEvidenceSnapshot {
+            generation: state.authorization_generation,
+            pending_workspace_receipts: state.pending_workspace_authorities.len(),
+            grants,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn set_authorization_generation_for_test(
         &self,
@@ -1516,6 +1635,23 @@ impl FileAuthorizationSession {
         let count = self.lock()?.pending_save_authorities.len();
         debug_assert!(count <= MAX_PENDING_SAVE_AUTHORITIES);
         Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_workspace_authority_for_test(&self, receipt: &str) -> Result<(), String> {
+        let token = WorkspaceToken::from_receipt(receipt)?;
+        let mut state = self.lock()?;
+        let pending = state
+            .pending_workspace_authorities
+            .get_mut(&token)
+            .ok_or_else(|| "Workspace open receipt is unknown".to_string())?;
+        pending.expires_at = Instant::now();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_workspace_authority_count_for_test(&self) -> Result<usize, String> {
+        Ok(self.lock()?.pending_workspace_authorities.len())
     }
 
     #[cfg(test)]
@@ -1681,15 +1817,111 @@ impl FileAuthorizationSession {
         Ok((workspace, snapshot))
     }
 
+    pub(crate) fn prepare_workspace_authorization<S>(
+        &self,
+        owner_window: &str,
+        root: impl AsRef<Path>,
+        expected_root: Option<&Path>,
+        snapshot: impl for<'a> FnOnce(WorkspaceSnapshotSource<'a>) -> Result<S, String>,
+    ) -> Result<PreparedWorkspaceAuthorization<S>, String> {
+        let candidate = self.workspace_candidate(root)?;
+        if expected_root.is_some_and(|expected| candidate.root != expected) {
+            return Err("Saved workspace root changed while being restored".to_string());
+        }
+        let snapshot = snapshot(WorkspaceSnapshotSource::Candidate(&candidate))?;
+        let now = Instant::now();
+        let mut state = self.lock()?;
+        state
+            .pending_workspace_authorities
+            .retain(|_, pending| pending.expires_at > now);
+        if state.pending_workspace_authorities.len() >= MAX_PENDING_WORKSPACE_AUTHORITIES {
+            return Err("Too many workspace opens are awaiting completion".to_string());
+        }
+        let token = state.allocate_workspace_token()?;
+        let workspace = AuthorizedWorkspace::new(token, candidate.root.clone());
+        let receipt = token.to_receipt();
+        state.pending_workspace_authorities.insert(
+            token,
+            PendingWorkspaceReservation {
+                owner_window: owner_window.to_string(),
+                candidate,
+                expires_at: now + PENDING_WORKSPACE_AUTHORITY_TTL,
+            },
+        );
+        Ok(PreparedWorkspaceAuthorization {
+            workspace,
+            snapshot,
+            receipt,
+        })
+    }
+
+    pub(crate) fn settle_workspace_authorization(
+        &self,
+        owner_window: &str,
+        receipt: &str,
+        applied: bool,
+        transport: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<PreparedWorkspaceSettlement, String> {
+        let token = WorkspaceToken::from_receipt(receipt)?;
+        if token.to_receipt() != receipt {
+            return Err("Invalid workspace open receipt".to_string());
+        }
+        let now = Instant::now();
+        let mut state = self.lock()?;
+        let target_expired = state
+            .pending_workspace_authorities
+            .get(&token)
+            .is_some_and(|pending| pending.expires_at <= now);
+        state
+            .pending_workspace_authorities
+            .retain(|_, pending| pending.expires_at > now);
+        if target_expired {
+            return Ok(PreparedWorkspaceSettlement::Expired);
+        }
+        let Some(pending) = state.pending_workspace_authorities.get(&token) else {
+            return Ok(PreparedWorkspaceSettlement::Unknown);
+        };
+        if pending.owner_window != owner_window {
+            return Err("Workspace open receipt belongs to another window".to_string());
+        }
+        let pending = state
+            .pending_workspace_authorities
+            .remove(&token)
+            .expect("workspace reservation was checked while authorization was held");
+        if !applied {
+            return Ok(PreparedWorkspaceSettlement::Discarded);
+        }
+
+        let current = self.workspace_candidate(&pending.candidate.root)?;
+        if current.root != pending.candidate.root {
+            return Err("Workspace root changed before the open was applied".to_string());
+        }
+        let workspace = Self::publish_workspace_with_token(&mut state, token, current)?;
+        if let Err(error) = transport(workspace.root()) {
+            let origin = GrantOrigin::Workspace(token);
+            state.revoke_origin_raw(&origin, RevokeOriginMode::All);
+            return Err(error);
+        }
+        Ok(PreparedWorkspaceSettlement::Applied)
+    }
+
     fn publish_workspace(
         state: &mut AuthorizationState,
+        candidate: WorkspaceCandidate,
+    ) -> Result<AuthorizedWorkspace, String> {
+        let token = state.allocate_workspace_token()?;
+        Self::publish_workspace_with_token(state, token, candidate)
+    }
+
+    fn publish_workspace_with_token(
+        state: &mut AuthorizationState,
+        token: WorkspaceToken,
         candidate: WorkspaceCandidate,
     ) -> Result<AuthorizedWorkspace, String> {
         state
             .authorization_generation
             .checked_add(2)
             .ok_or_else(|| "Authorization generation is exhausted".to_string())?;
-        let token = state.allocate_workspace_token()?;
         let origin = GrantOrigin::Workspace(token);
         state.grant(
             GrantKey::DirectoryRead(candidate.root.clone()),
@@ -3139,7 +3371,7 @@ pub(crate) fn revoke_authorized_path_prefix_inner(
     state: &AppState,
     prefix: &Path,
 ) -> Result<(), String> {
-    apply_authorization_then_preview_invalidation(
+    let outcome = apply_authorization_then_preview_invalidation(
         || state.file_authorization().revoke_path_prefix(prefix),
         |invalidated_preview_leases| match state
             .html_preview_server
@@ -3153,7 +3385,11 @@ pub(crate) fn revoke_authorized_path_prefix_inner(
                 Err(error)
             }
         },
-    )
+    );
+    if outcome.is_ok() {
+        state.workspace_index().discard_all();
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -3280,6 +3516,45 @@ pub(crate) fn resolve_authorized_workspace_root_for_token_inner(
     state
         .file_authorization()
         .authorized_workspace_root_for_token(workspace_token, root)
+}
+
+/// Resolves an index result relative to one exact authorized workspace. Cached
+/// result paths are hints only, so every path component is re-observed and
+/// symbolic links are rejected before the existing authorization is reused.
+pub(crate) fn resolve_authorized_workspace_result_file_inner(
+    state: &AppState,
+    workspace_token: &str,
+    workspace_root: impl AsRef<Path>,
+    relative_path: &str,
+) -> Result<(AuthorizedWorkspace, PathBuf), String> {
+    let workspace =
+        resolve_authorized_workspace_root_for_token_inner(state, workspace_token, workspace_root)?;
+    let relative = Path::new(relative_path);
+    if relative_path.is_empty() || relative.is_absolute() {
+        return Err("Workspace search result path must be relative".to_string());
+    }
+
+    let mut candidate = workspace.root.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err("Workspace search result path is invalid".to_string());
+        };
+        candidate.push(part);
+        let metadata = std::fs::symlink_metadata(&candidate)
+            .map_err(|error| format!("Workspace search result is no longer available: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("Workspace search result cannot traverse a symbolic link".to_string());
+        }
+    }
+
+    let canonical = normalize_existing_path(&candidate)?;
+    if !canonical.is_file() || !path_is_under(&canonical, &workspace.root) {
+        return Err("Workspace search result is outside the selected workspace".to_string());
+    }
+    state
+        .file_authorization()
+        .ensure_workspace_is_current(&workspace)?;
+    Ok((workspace, canonical))
 }
 
 #[cfg(test)]
@@ -3527,6 +3802,56 @@ mod tests {
             canonical_document
         );
         assert!(ensure_authorized_existing_file_inner(&state, &sibling).is_err());
+    }
+
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    #[test]
+    fn packaged_evidence_snapshot_reports_exact_active_grants_and_pending_workspace_receipts() {
+        let directory = tempdir().unwrap();
+        let document = directory.path().join("evidence.md");
+        fs::write(&document, "# evidence").unwrap();
+        let canonical = normalize_existing_path(&document).unwrap();
+        let state = AppState::default();
+
+        let prepared = state
+            .file_authorization()
+            .prepare_workspace_authorization("main", directory.path(), None, |_| Ok(()))
+            .unwrap();
+        let pending = state.file_authorization().evidence_snapshot().unwrap();
+        assert_eq!(pending.pending_workspace_receipts, 1);
+        assert!(pending.grants.is_empty());
+
+        state
+            .file_authorization()
+            .with_prepared_open_document_grant(&canonical, |grant| {
+                grant.apply();
+                Ok(())
+            })
+            .unwrap();
+        let applied = state.file_authorization().evidence_snapshot().unwrap();
+        assert!(applied.grants.iter().any(|grant| {
+            grant.kind == "exact_rw"
+                && grant.path == canonical.to_string_lossy()
+                && grant.origin == "open_document"
+                && grant.status == "active"
+        }));
+        assert_eq!(applied.pending_workspace_receipts, 1);
+
+        assert_eq!(
+            state
+                .file_authorization()
+                .settle_workspace_authorization("main", &prepared.receipt, false, |_| Ok(()))
+                .unwrap(),
+            PreparedWorkspaceSettlement::Discarded
+        );
+        assert_eq!(
+            state
+                .file_authorization()
+                .evidence_snapshot()
+                .unwrap()
+                .pending_workspace_receipts,
+            0
+        );
     }
 
     #[test]
@@ -4805,6 +5130,182 @@ mod tests {
         assert_eq!(
             authorize_workspace_file_inner(&state, &canonical).unwrap(),
             canonical
+        );
+    }
+
+    #[test]
+    fn prepared_workspace_is_not_authorized_until_the_frontend_applies_it() {
+        let directory = tempdir().unwrap();
+        let session = FileAuthorizationSession::default();
+        let prepared = session
+            .prepare_workspace_authorization("main", directory.path(), None, |source| {
+                Ok(match source {
+                    WorkspaceSnapshotSource::Candidate(candidate) => candidate.root.clone(),
+                    WorkspaceSnapshotSource::Authorized(workspace) => workspace.root.clone(),
+                })
+            })
+            .unwrap();
+        let token = prepared.workspace.wire_token();
+        let root = prepared.workspace.root().to_path_buf();
+
+        assert!(session
+            .authorized_workspace_root_for_token(&token, &root)
+            .is_err());
+        assert_eq!(
+            session
+                .pending_workspace_authority_count_for_test()
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            session
+                .settle_workspace_authorization("main", &prepared.receipt, true, |_| Ok(()))
+                .unwrap(),
+            PreparedWorkspaceSettlement::Applied
+        );
+        assert_eq!(
+            session
+                .authorized_workspace_root_for_token(&token, &root)
+                .unwrap()
+                .root(),
+            root
+        );
+        assert_eq!(
+            session
+                .pending_workspace_authority_count_for_test()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn discarded_workspace_receipt_removes_only_its_reservation() {
+        let directory = tempdir().unwrap();
+        let session = FileAuthorizationSession::default();
+        let existing = session.authorize_directory_root(directory.path()).unwrap();
+        let prepared = session
+            .prepare_workspace_authorization("main", directory.path(), None, |_| Ok(()))
+            .unwrap();
+
+        assert_eq!(
+            session
+                .settle_workspace_authorization("main", &prepared.receipt, false, |_| {
+                    panic!("discard must not invoke transport")
+                })
+                .unwrap(),
+            PreparedWorkspaceSettlement::Discarded
+        );
+        assert!(session
+            .authorized_workspace_root_for_token(&existing.wire_token(), existing.root(),)
+            .is_ok());
+        assert!(session
+            .authorized_workspace_root_for_token(
+                &prepared.workspace.wire_token(),
+                prepared.workspace.root(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn expired_workspace_receipt_cannot_publish_authorization() {
+        let directory = tempdir().unwrap();
+        let session = FileAuthorizationSession::default();
+        let prepared = session
+            .prepare_workspace_authorization("main", directory.path(), None, |_| Ok(()))
+            .unwrap();
+        session
+            .expire_workspace_authority_for_test(&prepared.receipt)
+            .unwrap();
+
+        assert_eq!(
+            session
+                .settle_workspace_authorization("main", &prepared.receipt, true, |_| {
+                    panic!("expired receipt must not invoke transport")
+                })
+                .unwrap(),
+            PreparedWorkspaceSettlement::Expired
+        );
+        assert!(session
+            .authorized_workspace_root_for_token(
+                &prepared.workspace.wire_token(),
+                prepared.workspace.root(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn workspace_receipt_is_owner_bound_without_consuming_the_valid_owner_claim() {
+        let directory = tempdir().unwrap();
+        let session = FileAuthorizationSession::default();
+        let prepared = session
+            .prepare_workspace_authorization("main", directory.path(), None, |_| Ok(()))
+            .unwrap();
+
+        assert!(session
+            .settle_workspace_authorization("child", &prepared.receipt, false, |_| Ok(()))
+            .is_err());
+        assert_eq!(
+            session
+                .settle_workspace_authorization("main", &prepared.receipt, false, |_| Ok(()))
+                .unwrap(),
+            PreparedWorkspaceSettlement::Discarded
+        );
+    }
+
+    #[test]
+    fn workspace_transport_failure_revokes_exactly_the_prepared_workspace_origin() {
+        let directory = tempdir().unwrap();
+        let session = FileAuthorizationSession::default();
+        let existing = session.authorize_directory_root(directory.path()).unwrap();
+        let prepared = session
+            .prepare_workspace_authorization("main", directory.path(), None, |_| Ok(()))
+            .unwrap();
+
+        assert_eq!(
+            session
+                .settle_workspace_authorization("main", &prepared.receipt, true, |_| {
+                    Err("asset scope unavailable".to_string())
+                })
+                .unwrap_err(),
+            "asset scope unavailable"
+        );
+        assert!(session
+            .authorized_workspace_root_for_token(&existing.wire_token(), existing.root(),)
+            .is_ok());
+        assert!(session
+            .authorized_workspace_root_for_token(
+                &prepared.workspace.wire_token(),
+                prepared.workspace.root(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn workspace_root_is_reobserved_before_prepared_authorization_is_published() {
+        let directory = tempdir().unwrap();
+        let session = FileAuthorizationSession::default();
+        let prepared = session
+            .prepare_workspace_authorization("main", directory.path(), None, |_| Ok(()))
+            .unwrap();
+        fs::remove_dir(directory.path()).unwrap();
+
+        assert!(session
+            .settle_workspace_authorization("main", &prepared.receipt, true, |_| {
+                panic!("stale workspace must not invoke transport")
+            })
+            .is_err());
+        assert!(session
+            .authorized_workspace_root_for_token(
+                &prepared.workspace.wire_token(),
+                prepared.workspace.root(),
+            )
+            .is_err());
+        assert_eq!(
+            session
+                .pending_workspace_authority_count_for_test()
+                .unwrap(),
+            0
         );
     }
 }
