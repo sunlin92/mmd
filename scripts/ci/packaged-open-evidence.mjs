@@ -185,20 +185,56 @@ function assertOrder(identity, ordered) {
 }
 
 function normalizeWindowsEvidenceTarget(target) {
-  const normalized = target.replaceAll('/', '\\');
-  const verbatimDrive = normalized.match(/^\\\\\?\\([a-z]:\\.*)$/i);
-  if (verbatimDrive) return verbatimDrive[1].replace(/[A-Z]/g, (value) => value.toLowerCase());
-  const verbatimUnc = normalized.match(/^\\\\\?\\unc\\(.+)$/i);
-  const wirePath = verbatimUnc ? `\\\\${verbatimUnc[1]}` : normalized;
-  return wirePath.replace(/[A-Z]/g, (value) => value.toLowerCase());
+  const verbatim = target.startsWith('\\\\?\\');
+  if (verbatim && target.includes('/')) return null;
+  const normalized = verbatim ? target : target.replaceAll('/', '\\');
+  const drive = normalized.match(verbatim
+    ? /^\\\\\?\\([a-z]):\\(.*)$/i
+    : /^([a-z]):\\(.*)$/i);
+  if (drive) {
+    const components = drive[2].split('\\');
+    if (!components.every(isUnambiguousWindowsComponent)) return null;
+    return `${drive[1].toLowerCase()}:\\${components.join('\\')}`;
+  }
+
+  const unc = normalized.match(verbatim
+    ? /^\\\\\?\\unc\\([^\\]+)\\([^\\]+)(?:\\(.*))?$/i
+    : /^\\\\([^\\]+)\\([^\\]+)(?:\\(.*))?$/);
+  if (!unc) return null;
+  const components = [unc[1], unc[2], ...(unc[3] === undefined ? [] : unc[3].split('\\'))];
+  if (!components.every(isUnambiguousWindowsComponent)) return null;
+  return `\\\\${components.join('\\')}`;
+}
+
+const WINDOWS_RESERVED_DEVICE_BASENAMES = new Set([
+  'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', 'CLOCK$',
+]);
+
+function containsWindowsControlCharacter(component) {
+  return [...component].some((character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint <= 0x1f || codePoint === 0x7f;
+  });
+}
+
+function isUnambiguousWindowsComponent(component) {
+  const deviceBasename = component.split('.', 1)[0].toUpperCase();
+  return component.length > 0
+    && component !== '.'
+    && component !== '..'
+    && !component.endsWith('.')
+    && !component.endsWith(' ')
+    && !containsWindowsControlCharacter(component)
+    && !/[<>:"|?*]/.test(component)
+    && !WINDOWS_RESERVED_DEVICE_BASENAMES.has(deviceBasename)
+    && !/^(?:COM|LPT)(?:[1-9¹²³])$/u.test(deviceBasename);
 }
 
 export function sameEvidenceTarget(left, right, platform) {
   if (left === right) return true;
-  return platform === 'windows'
-    && typeof left === 'string'
-    && typeof right === 'string'
-    && normalizeWindowsEvidenceTarget(left) === normalizeWindowsEvidenceTarget(right);
+  if (platform !== 'windows' || typeof left !== 'string' || typeof right !== 'string') return false;
+  const normalizedLeft = normalizeWindowsEvidenceTarget(left);
+  return normalizedLeft !== null && normalizedLeft === normalizeWindowsEvidenceTarget(right);
 }
 
 function validateNativeDelivery(receipt, challenge, events) {

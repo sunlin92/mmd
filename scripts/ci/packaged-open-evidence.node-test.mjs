@@ -411,34 +411,57 @@ test('accepts app-applied file/workspace evidence with exact Rust authorization 
   assert.equal(verified.scope.realWebviewSpellcheckAttribute, true);
 });
 
-test('accepts Windows-equivalent queued and canonical target spellings', async (t) => {
+test('accepts Windows receipt identity without weakening exact target spelling', async (t) => {
   const { challengePath, challenge } = await issueChallenge(
     t, 'restore-cancel', 'nsis', 'windows',
   );
   const receipt = restoreCancelReceipt(challenge);
-  const duplicate = receipt.events.find((event) => (
-    event.type === 'native_delivery' && event.step === 'cli-secondary-duplicate'
-  ));
-  const reobserved = receipt.events.find((event) => (
-    event.type === 'backend_reobserved' && event.step === 'cli-primary'
-  ));
-  duplicate.target = duplicate.target.toUpperCase();
-  reobserved.target = reobserved.target.toUpperCase();
 
   const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
   assert.equal(result.status, 0, result.stderr);
 });
 
-test('limits Windows target equivalence to wire spelling differences', () => {
+test('accepts safe DOS and verbatim bindings through the Windows verifier', {
+  skip: process.platform !== 'win32',
+}, async (t) => {
+  const { challengePath, challenge } = await issueChallenge(
+    t, 'restore-cancel', 'nsis', 'windows',
+  );
+  const receipt = restoreCancelReceipt(challenge);
+  const asVerbatim = (target) => (
+    target.startsWith('\\\\') ? `\\\\?\\UNC\\${target.slice(2)}` : `\\\\?\\${target}`
+  );
+  const duplicate = receipt.events.find((event) => (
+    event.type === 'native_delivery' && event.step === 'cli-secondary-duplicate'
+  ));
+  duplicate.target = asVerbatim(duplicate.target);
+  receipt.final.app.activeFile = asVerbatim(receipt.final.app.activeFile);
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('limits Windows target equivalence to unambiguous wire spelling differences', () => {
   assert.equal(sameEvidenceTarget(
-    'C:\\Docs\\File.md', '\\\\?\\C:\\docs\\file.md', 'windows',
+    'C:\\Docs\\File.md', '\\\\?\\C:\\Docs\\File.md', 'windows',
   ), true);
   assert.equal(sameEvidenceTarget(
     '\\\\server\\share\\Docs\\File.md',
-    '\\\\?\\UNC\\SERVER\\SHARE\\docs\\file.md',
+    '\\\\?\\UNC\\server\\share\\Docs\\File.md',
     'windows',
   ), true);
-  assert.equal(sameEvidenceTarget('C:\\Docs\\File.md', 'c:/docs/file.md', 'windows'), true);
+  assert.equal(sameEvidenceTarget('C:\\Docs\\File.md', 'c:/Docs/File.md', 'windows'), true);
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md', '\\\\?\\C:\\Docs\\FILE.md', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md', '\\\\?\\C:\\docs\\File.md', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
+    '\\\\server\\share\\Docs\\File.md',
+    '\\\\?\\UNC\\SERVER\\share\\Docs\\File.md',
+    'windows',
+  ), false);
   assert.equal(sameEvidenceTarget(
     'C:\\secret.md', 'C:\\safe\\..\\secret.md', 'windows',
   ), false);
@@ -446,8 +469,45 @@ test('limits Windows target equivalence to wire spelling differences', () => {
     'C:\\secret.md', '\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\secret.md', 'windows',
   ), false);
   assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md', '\\\\?\\C:/Docs/File.md', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md', '\\\\?\\C:\\Docs\\File.md.', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md', '\\\\?\\C:\\Docs\\File.md ', 'windows',
+  ), false);
+  for (const reserved of [
+    'NUL.txt', 'con', 'COM1.md', 'com¹.log', 'LPT9', 'lpt³.md', 'CONIN$', 'conout$.txt',
+  ]) {
+    assert.equal(sameEvidenceTarget(
+      `C:\\Docs\\${reserved}`, `\\\\?\\C:\\Docs\\${reserved}`, 'windows',
+    ), false, reserved);
+  }
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\COM10.md', '\\\\?\\C:\\Docs\\COM10.md', 'windows',
+  ), true);
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\bad\u0001name.md', '\\\\?\\C:\\Docs\\bad\u0001name.md', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
+    'C:\\Docs\\File.md:stream', '\\\\?\\C:\\Docs\\File.md:stream', 'windows',
+  ), false);
+  assert.equal(sameEvidenceTarget(
     'C:\\Docs\\File.md', '\\\\?\\C:\\docs\\file.md', 'macos',
   ), false);
+});
+
+test('rejects a case-only Windows final authorization mismatch', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(
+    t, 'restore-cancel', 'nsis', 'windows',
+  );
+  const receipt = restoreCancelReceipt(challenge);
+  receipt.final.app.activeFile = receipt.final.app.activeFile.toUpperCase();
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /final active file lacks authorization/);
 });
 
 test('accepts a zero-receipt session restore lifecycle', async (t) => {
