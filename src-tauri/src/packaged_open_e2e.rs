@@ -1042,6 +1042,79 @@ mod tests {
     }
 
     #[test]
+    fn authorization_delta_preserves_aggregated_shared_parent_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_document = directory.path().join("first.md");
+        let second_document = directory.path().join("second.md");
+        fs::write(&first_document, "# first").unwrap();
+        fs::write(&second_document, "# second").unwrap();
+        let state = AppState::default();
+
+        state
+            .file_authorization()
+            .with_prepared_open_document_grant(&first_document, |grant| {
+                grant.apply();
+                Ok(())
+            })
+            .unwrap();
+        let first_snapshot = state.file_authorization().evidence_snapshot().unwrap();
+        let first = EvidenceAuthorizationState {
+            generation: first_snapshot.generation,
+            pending_file_receipts: 0,
+            pending_workspace_receipts: first_snapshot.pending_workspace_receipts,
+            grants: first_snapshot.grants,
+        };
+        state
+            .file_authorization()
+            .with_prepared_open_document_grant(&second_document, |grant| {
+                grant.apply();
+                Ok(())
+            })
+            .unwrap();
+        let second_snapshot = state.file_authorization().evidence_snapshot().unwrap();
+        let second = EvidenceAuthorizationState {
+            generation: second_snapshot.generation,
+            pending_file_receipts: 0,
+            pending_workspace_receipts: second_snapshot.pending_workspace_receipts,
+            grants: second_snapshot.grants,
+        };
+        let delta = AuthorizationDelta::between(&first, &second);
+
+        assert_eq!((first.generation, second.generation), (1, 2));
+        assert_eq!((delta.generation_before, delta.generation_after), (1, 2));
+        let shared_parent = second
+            .grants
+            .iter()
+            .find(|grant| grant.kind == "internal_asset" && grant.origin == "open_document")
+            .unwrap();
+        assert_eq!(
+            second
+                .grants
+                .iter()
+                .filter(|grant| {
+                    grant.kind == "internal_asset" && grant.origin == "open_document"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(shared_parent.count, 2);
+        assert!(delta.removed.iter().any(|grant| {
+            grant.kind == "internal_asset" && grant.origin == "open_document" && grant.count == 1
+        }));
+        assert!(delta.added.iter().any(|grant| {
+            grant.kind == "internal_asset" && grant.origin == "open_document" && grant.count == 2
+        }));
+        assert!(delta.added.iter().any(|grant| {
+            grant.kind == "exact_rw"
+                && grant.path
+                    == fs::canonicalize(&second_document)
+                        .unwrap()
+                        .to_string_lossy()
+                && grant.count == 1
+        }));
+    }
+
+    #[test]
     fn app_settlement_uses_rust_queue_and_authorization_for_final_state() {
         let directory = tempfile::tempdir().unwrap();
         let observer = test_observer(directory.path(), "deb", "restore-cancel");

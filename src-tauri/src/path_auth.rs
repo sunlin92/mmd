@@ -1494,10 +1494,23 @@ impl FileAuthorizationSession {
                     right.count,
                 ))
         });
+        let mut aggregated: Vec<AuthorizationEvidenceGrant> = Vec::with_capacity(grants.len());
+        for grant in grants {
+            if let Some(existing) = aggregated.last_mut().filter(|existing| {
+                existing.kind == grant.kind
+                    && existing.path == grant.path
+                    && existing.origin == grant.origin
+                    && existing.status == grant.status
+            }) {
+                existing.count = existing.count.saturating_add(grant.count);
+            } else {
+                aggregated.push(grant);
+            }
+        }
         Ok(AuthorizationEvidenceSnapshot {
             generation: state.authorization_generation,
             pending_workspace_receipts: state.pending_workspace_authorities.len(),
-            grants,
+            grants: aggregated,
         })
     }
 
@@ -3852,6 +3865,90 @@ mod tests {
                 .pending_workspace_receipts,
             0
         );
+    }
+
+    #[cfg(feature = "packaged-lifecycle-e2e")]
+    #[test]
+    fn packaged_evidence_snapshot_aggregates_same_category_origins() {
+        let directory = tempdir().unwrap();
+        let first_document = directory.path().join("first.md");
+        let second_document = directory.path().join("second.md");
+        fs::write(&first_document, "# first").unwrap();
+        fs::write(&second_document, "# second").unwrap();
+        let state = AppState::default();
+
+        let first_grant = state
+            .file_authorization()
+            .authorize_file(&first_document)
+            .unwrap();
+        let first_generation = state
+            .file_authorization()
+            .authorization_generation()
+            .unwrap();
+        let second_grant = state
+            .file_authorization()
+            .authorize_file(&second_document)
+            .unwrap();
+
+        let parent = normalize_existing_path(directory.path()).unwrap();
+        let snapshot = state.file_authorization().evidence_snapshot().unwrap();
+        assert!(first_generation > 0);
+        assert!(snapshot.generation > first_generation);
+        assert_eq!(
+            snapshot
+                .grants
+                .iter()
+                .filter(|grant| grant.kind == "exact_rw" && grant.origin == "open_document")
+                .map(|grant| grant.count)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        let shared_parent_grants = snapshot
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.kind == "internal_asset"
+                    && grant.path == parent.to_string_lossy()
+                    && grant.origin == "open_document"
+                    && grant.status == "active"
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(shared_parent_grants.len(), 1);
+        assert_eq!(shared_parent_grants[0].count, 2);
+
+        state
+            .file_authorization()
+            .revoke_origin(first_grant.origin(), RevokeOriginMode::All)
+            .unwrap();
+        let after_first_revoke = state.file_authorization().evidence_snapshot().unwrap();
+        assert!(after_first_revoke.generation > snapshot.generation);
+        assert_eq!(
+            after_first_revoke
+                .grants
+                .iter()
+                .find(|grant| grant.kind == "internal_asset"
+                    && grant.path == parent.to_string_lossy())
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            after_first_revoke
+                .grants
+                .iter()
+                .filter(|grant| grant.kind == "exact_rw")
+                .count(),
+            1
+        );
+
+        state
+            .file_authorization()
+            .revoke_origin(second_grant.origin(), RevokeOriginMode::All)
+            .unwrap();
+        let after_second_revoke = state.file_authorization().evidence_snapshot().unwrap();
+        assert!(after_second_revoke.generation > after_first_revoke.generation);
+        assert!(after_second_revoke.grants.is_empty());
     }
 
     #[test]
