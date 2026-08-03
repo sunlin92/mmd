@@ -1091,13 +1091,12 @@ impl FileSystemPort for SystemFileSystemPort {
     }
 }
 
-fn read_binary_file_bounded(
+fn read_open_binary_file_bounded(
+    file: fs::File,
     path: &Path,
     source_limit: u64,
     limit_error: &str,
 ) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Failed to open binary file {}: {error}", path.display()))?;
     if file
         .metadata()
         .map_err(|error| format!("Failed to inspect binary file {}: {error}", path.display()))?
@@ -1117,18 +1116,31 @@ fn read_binary_file_bounded(
     Ok(bytes)
 }
 
+fn read_binary_file_bounded(
+    path: &Path,
+    source_limit: u64,
+    limit_error: &str,
+) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Failed to open binary file {}: {error}", path.display()))?;
+    read_open_binary_file_bounded(file, path, source_limit, limit_error)
+}
+
 fn embedded_binary_open_response(
     kind: WorkspaceFileKind,
     path: &Path,
+    file: fs::File,
 ) -> Result<OpenFileResponse, String> {
     let bytes = match kind {
-        WorkspaceFileKind::Pdf => read_binary_file_bounded(
+        WorkspaceFileKind::Pdf => read_open_binary_file_bounded(
+            file,
             path,
             PDF_SOURCE_LIMIT_BYTES,
             "PDF source exceeds the 64 MiB limit",
         )?,
         WorkspaceFileKind::Docx => {
-            let bytes = read_binary_file_bounded(
+            let bytes = read_open_binary_file_bounded(
+                file,
                 path,
                 DOCX_SOURCE_LIMIT_BYTES,
                 "DOCX source exceeds the 32 MiB limit",
@@ -1155,10 +1167,12 @@ pub(crate) fn open_authorized_file_response(
 ) -> Result<OpenFileResponse, String> {
     let kind = WorkspaceFileKind::classify(&file)
         .ok_or_else(|| "Selected file is not a supported preview file".to_string())?;
+    let handle = open_regular_file_without_following_links(&file)
+        .map_err(|error| format!("Failed to securely open file {}: {error}", file.display()))?;
     if kind.requires_embedded_bytes() {
-        embedded_binary_open_response(kind, &file)
+        embedded_binary_open_response(kind, &file, handle)
     } else {
-        kind.open_response(&file)
+        kind.open_response_from_handle(&file, handle)
     }
 }
 
@@ -1225,7 +1239,17 @@ pub(crate) fn prepare_workspace_file_inner(
     owner_window: &str,
     path: impl AsRef<Path>,
 ) -> Result<PreparedOpenFileResponse, String> {
+    prepare_workspace_file_with_before_open_inner(state, owner_window, path, || {})
+}
+
+fn prepare_workspace_file_with_before_open_inner(
+    state: &AppState,
+    owner_window: &str,
+    path: impl AsRef<Path>,
+    before_open: impl FnOnce(),
+) -> Result<PreparedOpenFileResponse, String> {
     let file = ensure_authorized_existing_file_inner(state, path)?;
+    before_open();
     let response = open_authorized_file_response(file.clone())?;
     let identifiers = state.recent_files()?.issue_open(owner_window, &file)?;
     Ok(PreparedOpenFileResponse {
@@ -3313,6 +3337,22 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn replace_directory_with_test_link(link: &Path, target: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn replace_directory_with_test_link(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create test junction");
+    }
+
     use crate::{
         path_auth::{is_authorized_image_path, normalize_existing_path},
         workspace_index::{build_index, CancellationToken, IndexDocument, IndexLimits},
@@ -4091,6 +4131,36 @@ mod tests {
         assert!(failed.is_err());
         assert!(ensure_authorized_existing_file_inner(&failed_state, &document).is_err());
         assert!(!is_authorized_image_path(&failed_state, &asset.canonicalize().unwrap()).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn workspace_open_refuses_a_parent_link_swap_after_authorization() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        let moved = workspace.path().join("moved");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("note.md"), "authorized content").unwrap();
+        fs::write(outside.path().join("note.md"), "external secret").unwrap();
+        let state = AppState::default();
+        let app_data = tempdir().unwrap();
+        state
+            .initialize_recent_files(app_data.path().to_path_buf())
+            .unwrap();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+
+        let result = prepare_workspace_file_with_before_open_inner(
+            &state,
+            "main",
+            nested.join("note.md"),
+            || {
+                fs::rename(&nested, &moved).unwrap();
+                replace_directory_with_test_link(&nested, outside.path());
+            },
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
