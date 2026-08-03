@@ -472,6 +472,21 @@ fn open_verified_parent(parent: &Path) -> io::Result<File> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn open_directory_without_following_links(path: &Path) -> io::Result<File> {
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace root is not a directory",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn open_regular_file_without_following_links(path: &Path) -> io::Result<File> {
     let parent = path
         .parent()
@@ -707,8 +722,8 @@ mod windows_handle_files {
         }
     }
 
-    fn open_verified_parent(parent: &Path) -> io::Result<File> {
-        let path = wide_nul(parent.as_os_str());
+    pub(super) fn open_directory(path: &Path) -> io::Result<File> {
+        let path = wide_nul(path.as_os_str());
         let raw = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -731,6 +746,11 @@ mod windows_handle_files {
         if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(invalid_input("parent path is not a directory"));
         }
+        Ok(directory)
+    }
+
+    fn open_verified_parent(parent: &Path) -> io::Result<File> {
+        let directory = open_directory(parent)?;
         if !paths_match(&opened_path(&directory)?, parent)? {
             return Err(permission_denied(
                 "parent directory changed after authorization",
@@ -1014,6 +1034,38 @@ pub(crate) fn open_regular_file_without_following_links(path: &Path) -> io::Resu
     windows_handle_files::open_read(path)
 }
 
+#[cfg(windows)]
+pub(crate) fn open_directory_without_following_links(path: &Path) -> io::Result<fs::File> {
+    windows_handle_files::open_directory(path)
+}
+
+#[cfg(unix)]
+pub(crate) fn opened_file_platform_identity(file: &fs::File) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+pub(crate) fn opened_file_platform_identity(file: &fs::File) -> io::Result<String> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let result = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok(format!("{}:{file_index}", information.dwVolumeSerialNumber))
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn write_file_without_following_links(_path: &Path, _bytes: &[u8]) -> io::Result<()> {
     Err(io::Error::new(
@@ -1027,6 +1079,22 @@ pub(crate) fn open_regular_file_without_following_links(_path: &Path) -> io::Res
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "nofollow handle-based reads are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn open_directory_without_following_links(_path: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nofollow directory handles are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn opened_file_platform_identity(_file: &fs::File) -> io::Result<String> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem identity is unavailable on this platform",
     ))
 }
 

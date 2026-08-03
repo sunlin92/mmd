@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
@@ -82,7 +83,12 @@ impl WorkspaceIndex {
     pub(crate) fn exact_content_for_relative_path(&self, relative_path: &str) -> Option<&str> {
         let normalized_path = normalize_for_search(relative_path);
         self.documents
-            .binary_search_by(|document| document.normalized_path.cmp(&normalized_path))
+            .binary_search_by(|document| {
+                document
+                    .normalized_path
+                    .cmp(&normalized_path)
+                    .then_with(|| document.relative_path.as_str().cmp(relative_path))
+            })
             .ok()
             .and_then(|index| {
                 let document = &self.documents[index];
@@ -308,7 +314,13 @@ pub fn build_index(
     cancellation: &CancellationToken,
 ) -> BuildOutcome {
     documents.sort_by(|left, right| {
-        normalize_for_search(&left.relative_path).cmp(&normalize_for_search(&right.relative_path))
+        let left_path = normalize_relative_path(&left.relative_path)
+            .unwrap_or_else(|| left.relative_path.clone());
+        let right_path = normalize_relative_path(&right.relative_path)
+            .unwrap_or_else(|| right.relative_path.clone());
+        normalize_for_search(&left_path)
+            .cmp(&normalize_for_search(&right_path))
+            .then_with(|| left_path.cmp(&right_path))
     });
     let corpus_digest = corpus_digest(&documents);
     let input_files = documents.len();
@@ -325,7 +337,7 @@ pub fn build_index(
     };
     let mut indexed = Vec::with_capacity(input_files.min(limits.max_files));
     let mut eligible_files = 0usize;
-    let mut previous_path: Option<String> = None;
+    let mut seen_paths = HashSet::with_capacity(input_files.min(limits.max_files));
 
     for document in documents {
         if cancellation.is_cancelled() {
@@ -340,11 +352,10 @@ pub fn build_index(
             continue;
         }
         let normalized_path = normalize_for_search(&relative_path);
-        if previous_path.as_ref() == Some(&normalized_path) {
+        if !seen_paths.insert(relative_path.clone()) {
             report.skipped.duplicate_path += 1;
             continue;
         }
-        previous_path = Some(normalized_path.clone());
         if eligible_files >= limits.max_files {
             report.skipped.file_count_limit += 1;
             continue;
@@ -838,6 +849,31 @@ mod tests {
         assert_eq!(
             first_index.normalized_documents(),
             second_index.normalized_documents()
+        );
+    }
+
+    #[test]
+    fn keeps_case_distinct_paths_as_separate_filesystem_identities() {
+        let (index, report) = build_index(
+            vec![
+                document("A/note.md", "upper"),
+                document("a/note.md", "lower"),
+            ],
+            IndexLimits::default(),
+            &CancellationToken::new(),
+        )
+        .completed()
+        .unwrap();
+
+        assert_eq!(report.indexed_files, 2);
+        assert_eq!(report.skipped.duplicate_path, 0);
+        assert_eq!(
+            index.exact_content_for_relative_path("A/note.md"),
+            Some("upper")
+        );
+        assert_eq!(
+            index.exact_content_for_relative_path("a/note.md"),
+            Some("lower")
         );
     }
 

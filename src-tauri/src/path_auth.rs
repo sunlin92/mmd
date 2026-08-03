@@ -2,11 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Component, Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
-use crate::state::AppState;
+use crate::{
+    commands::{open_directory_without_following_links, opened_file_platform_identity},
+    state::AppState,
+};
 
 const MAX_PENDING_SAVE_AUTHORITIES: usize = 1;
 const MAX_PENDING_WORKSPACE_AUTHORITIES: usize = 32;
@@ -284,6 +287,7 @@ struct AuthorizationState {
 
 pub(crate) struct WorkspaceCandidate {
     root: PathBuf,
+    root_binding: WorkspaceRootBinding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -291,12 +295,45 @@ pub(crate) struct WorkspaceToken(u64);
 
 struct WorkspaceGrant {
     root: PathBuf,
+    root_binding: WorkspaceRootBinding,
 }
 
 #[derive(Clone)]
 pub(crate) struct AuthorizedWorkspace {
     token: WorkspaceToken,
     root: PathBuf,
+    root_binding: WorkspaceRootBinding,
+}
+
+#[derive(Clone)]
+struct WorkspaceRootBinding {
+    identity: String,
+    _handle: Arc<fs::File>,
+}
+
+impl WorkspaceRootBinding {
+    fn capture(root: &Path) -> Result<Self, String> {
+        let handle = Arc::new(
+            open_directory_without_following_links(root)
+                .map_err(|error| format!("Could not bind the workspace root: {error}"))?,
+        );
+        let identity = opened_file_platform_identity(&handle)
+            .map_err(|error| format!("Could not identify the workspace root: {error}"))?;
+        Ok(Self {
+            identity,
+            _handle: handle,
+        })
+    }
+
+    fn is_current(&self, root: &Path) -> bool {
+        open_directory_without_following_links(root)
+            .and_then(|handle| opened_file_platform_identity(&handle))
+            .is_ok_and(|identity| identity == self.identity)
+    }
+
+    fn same_object(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
 }
 
 pub(crate) struct RenamedWorkspaceEntry {
@@ -720,8 +757,12 @@ fn reject_symlink_components_below_root(path: &Path, root: &Path) -> Result<(), 
 }
 
 impl AuthorizedWorkspace {
-    fn new(token: WorkspaceToken, root: PathBuf) -> Self {
-        Self { token, root }
+    fn new(token: WorkspaceToken, root: PathBuf, root_binding: WorkspaceRootBinding) -> Self {
+        Self {
+            token,
+            root,
+            root_binding,
+        }
     }
 
     #[cfg(test)]
@@ -1787,7 +1828,8 @@ impl FileAuthorizationSession {
         if !root.is_dir() {
             return Err("Authorized root must be a directory".into());
         }
-        Ok(WorkspaceCandidate { root })
+        let root_binding = WorkspaceRootBinding::capture(&root)?;
+        Ok(WorkspaceCandidate { root, root_binding })
     }
 
     #[cfg(test)]
@@ -1851,7 +1893,11 @@ impl FileAuthorizationSession {
             return Err("Too many workspace opens are awaiting completion".to_string());
         }
         let token = state.allocate_workspace_token()?;
-        let workspace = AuthorizedWorkspace::new(token, candidate.root.clone());
+        let workspace = AuthorizedWorkspace::new(
+            token,
+            candidate.root.clone(),
+            candidate.root_binding.clone(),
+        );
         let receipt = token.to_receipt();
         state.pending_workspace_authorities.insert(
             token,
@@ -1906,7 +1952,11 @@ impl FileAuthorizationSession {
         }
 
         let current = self.workspace_candidate(&pending.candidate.root)?;
-        if current.root != pending.candidate.root {
+        if current.root != pending.candidate.root
+            || !current
+                .root_binding
+                .same_object(&pending.candidate.root_binding)
+        {
             return Err("Workspace root changed before the open was applied".to_string());
         }
         let workspace = Self::publish_workspace_with_token(&mut state, token, current)?;
@@ -1931,6 +1981,9 @@ impl FileAuthorizationSession {
         token: WorkspaceToken,
         candidate: WorkspaceCandidate,
     ) -> Result<AuthorizedWorkspace, String> {
+        if !candidate.root_binding.is_current(&candidate.root) {
+            return Err("Workspace root changed before authorization was published".to_string());
+        }
         state
             .authorization_generation
             .checked_add(2)
@@ -1945,9 +1998,14 @@ impl FileAuthorizationSession {
             token,
             WorkspaceGrant {
                 root: candidate.root.clone(),
+                root_binding: candidate.root_binding.clone(),
             },
         );
-        Ok(AuthorizedWorkspace::new(token, candidate.root))
+        Ok(AuthorizedWorkspace::new(
+            token,
+            candidate.root,
+            candidate.root_binding,
+        ))
     }
 
     #[cfg(test)]
@@ -2245,13 +2303,20 @@ impl FileAuthorizationSession {
         token: &WorkspaceToken,
     ) -> Option<AuthorizedWorkspace> {
         let workspace = state.workspaces.get(token)?;
+        if !workspace.root_binding.is_current(&workspace.root) {
+            return None;
+        }
         state
             .grants
             .get(&GrantKey::DirectoryRead(workspace.root.clone()))
             .filter(|ledger| {
                 ledger.is_active() && ledger.origins.contains_key(&GrantOrigin::Workspace(*token))
             })?;
-        Some(AuthorizedWorkspace::new(*token, workspace.root.clone()))
+        Some(AuthorizedWorkspace::new(
+            *token,
+            workspace.root.clone(),
+            workspace.root_binding.clone(),
+        ))
     }
 
     fn authorized_workspace_root_for_token(
@@ -2270,6 +2335,10 @@ impl FileAuthorizationSession {
         if workspace.root != canonical {
             return Err("Directory does not match the selected workspace".into());
         }
+        drop(state);
+        if !workspace.root_binding.is_current(&workspace.root) {
+            return Err("Workspace root changed after authorization".into());
+        }
         Ok(workspace)
     }
 
@@ -2280,8 +2349,16 @@ impl FileAuthorizationSession {
         let state = self.lock()?;
         let active_workspace = Self::workspace_for_token(&state, &workspace.token)
             .ok_or_else(|| "Workspace authorization is no longer active".to_string())?;
-        if active_workspace.root != workspace.root {
+        if active_workspace.root != workspace.root
+            || !active_workspace
+                .root_binding
+                .same_object(&workspace.root_binding)
+        {
             return Err("Workspace authorization does not match the selected root".into());
+        }
+        drop(state);
+        if !workspace.root_binding.is_current(&workspace.root) {
+            return Err("Workspace root changed after authorization".into());
         }
         Ok(())
     }
@@ -2301,6 +2378,10 @@ impl FileAuthorizationSession {
             .ok_or_else(|| "Workspace authorization is no longer active".to_string())?;
         if !path_is_under(&canonical, &workspace.root) {
             return Err("Directory is outside the selected workspace".into());
+        }
+        drop(state);
+        if !workspace.root_binding.is_current(&workspace.root) {
+            return Err("Workspace root changed after authorization".into());
         }
         Ok((canonical, workspace))
     }
@@ -3628,6 +3709,30 @@ mod tests {
     use super::*;
     use crate::html_preview_server::prepare_html_preview_inner;
     use tempfile::tempdir;
+
+    #[test]
+    fn workspace_authorization_rejects_a_replaced_root_object() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let displaced = directory.path().join("displaced");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("note.md"), "same content").unwrap();
+        let authorization = FileAuthorizationSession::default();
+        let workspace = authorization.authorize_directory_root(&root).unwrap();
+        let token = workspace.wire_token();
+        let canonical_root = workspace.root().to_path_buf();
+
+        fs::rename(&canonical_root, displaced).unwrap();
+        fs::create_dir(&canonical_root).unwrap();
+        fs::write(canonical_root.join("note.md"), "same content").unwrap();
+
+        assert!(authorization
+            .ensure_workspace_is_current(&workspace)
+            .is_err());
+        assert!(authorization
+            .authorized_workspace_root_for_token(&token, &canonical_root)
+            .is_err());
+    }
 
     #[test]
     fn anchored_workspace_preview_lease_remains_supported() {
