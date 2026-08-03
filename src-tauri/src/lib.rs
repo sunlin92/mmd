@@ -265,6 +265,7 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let opened_event_open_intents = Arc::clone(&open_intents);
     let app = tauri::Builder::default()
+        .manage(managed_open_intents)
         .plugin(tauri_plugin_single_instance::init(move |app, args, cwd| {
             publish_open_intent_result(
                 app,
@@ -296,7 +297,6 @@ pub fn run() {
                 .initialize_crash_drafts(app_data_dir)
                 .map_err(|error| format!("Cannot initialize crash recovery: {error}"))?;
             app.manage(state);
-            app.manage(managed_open_intents);
             if let Some(result) = startup_open_intent {
                 deliver_open_intent_result(app.handle(), result);
             }

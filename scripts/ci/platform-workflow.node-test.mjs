@@ -10,6 +10,7 @@ const releaseWorkflowPath = fileURLToPath(new URL('../../.github/workflows/relea
 const windowsSmokePath = fileURLToPath(new URL('./smoke-windows.ps1', import.meta.url));
 const packagedRunnerPath = fileURLToPath(new URL('./packaged-lifecycle-runner.mjs', import.meta.url));
 const packagedOpenRunnerPath = fileURLToPath(new URL('./packaged-open-runner.mjs', import.meta.url));
+const tauriLibPath = fileURLToPath(new URL('../../src-tauri/src/lib.rs', import.meta.url));
 const nativeTrashPath = fileURLToPath(
   new URL('../../src-tauri/src/workspace_trash_native.rs', import.meta.url),
 );
@@ -26,6 +27,25 @@ async function workflow() {
 async function smokes() {
   return (await Promise.all(smokePaths.map((file) => readFile(file, 'utf8')))).join('\n');
 }
+
+test('manages open intents before setup can build webviews', async () => {
+  const value = await readFile(tauriLibPath, 'utf8');
+  const setupIndex = value.indexOf('.setup(move |app|');
+  const manageIndexes = [...value.matchAll(/\.manage\(managed_open_intents\)/g)].map(
+    (match) => match.index,
+  );
+
+  assert.notEqual(setupIndex, -1, 'the Tauri setup callback must exist');
+  assert.equal(manageIndexes.length, 1, 'the coordinator must be managed exactly once');
+  assert.ok(
+    manageIndexes[0] < setupIndex,
+    'the coordinator must be managed before setup can race with webview commands',
+  );
+
+  const setupBody = value.slice(setupIndex, value.indexOf('.on_menu_event', setupIndex));
+  assert.match(setupBody, /app\.manage\(state\);/);
+  assert.doesNotMatch(setupBody, /app\.manage\(managed_open_intents\);/);
+});
 
 test('records target-native durable-write CAS and real Trash gates', async () => {
   const value = await workflow();
