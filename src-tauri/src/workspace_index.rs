@@ -78,6 +78,18 @@ impl WorkspaceIndex {
             })
             .collect()
     }
+
+    pub(crate) fn content_for_relative_path(&self, relative_path: &str) -> Option<&str> {
+        let normalized_path = normalize_for_search(relative_path);
+        self.documents
+            .binary_search_by(|document| document.normalized_path.cmp(&normalized_path))
+            .ok()
+            .map(|index| self.documents[index].content.as_str())
+    }
+
+    pub(crate) fn max_file_bytes(&self) -> usize {
+        self.limits.max_file_bytes
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
