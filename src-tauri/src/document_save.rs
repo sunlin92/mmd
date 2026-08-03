@@ -500,6 +500,7 @@ impl DocumentSaveCoordinator {
                 if let Some(pending) = pending {
                     scope.publish_pending(pending);
                 }
+                scope.refresh_document_origin_identities();
             }
             DurableWriteOutcome::Indeterminate { .. } => {
                 if let Some(pending) = pending {
@@ -550,6 +551,10 @@ fn random_token_id() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        path_auth::{authorize_directory_root_inner, authorize_workspace_file_inner},
+        state::AppState,
+    };
     use std::{
         fs,
         sync::{
@@ -714,6 +719,41 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(conflict, DocumentSaveDisposition::Conflict { .. }));
+    }
+
+    #[test]
+    fn workspace_document_identity_rebinds_after_each_confirmed_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, b"old").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+        authorize_workspace_file_inner(&state, &path).unwrap();
+        let authorization = state.file_authorization();
+        let coordinator = DocumentSaveCoordinator::default();
+
+        for (index, bytes) in [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let expected = capture_file_version(&path).unwrap().unwrap();
+            let outcome = coordinator
+                .save_expected(
+                    authorization,
+                    &path,
+                    bytes,
+                    expected,
+                    &format!("op-{index}"),
+                    MAIN_SAVE_OWNER,
+                )
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                DocumentSaveDisposition::ConfirmedCommitted { .. }
+            ));
+        }
+
+        assert_eq!(fs::read(&path).unwrap(), b"second");
     }
 
     #[test]

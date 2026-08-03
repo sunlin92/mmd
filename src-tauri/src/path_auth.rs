@@ -278,6 +278,8 @@ pub(crate) mod lock_order_test_probe {
 #[derive(Default)]
 struct AuthorizationState {
     workspaces: HashMap<WorkspaceToken, WorkspaceGrant>,
+    workspace_document_origins: HashMap<DocumentGrantId, WorkspaceToken>,
+    document_origin_identities: HashMap<DocumentGrantId, String>,
     grants: HashMap<GrantKey, GrantLedger>,
     pending_save_authorities: HashMap<DocumentGrantId, PendingSaveReservation>,
     pending_workspace_authorities: HashMap<WorkspaceToken, PendingWorkspaceReservation>,
@@ -398,20 +400,186 @@ fn current_workspace_binding_for_directory_grant(
     })
 }
 
+#[cfg(test)]
+fn current_workspace_token_for_path(
+    state: &AuthorizationState,
+    path: &Path,
+) -> Option<WorkspaceToken> {
+    state
+        .grants
+        .iter()
+        .filter_map(|(key, ledger)| {
+            let GrantKey::DirectoryRead(root) = key else {
+                return None;
+            };
+            if !ledger.is_active() || !path_is_under(path, root) {
+                return None;
+            }
+            current_workspace_binding_for_directory_grant(state, root, ledger)
+                .map(|(token, _)| (root.components().count(), token))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, token)| token)
+}
+
 fn internal_asset_grant_is_current(
     state: &AuthorizationState,
     root: &Path,
     ledger: &GrantLedger,
 ) -> bool {
     ledger.origins.keys().any(|origin| match origin {
-        GrantOrigin::Workspace(token) => state
-            .workspaces
-            .get(token)
-            .is_some_and(|workspace| capture_current_workspace_binding(workspace, root).is_some()),
         GrantOrigin::Preview(lease) => state.preview_lease_is_active_and_supported(lease),
-        GrantOrigin::OpenDocument(_) | GrantOrigin::SaveAs(_) | GrantOrigin::CreatedDocument(_) => {
-            true
+        _ => grant_origin_is_current_for_path(state, root, origin),
+    })
+}
+
+fn workspace_origin_is_current(
+    state: &AuthorizationState,
+    token: &WorkspaceToken,
+    path: &Path,
+) -> bool {
+    state.workspaces.get(token).is_some_and(|workspace| {
+        path_is_under(path, &workspace.root)
+            && capture_current_workspace_binding(workspace, &workspace.root).is_some()
+    })
+}
+
+fn grant_origin_is_current_for_path(
+    state: &AuthorizationState,
+    path: &Path,
+    origin: &GrantOrigin,
+) -> bool {
+    match origin {
+        GrantOrigin::Workspace(token) => workspace_origin_is_current(state, token, path),
+        GrantOrigin::OpenDocument(id) => state
+            .workspace_document_origins
+            .get(id)
+            .is_none_or(|token| workspace_origin_is_current(state, token, path)),
+        GrantOrigin::SaveAs(_) | GrantOrigin::CreatedDocument(_) => true,
+        GrantOrigin::Preview(_) => false,
+    }
+}
+
+fn current_file_identity_for_origin(
+    state: &AuthorizationState,
+    path: &Path,
+    workspace_token: Option<&WorkspaceToken>,
+) -> Option<String> {
+    let file = if let Some(token) = workspace_token {
+        let workspace = state.workspaces.get(token)?;
+        let binding = capture_current_workspace_binding(workspace, &workspace.root)?;
+        let relative = path.strip_prefix(&workspace.root).ok()?;
+        binding.open_regular_file(relative).ok()?
+    } else {
+        open_regular_file_without_following_links(path).ok()?
+    };
+    opened_file_platform_identity(&file).ok()
+}
+
+fn exact_origin_is_current_for_path(
+    state: &AuthorizationState,
+    path: &Path,
+    origin: &GrantOrigin,
+) -> bool {
+    if !grant_origin_is_current_for_path(state, path, origin) {
+        return false;
+    }
+    let GrantOrigin::OpenDocument(id) = origin else {
+        return true;
+    };
+    state
+        .document_origin_identities
+        .get(id)
+        .is_none_or(|expected| {
+            current_file_identity_for_origin(state, path, state.workspace_document_origins.get(id))
+                .is_some_and(|current| current == *expected)
+        })
+}
+
+enum ExactReadAuthority {
+    Path,
+    Identity(String),
+}
+
+fn exact_read_authority(
+    state: &AuthorizationState,
+    path: &Path,
+    ledger: &GrantLedger,
+) -> Option<ExactReadAuthority> {
+    if !ledger.is_active() {
+        return None;
+    }
+    let mut expected_identity = None;
+    for origin in ledger.origins.keys() {
+        if !exact_origin_is_current_for_path(state, path, origin) {
+            continue;
         }
+        match origin {
+            GrantOrigin::OpenDocument(id) => {
+                if let Some(identity) = state.document_origin_identities.get(id) {
+                    expected_identity.get_or_insert_with(|| identity.clone());
+                } else {
+                    return Some(ExactReadAuthority::Path);
+                }
+            }
+            GrantOrigin::SaveAs(_) | GrantOrigin::CreatedDocument(_) => {
+                return Some(ExactReadAuthority::Path);
+            }
+            GrantOrigin::Workspace(_) | GrantOrigin::Preview(_) => {}
+        }
+    }
+    expected_identity.map(ExactReadAuthority::Identity)
+}
+
+fn exact_grant_is_current(state: &AuthorizationState, path: &Path, ledger: &GrantLedger) -> bool {
+    exact_read_authority(state, path, ledger).is_some()
+}
+
+fn active_authority_origins_for_path(
+    state: &AuthorizationState,
+    path: &Path,
+) -> HashSet<GrantOrigin> {
+    let mut origins = HashSet::new();
+    for (key, ledger) in &state.grants {
+        if !ledger.is_active() {
+            continue;
+        }
+        match key {
+            GrantKey::ExactReadWrite(granted_path) if granted_path == path => {
+                origins.extend(
+                    ledger
+                        .origins
+                        .keys()
+                        .filter(|origin| exact_origin_is_current_for_path(state, path, origin))
+                        .cloned(),
+                );
+            }
+            GrantKey::DirectoryRead(root)
+                if path_is_under(path, root)
+                    && directory_read_grant_is_current(state, root, ledger) =>
+            {
+                origins.extend(
+                    ledger
+                        .origins
+                        .keys()
+                        .filter(|origin| grant_origin_is_current_for_path(state, path, origin))
+                        .cloned(),
+                );
+            }
+            _ => {}
+        }
+    }
+    origins
+}
+
+fn ledger_shares_current_origin(
+    state: &AuthorizationState,
+    path: &Path,
+    ledger: &GrantLedger,
+    origins: &HashSet<GrantOrigin>,
+) -> bool {
+    ledger.origins.keys().any(|origin| {
+        origins.contains(origin) && grant_origin_is_current_for_path(state, path, origin)
     })
 }
 
@@ -623,8 +791,8 @@ impl SaveAuthorizationScope<'_> {
 
     pub(crate) fn has_exact_write_authority(&self) -> bool {
         self.state.grants.iter().any(|(key, ledger)| {
-            ledger.is_active()
-                && matches!(key, GrantKey::ExactReadWrite(file) if file == &self.path)
+            matches!(key, GrantKey::ExactReadWrite(file)
+                if file == &self.path && exact_grant_is_current(self.state, file, ledger))
         })
     }
 
@@ -636,6 +804,11 @@ impl SaveAuthorizationScope<'_> {
                 .pending_save_authorities
                 .get(&pending.id)
                 .is_some_and(|reservation| reservation.path == self.path)
+    }
+
+    pub(crate) fn refresh_document_origin_identities(&mut self) {
+        self.state
+            .refresh_document_origin_identities_for_path(&self.path);
     }
 
     pub(crate) fn publish_pending(&mut self, pending: &PendingSaveAuthority) {
@@ -765,6 +938,8 @@ pub(crate) enum PreparedWorkspaceSettlement {
 pub(crate) struct PreparedOpenDocumentGrant<'a> {
     state: AuthorizationGuard<'a>,
     mutations: Vec<PreparedGrantMutation>,
+    workspace_document_origin: Option<(DocumentGrantId, WorkspaceToken)>,
+    document_origin_identity: Option<(DocumentGrantId, String)>,
     next_document_grant_id: u64,
     next_grant_sequence: u64,
     next_authorization_generation: u64,
@@ -791,6 +966,20 @@ impl PreparedOpenDocumentGrant<'_> {
                     debug_assert!(replaced.is_none());
                 }
             }
+        }
+        if let Some((document_id, workspace_token)) = self.workspace_document_origin {
+            let replaced = self
+                .state
+                .workspace_document_origins
+                .insert(document_id, workspace_token);
+            debug_assert!(replaced.is_none());
+        }
+        if let Some((document_id, file_identity)) = self.document_origin_identity {
+            let replaced = self
+                .state
+                .document_origin_identities
+                .insert(document_id, file_identity);
+            debug_assert!(replaced.is_none());
         }
     }
 }
@@ -1207,6 +1396,36 @@ impl AuthorizationState {
         if let GrantOrigin::Workspace(token) = origin {
             self.workspaces.remove(token);
         }
+        if let GrantOrigin::OpenDocument(id) = origin {
+            self.workspace_document_origins.remove(id);
+            self.document_origin_identities.remove(id);
+        }
+    }
+
+    fn refresh_document_origin_identities_for_path(&mut self, path: &Path) {
+        let document_ids = self
+            .grants
+            .get(&GrantKey::ExactReadWrite(path.to_path_buf()))
+            .into_iter()
+            .flat_map(|ledger| ledger.origins.keys())
+            .filter_map(|origin| match origin {
+                GrantOrigin::OpenDocument(id)
+                    if self.document_origin_identities.contains_key(id) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for id in document_ids {
+            if let Some(identity) = current_file_identity_for_origin(
+                self,
+                path,
+                self.workspace_document_origins.get(&id),
+            ) {
+                self.document_origin_identities.insert(id, identity);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1247,35 +1466,14 @@ impl AuthorizationState {
 
     fn preview_lease_is_supported(&self, lease: &PreviewLeaseId) -> bool {
         let authority_document = lease.authority_anchor.as_deref().unwrap_or(&lease.document);
-        let authority_origins = self
-            .grants
-            .iter()
-            .filter(|(_, ledger)| ledger.is_active())
-            .filter_map(|(key, ledger)| match key {
-                GrantKey::ExactReadWrite(path) if path == authority_document => {
-                    Some(&ledger.origins)
-                }
-                GrantKey::DirectoryRead(root)
-                    if path_is_under(authority_document, root)
-                        && directory_read_grant_is_current(self, root, ledger) =>
-                {
-                    Some(&ledger.origins)
-                }
-                _ => None,
-            })
-            .flat_map(HashMap::keys)
-            .filter(|origin| !matches!(origin, GrantOrigin::Preview(_)))
-            .cloned()
-            .collect::<HashSet<_>>();
+        let authority_origins = active_authority_origins_for_path(self, authority_document);
 
         self.grants.iter().any(|(key, ledger)| {
             ledger.is_active()
                 && matches!(key, GrantKey::DirectoryRead(root) | GrantKey::InternalAsset(root)
                     if path_is_under(&lease.document, root)
                         && path_is_under(authority_document, root))
-                && ledger.origins.keys().any(|origin| {
-                    !matches!(origin, GrantOrigin::Preview(_)) && authority_origins.contains(origin)
-                })
+                && ledger_shares_current_origin(self, key.path(), ledger, &authority_origins)
         })
     }
 
@@ -1309,9 +1507,48 @@ impl AuthorizationState {
         old_prefix: &Path,
         new_prefix: &Path,
     ) -> Result<HashSet<PreviewLeaseId>, String> {
+        self.relocate_path_prefix_with_identity(old_prefix, new_prefix, None)
+    }
+
+    fn relocate_path_prefix_with_identity(
+        &mut self,
+        old_prefix: &Path,
+        new_prefix: &Path,
+        expected_identity: Option<&str>,
+    ) -> Result<HashSet<PreviewLeaseId>, String> {
         if old_prefix == new_prefix {
             return Ok(HashSet::new());
         }
+        let identity_bound_documents = if let Some(expected_identity) = expected_identity {
+            let current_identity = current_file_identity_for_origin(self, new_prefix, None)
+                .ok_or_else(|| "Renamed document could not be securely reidentified".to_string())?;
+            if current_identity != expected_identity {
+                return Err("Renamed document identity changed before authorization moved".into());
+            }
+            let document_ids = self
+                .grants
+                .iter()
+                .filter(|(key, ledger)| {
+                    ledger.is_active()
+                        && matches!(key, GrantKey::ExactReadWrite(path) if path_is_under(path, old_prefix))
+                })
+                .flat_map(|(_, ledger)| ledger.origins.keys())
+                .filter_map(|origin| match origin {
+                    GrantOrigin::OpenDocument(id) => Some(*id),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let additional = document_ids
+                .iter()
+                .filter(|id| !self.document_origin_identities.contains_key(id))
+                .count();
+            self.document_origin_identities
+                .try_reserve(additional)
+                .map_err(|_| "Cannot reserve renamed document identity provenance".to_string())?;
+            document_ids
+        } else {
+            HashSet::new()
+        };
         let invalidates_preview = self.grants.values().any(|ledger| {
             ledger.origins.keys().any(|origin| {
                 matches!(origin, GrantOrigin::Preview(lease)
@@ -1366,6 +1603,12 @@ impl AuthorizationState {
                 existing.merge(ledger);
             } else {
                 self.grants.insert(relocated_key, ledger);
+            }
+        }
+        if let Some(expected_identity) = expected_identity {
+            for document_id in identity_bound_documents {
+                self.document_origin_identities
+                    .insert(document_id, expected_identity.to_string());
             }
         }
         Ok(invalidated_preview_leases)
@@ -1724,7 +1967,8 @@ impl FileAuthorizationSession {
         let path = normalize_file_for_write(path)?;
         let state = self.lock()?;
         if !state.grants.iter().any(|(key, ledger)| {
-            ledger.is_active() && matches!(key, GrantKey::ExactReadWrite(file) if file == &path)
+            matches!(key, GrantKey::ExactReadWrite(file)
+                if file == &path && exact_grant_is_current(&state, file, ledger))
         }) {
             return Err("Destination file has not been explicitly authorized by open, workspace selection, or save-as".into());
         }
@@ -1859,6 +2103,18 @@ impl FileAuthorizationSession {
             .map(|(token, workspace)| format!("{token:?}:{}", workspace.root.display()))
             .collect::<Vec<_>>();
         workspaces.sort();
+        let mut workspace_document_origins = state
+            .workspace_document_origins
+            .iter()
+            .map(|(document, workspace)| format!("{document:?}:{workspace:?}"))
+            .collect::<Vec<_>>();
+        workspace_document_origins.sort();
+        let mut document_origin_identities = state
+            .document_origin_identities
+            .iter()
+            .map(|(document, identity)| format!("{document:?}:{identity}"))
+            .collect::<Vec<_>>();
+        document_origin_identities.sort();
         let mut grants = state
             .grants
             .iter()
@@ -1877,7 +2133,7 @@ impl FileAuthorizationSession {
             .collect::<Vec<_>>();
         grants.sort();
         format!(
-            "workspaces={workspaces:?};grants={grants:?};counters={:?}",
+            "workspaces={workspaces:?};workspace_document_origins={workspace_document_origins:?};document_origin_identities={document_origin_identities:?};grants={grants:?};counters={:?}",
             (
                 state.next_workspace_token_id,
                 state.next_document_grant_id,
@@ -2177,7 +2433,7 @@ impl FileAuthorizationSession {
             return Err("Authorized file must be a file".into());
         }
         let mut state = self.lock()?;
-        Self::publish_open_document(&mut state, file, true)
+        Self::publish_open_document(&mut state, file, true, None)
     }
 
     #[cfg(test)]
@@ -2198,7 +2454,7 @@ impl FileAuthorizationSession {
             .to_path_buf();
         let mut state = self.lock()?;
         transport(&parent)?;
-        let authorized = Self::publish_open_document(&mut state, file, true)?;
+        let authorized = Self::publish_open_document(&mut state, file, true, None)?;
         Ok((authorized, response))
     }
 
@@ -2249,6 +2505,24 @@ impl FileAuthorizationSession {
             .checked_add(1)
             .ok_or_else(|| "Document authorization identifier space is exhausted".to_string())?;
         let origin = GrantOrigin::OpenDocument(DocumentGrantId(document_grant_id));
+        let workspace_document_origin = workspace_authorization
+            .map(|authorization| (DocumentGrantId(document_grant_id), authorization.token));
+        let document_origin_identity = workspace_authorization.map(|authorization| {
+            (
+                DocumentGrantId(document_grant_id),
+                authorization.file_identity.clone(),
+            )
+        });
+        if workspace_document_origin.is_some() {
+            state
+                .workspace_document_origins
+                .try_reserve(1)
+                .map_err(|_| "Cannot reserve workspace document provenance".to_string())?;
+            state
+                .document_origin_identities
+                .try_reserve(1)
+                .map_err(|_| "Cannot reserve document identity provenance".to_string())?;
+        }
         let keys = [
             GrantKey::ExactReadWrite(file),
             GrantKey::InternalAsset(parent),
@@ -2290,6 +2564,8 @@ impl FileAuthorizationSession {
         operation(PreparedOpenDocumentGrant {
             state,
             mutations,
+            workspace_document_origin,
+            document_origin_identity,
             next_document_grant_id,
             next_grant_sequence,
             next_authorization_generation,
@@ -2354,9 +2630,29 @@ impl FileAuthorizationSession {
         state: &mut AuthorizationState,
         file: PathBuf,
         include_internal_assets: bool,
+        workspace_provenance: Option<(WorkspaceToken, String)>,
     ) -> Result<AuthorizedFile, String> {
-        let origin = GrantOrigin::OpenDocument(state.allocate_document_grant_id()?);
+        if workspace_provenance.is_some() {
+            state
+                .workspace_document_origins
+                .try_reserve(1)
+                .map_err(|_| "Cannot reserve workspace document provenance".to_string())?;
+            state
+                .document_origin_identities
+                .try_reserve(1)
+                .map_err(|_| "Cannot reserve document identity provenance".to_string())?;
+        }
+        let document_id = state.allocate_document_grant_id()?;
+        let origin = GrantOrigin::OpenDocument(document_id);
         Self::grant_exact_file(state, &file, origin.clone(), include_internal_assets)?;
+        if let Some((token, file_identity)) = workspace_provenance {
+            let replaced = state.workspace_document_origins.insert(document_id, token);
+            debug_assert!(replaced.is_none());
+            let replaced = state
+                .document_origin_identities
+                .insert(document_id, file_identity);
+            debug_assert!(replaced.is_none());
+        }
         Ok(AuthorizedFile::new(file, origin))
     }
 
@@ -2367,23 +2663,34 @@ impl FileAuthorizationSession {
             return Err("Path is not a file".into());
         }
         let mut state = self.lock()?;
-        if !Self::is_existing_file_authorized(&state, &canonical) {
-            return Err("File is outside the user-authorized session files and directories".into());
-        }
-        Self::publish_open_document(&mut state, canonical, false)
+        let workspace_token = current_workspace_token_for_path(&state, &canonical);
+        let workspace_token = workspace_token.ok_or_else(|| {
+            "File is outside the user-authorized session files and directories".to_string()
+        })?;
+        let file_identity =
+            current_file_identity_for_origin(&state, &canonical, Some(&workspace_token))
+                .ok_or_else(|| {
+                    "Workspace file identity changed before open publication".to_string()
+                })?;
+        Self::publish_open_document(
+            &mut state,
+            canonical,
+            false,
+            Some((workspace_token, file_identity)),
+        )
     }
 
     fn is_existing_file_authorized(state: &AuthorizationState, canonical: &Path) -> bool {
-        state.grants.iter().any(|(key, ledger)| {
-            ledger.is_active()
-                && match key {
-                    GrantKey::ExactReadWrite(file) => file == canonical,
-                    GrantKey::DirectoryRead(root) => {
-                        path_is_under(canonical, root)
-                            && directory_read_grant_is_current(state, root, ledger)
-                    }
-                    GrantKey::InternalAsset(_) => false,
-                }
+        state.grants.iter().any(|(key, ledger)| match key {
+            GrantKey::ExactReadWrite(file) => {
+                file == canonical && exact_grant_is_current(state, file, ledger)
+            }
+            GrantKey::DirectoryRead(root) => {
+                ledger.is_active()
+                    && path_is_under(canonical, root)
+                    && directory_read_grant_is_current(state, root, ledger)
+            }
+            GrantKey::InternalAsset(_) => false,
         })
     }
 
@@ -2410,7 +2717,7 @@ impl FileAuthorizationSession {
             return Err("Path is not a file".into());
         }
         enum ReadAuthority {
-            Exact,
+            Exact(ExactReadAuthority),
             Workspace {
                 root: PathBuf,
                 token: WorkspaceToken,
@@ -2442,13 +2749,17 @@ impl FileAuthorizationSession {
                     token,
                     binding,
                 }
+            } else if let Some(exact) = state.grants.iter().find_map(|(key, ledger)| {
+                let GrantKey::ExactReadWrite(file) = key else {
+                    return None;
+                };
+                (file == &canonical)
+                    .then(|| exact_read_authority(&state, file, ledger))
+                    .flatten()
+            }) {
+                ReadAuthority::Exact(exact)
             } else if matching_directory_grant {
                 return Err("Workspace root changed after authorization".to_string());
-            } else if state.grants.iter().any(|(key, ledger)| {
-                ledger.is_active()
-                    && matches!(key, GrantKey::ExactReadWrite(file) if file == &canonical)
-            }) {
-                ReadAuthority::Exact
             } else {
                 return Err(
                     "File is outside the user-authorized session files and directories".into(),
@@ -2463,11 +2774,24 @@ impl FileAuthorizationSession {
             )
         };
         let (file, workspace_authorization) = match authority {
-            ReadAuthority::Exact => (
-                open_regular_file_without_following_links(&canonical)
-                    .map_err(&secure_open_error)?,
-                None,
-            ),
+            ReadAuthority::Exact(exact) => {
+                let file = open_regular_file_without_following_links(&canonical)
+                    .map_err(&secure_open_error)?;
+                if let ExactReadAuthority::Identity(expected) = exact {
+                    let actual = opened_file_platform_identity(&file).map_err(|error| {
+                        format!(
+                            "Failed to identify securely opened file {}: {error}",
+                            canonical.display()
+                        )
+                    })?;
+                    if actual != expected {
+                        return Err(
+                            "Securely opened file identity changed after authorization".to_string()
+                        );
+                    }
+                }
+                (file, None)
+            }
             ReadAuthority::Workspace {
                 root,
                 token,
@@ -2517,7 +2841,9 @@ impl FileAuthorizationSession {
         if state.grants.iter().any(|(key, ledger)| {
             ledger.is_active()
                 && match key {
-                    GrantKey::ExactReadWrite(file) => file == &normalized,
+                    GrantKey::ExactReadWrite(file) => {
+                        file == &normalized && exact_grant_is_current(&state, file, ledger)
+                    }
                     GrantKey::DirectoryRead(root) => {
                         path_is_under(&normalized, root)
                             && directory_read_grant_is_current(&state, root, ledger)
@@ -2536,8 +2862,8 @@ impl FileAuthorizationSession {
         let normalized = normalize_file_for_write(path)?;
         let state = self.lock()?;
         if state.grants.iter().any(|(key, ledger)| {
-            ledger.is_active()
-                && matches!(key, GrantKey::ExactReadWrite(file) if file == &normalized)
+            matches!(key, GrantKey::ExactReadWrite(file)
+                if file == &normalized && exact_grant_is_current(&state, file, ledger))
         }) {
             Ok(normalized)
         } else {
@@ -2553,7 +2879,8 @@ impl FileAuthorizationSession {
         let path = normalize_file_for_write(path)?;
         let state = self.lock()?;
         if !state.grants.iter().any(|(key, ledger)| {
-            ledger.is_active() && matches!(key, GrantKey::ExactReadWrite(file) if file == &path)
+            matches!(key, GrantKey::ExactReadWrite(file)
+                if file == &path && exact_grant_is_current(&state, file, ledger))
         }) {
             return Err("Destination file has not been explicitly authorized by open, workspace selection, or save-as".into());
         }
@@ -3050,6 +3377,22 @@ impl FileAuthorizationSession {
         state.relocate_path_prefix(old_prefix, new_prefix)
     }
 
+    fn relocate_path_prefix_with_identity(
+        &self,
+        old_prefix: &Path,
+        new_prefix: &Path,
+        expected_identity: &str,
+    ) -> Result<HashSet<PreviewLeaseId>, String> {
+        let mut state = self.lock()?;
+        state.relocate_path_prefix_with_identity(old_prefix, new_prefix, Some(expected_identity))
+    }
+
+    fn refresh_document_origin_identities(&self, path: &Path) -> Result<(), String> {
+        let mut state = self.lock()?;
+        state.refresh_document_origin_identities_for_path(path);
+        Ok(())
+    }
+
     fn revoke_path_prefix(&self, prefix: &Path) -> Result<HashSet<PreviewLeaseId>, String> {
         let mut state = self.lock()?;
         state.revoke_path_prefix(prefix)
@@ -3079,23 +3422,7 @@ impl FileAuthorizationSession {
             return Err("Path is not a file".into());
         }
         let mut state = self.lock()?;
-        let document_origins = state
-            .grants
-            .iter()
-            .filter(|(_, ledger)| ledger.is_active())
-            .filter_map(|(key, ledger)| match key {
-                GrantKey::ExactReadWrite(path) if path == &document => Some(&ledger.origins),
-                GrantKey::DirectoryRead(root)
-                    if path_is_under(&document, root)
-                        && directory_read_grant_is_current(&state, root, ledger) =>
-                {
-                    Some(&ledger.origins)
-                }
-                _ => None,
-            })
-            .flat_map(HashMap::keys)
-            .cloned()
-            .collect::<HashSet<_>>();
+        let document_origins = active_authority_origins_for_path(&state, &document);
         let root = state
             .grants
             .iter()
@@ -3103,10 +3430,12 @@ impl FileAuthorizationSession {
             .filter_map(|(key, ledger)| match key {
                 GrantKey::DirectoryRead(root) | GrantKey::InternalAsset(root)
                     if path_is_under(&document, root)
-                        && ledger
-                            .origins
-                            .keys()
-                            .any(|origin| document_origins.contains(origin)) =>
+                        && ledger_shares_current_origin(
+                            &state,
+                            root,
+                            ledger,
+                            &document_origins,
+                        ) =>
                 {
                     Some(root)
                 }
@@ -3154,24 +3483,7 @@ impl FileAuthorizationSession {
             return Err("Workspace root is not a directory".into());
         }
         let mut state = self.lock()?;
-        let anchor_origins = state
-            .grants
-            .iter()
-            .filter(|(_, ledger)| ledger.is_active())
-            .filter_map(|(key, ledger)| match key {
-                GrantKey::ExactReadWrite(path) if path == &anchor => Some(&ledger.origins),
-                GrantKey::DirectoryRead(root)
-                    if path_is_under(&anchor, root)
-                        && directory_read_grant_is_current(&state, root, ledger) =>
-                {
-                    Some(&ledger.origins)
-                }
-                _ => None,
-            })
-            .flat_map(HashMap::keys)
-            .filter(|origin| !matches!(origin, GrantOrigin::Preview(_)))
-            .cloned()
-            .collect::<HashSet<_>>();
+        let anchor_origins = active_authority_origins_for_path(&state, &anchor);
         let root = if let Some(root) = workspace_root {
             if !path_is_under(&anchor, &root) || !path_is_under(&document, &root) {
                 return Err("HTML embed escaped the authorized workspace".to_string());
@@ -3181,10 +3493,7 @@ impl FileAuthorizationSession {
                     && matches!(key,
                         GrantKey::DirectoryRead(grant_root) | GrantKey::InternalAsset(grant_root)
                             if grant_root == &root)
-                    && ledger
-                        .origins
-                        .keys()
-                        .any(|origin| anchor_origins.contains(origin))
+                    && ledger_shares_current_origin(&state, &root, ledger, &anchor_origins)
             });
             if !workspace_is_shared {
                 return Err(
@@ -3206,10 +3515,12 @@ impl FileAuthorizationSession {
                         GrantKey::DirectoryRead(root) | GrantKey::InternalAsset(root)
                             if path_is_under(&anchor, root)
                                 && path_is_under(&document, root)
-                                && ledger
-                                    .origins
-                                    .keys()
-                                    .any(|origin| anchor_origins.contains(origin))
+                                && ledger_shares_current_origin(
+                                    &state,
+                                    root,
+                                    ledger,
+                                    &anchor_origins,
+                                )
                     )
                 });
             if !scope_is_authorized {
@@ -3384,7 +3695,12 @@ fn write_authorized_document_with_preview_inner(
 ) -> Result<AuthorizedWriteOutcome, String> {
     let path = state.file_authorization().write_document(path, preflight)?;
     match write(&path) {
-        Ok(()) => Ok(AuthorizedWriteOutcome::Committed(path)),
+        Ok(()) => {
+            let _ = state
+                .file_authorization()
+                .refresh_document_origin_identities(&path);
+            Ok(AuthorizedWriteOutcome::Committed(path))
+        }
         Err(recovery_message) => Ok(reconcile_indeterminate_write_with_preview_inner(
             state,
             path,
@@ -3738,6 +4054,24 @@ pub(crate) fn relocate_authorized_path_prefix_inner(
     )
 }
 
+pub(crate) fn relocate_authorized_path_prefix_with_identity_inner(
+    state: &AppState,
+    old_prefix: &Path,
+    new_prefix: &Path,
+    expected_identity: &str,
+) -> Result<(), String> {
+    apply_authorization_then_preview_invalidation(
+        || {
+            state
+                .file_authorization()
+                .relocate_path_prefix_with_identity(old_prefix, new_prefix, expected_identity)
+        },
+        |invalidated_preview_leases| {
+            invalidate_preview_leases_after_authorization(state, &invalidated_preview_leases)
+        },
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn commit_indeterminate_delete_inner(
     state: &AppState,
@@ -4054,6 +4388,106 @@ mod tests {
         assert!(!authorization
             .is_authorized_preview_asset(&canonical_root.join("note.md"))
             .unwrap());
+    }
+
+    #[test]
+    fn standalone_open_document_keeps_its_existing_path_authority_contract() {
+        let directory = tempdir().unwrap();
+        let document = directory.path().join("note.md");
+        let displaced = directory.path().join("displaced.md");
+        let asset = directory.path().join("image.png");
+        fs::write(&document, "authorized content").unwrap();
+        fs::write(&asset, b"image").unwrap();
+        let authorization = FileAuthorizationSession::default();
+        authorization.authorize_file(&document).unwrap();
+
+        fs::rename(&document, &displaced).unwrap();
+        fs::write(&document, "replacement content").unwrap();
+
+        assert!(authorization.file_for_read(&document).is_ok());
+        assert!(authorization.file_for_write(&document).is_ok());
+        assert!(authorization
+            .is_authorized_preview_asset(&asset.canonicalize().unwrap())
+            .unwrap());
+    }
+
+    #[test]
+    fn identity_bound_exact_read_rejects_replacement_before_handle_open() {
+        let directory = tempdir().unwrap();
+        let original = directory.path().join("original.md");
+        let renamed = directory.path().join("renamed.md");
+        let displaced = directory.path().join("displaced.md");
+        fs::write(&original, "authorized content").unwrap();
+        let canonical_original = normalize_existing_path(&original).unwrap();
+        let authorization = FileAuthorizationSession::default();
+        authorization.authorize_file(&original).unwrap();
+
+        fs::rename(&original, &renamed).unwrap();
+        let canonical_renamed = normalize_existing_path(&renamed).unwrap();
+        let renamed_identity = current_file_identity_for_origin(
+            &authorization.lock().unwrap(),
+            &canonical_renamed,
+            None,
+        )
+        .unwrap();
+        authorization
+            .relocate_path_prefix_with_identity(
+                &canonical_original,
+                &canonical_renamed,
+                &renamed_identity,
+            )
+            .unwrap();
+
+        let result = authorization.open_file_for_read_with_before_open(&canonical_renamed, || {
+            fs::rename(&canonical_renamed, &displaced).unwrap();
+            fs::write(&canonical_renamed, "replacement content").unwrap();
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn revoking_a_workspace_open_document_removes_its_workspace_provenance() {
+        let directory = tempdir().unwrap();
+        let document = directory.path().join("note.md");
+        fs::write(&document, "authorized content").unwrap();
+        let authorization = FileAuthorizationSession::default();
+        authorization
+            .authorize_directory_root(directory.path())
+            .unwrap();
+        let opened = authorization.open_workspace_file(&document).unwrap();
+
+        assert_eq!(
+            authorization
+                .lock()
+                .unwrap()
+                .workspace_document_origins
+                .len(),
+            1
+        );
+        assert_eq!(
+            authorization
+                .lock()
+                .unwrap()
+                .document_origin_identities
+                .len(),
+            1
+        );
+
+        authorization
+            .revoke_origin(opened.origin(), RevokeOriginMode::All)
+            .unwrap();
+
+        assert!(authorization
+            .lock()
+            .unwrap()
+            .workspace_document_origins
+            .is_empty());
+        assert!(authorization
+            .lock()
+            .unwrap()
+            .document_origin_identities
+            .is_empty());
     }
 
     #[test]

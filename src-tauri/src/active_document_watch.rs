@@ -16,7 +16,7 @@ use notify_debouncer_full::{
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::{
-    commands::open_authorized_file_response_from_handle,
+    commands::{open_authorized_file_response_from_handle, opened_file_platform_identity},
     models::{
         ActiveDocumentDiskSnapshot, ActiveDocumentWatchEvent, ActiveDocumentWatchEventPayload,
         ActiveDocumentWatchHealthStatus, ActiveDocumentWatchReason,
@@ -25,7 +25,7 @@ use crate::{
     },
     path_auth::{
         ensure_authorized_existing_file_inner, ensure_authorized_watch_file_inner,
-        open_authorized_existing_file_inner, relocate_authorized_path_prefix_inner,
+        open_authorized_existing_file_inner, relocate_authorized_path_prefix_with_identity_inner,
         revoke_authorized_path_prefix_inner,
     },
     state::AppState,
@@ -146,13 +146,17 @@ struct ReconcileContext {
 }
 
 enum DiskRead {
-    Present(OpenFileResponse),
+    Present {
+        file: OpenFileResponse,
+        file_identity: String,
+    },
     Missing,
 }
 
 enum ResolvedDisk {
     Present {
         file: OpenFileResponse,
+        file_identity: String,
         reason: ActiveDocumentWatchReason,
         previous_path: Option<PathBuf>,
     },
@@ -651,6 +655,7 @@ impl ActiveDocumentWatchState {
                 file,
                 reason,
                 previous_path,
+                ..
             } => {
                 let preview_revision = increment_safe(entry.preview_revision, "Preview revision")?;
                 Ok((
@@ -845,9 +850,12 @@ fn read_authorized_disk(state: &AppState, path: &Path) -> Result<DiskRead, Strin
                 return Err("Monitored file identity changed unexpectedly".to_string());
             }
             let (canonical, handle) = opened.into_parts();
-            Ok(DiskRead::Present(
-                open_authorized_file_response_from_handle(canonical, handle)?,
-            ))
+            let file_identity = opened_file_platform_identity(&handle)
+                .map_err(|_| "Monitored file identity could not be captured".to_string())?;
+            Ok(DiskRead::Present {
+                file: open_authorized_file_response_from_handle(canonical, handle)?,
+                file_identity,
+            })
         }
         Ok(_) => Err("Monitored path is no longer a regular file".to_string()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DiskRead::Missing),
@@ -859,9 +867,14 @@ fn resolve_disk_state(
     state: &AppState,
     context: &ReconcileContext,
 ) -> Result<ResolvedDisk, String> {
-    if let DiskRead::Present(file) = read_authorized_disk(state, &context.path)? {
+    if let DiskRead::Present {
+        file,
+        file_identity,
+    } = read_authorized_disk(state, &context.path)?
+    {
         return Ok(ResolvedDisk::Present {
             file,
+            file_identity,
             reason: ActiveDocumentWatchReason::Changed,
             previous_path: None,
         });
@@ -887,12 +900,16 @@ fn resolve_disk_state(
 
     if authorized_candidates.len() == 1 {
         let new_path = authorized_candidates.pop().expect("one candidate exists");
-        let file = match read_authorized_disk(state, &new_path)? {
-            DiskRead::Present(file) => file,
+        let (file, file_identity) = match read_authorized_disk(state, &new_path)? {
+            DiskRead::Present {
+                file,
+                file_identity,
+            } => (file, file_identity),
             DiskRead::Missing => return Ok(ResolvedDisk::Missing),
         };
         return Ok(ResolvedDisk::Present {
             file,
+            file_identity,
             reason: ActiveDocumentWatchReason::Renamed,
             previous_path: Some(context.path.clone()),
         });
@@ -909,11 +926,17 @@ fn finalize_authorization_transition(
     match resolved {
         ResolvedDisk::Present {
             file,
+            file_identity,
             reason: ActiveDocumentWatchReason::Renamed,
             previous_path: Some(previous_path),
         } => {
             let new_path = PathBuf::from(&file.path);
-            relocate_authorized_path_prefix_inner(state, previous_path, &new_path)?;
+            relocate_authorized_path_prefix_with_identity_inner(
+                state,
+                previous_path,
+                &new_path,
+                file_identity,
+            )?;
             entry.path = new_path;
         }
         ResolvedDisk::Missing => {
@@ -1254,7 +1277,7 @@ pub(crate) fn start_active_document_watch_inner(
     };
     service.attach_handle(&watch_id, handle)?;
     let snapshot = match read_authorized_disk(state, &canonical) {
-        Ok(DiskRead::Present(file)) => ActiveDocumentDiskSnapshot::Present {
+        Ok(DiskRead::Present { file, .. }) => ActiveDocumentDiskSnapshot::Present {
             file,
             preview_revision: 1,
         },
@@ -1488,7 +1511,10 @@ impl ActiveDocumentWatchState {
 mod tests {
     use super::*;
     use crate::{
-        path_auth::authorize_directory_root_inner,
+        path_auth::{
+            authorize_directory_root_inner, authorize_file_inner,
+            ensure_authorized_write_file_inner,
+        },
         state::AppState,
         workspace_file_kind::{ContentMode, WorkspaceFileKind},
     };
@@ -1717,6 +1743,7 @@ mod tests {
                 file,
                 reason,
                 previous_path,
+                ..
             } => {
                 assert_eq!(file.path, active.to_string_lossy());
                 assert_eq!(file.content.as_deref(), Some("final contents"));
@@ -1760,6 +1787,7 @@ mod tests {
                     file,
                     reason,
                     previous_path,
+                    ..
                 } => {
                     assert_eq!(file.path, new_path.to_string_lossy());
                     assert_eq!(reason, ActiveDocumentWatchReason::Renamed);
@@ -1768,6 +1796,66 @@ mod tests {
                 ResolvedDisk::Missing => panic!("one authorized same-kind rename must be followed"),
             }
         }
+    }
+
+    #[test]
+    fn rename_follow_does_not_migrate_write_authority_to_a_replacement_target() {
+        let workspace = tempdir().unwrap();
+        let old_path = workspace.path().join("old.md");
+        let new_path = workspace.path().join("new.md");
+        let displaced = workspace.path().join("displaced.md");
+        fs::write(&old_path, "authorized content").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        authorize_file_inner(&state, old_path.clone()).unwrap();
+        let canonical_old = old_path.canonicalize().unwrap();
+        fs::rename(&canonical_old, &new_path).unwrap();
+        let canonical_new = new_path.canonicalize().unwrap();
+        let mut context = reconcile_context(&canonical_old, WorkspaceFileKind::Markdown);
+        context
+            .rename_candidates
+            .push((canonical_old.clone(), canonical_new.clone()));
+        let mut resolved = resolve_disk_state(&state, &context).unwrap();
+        let watch = ActiveDocumentWatchState::default();
+        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
+
+        fs::rename(&canonical_new, &displaced).unwrap();
+        fs::write(&canonical_new, "replacement content").unwrap();
+        let mut watch_state = watch.lock().unwrap();
+        let entry = watch_state.current.as_mut().unwrap();
+
+        assert!(finalize_authorization_transition(&state, entry, &mut resolved).is_err());
+        assert_eq!(entry.path, canonical_old);
+        assert!(ensure_authorized_write_file_inner(&state, &canonical_new).is_err());
+    }
+
+    #[test]
+    fn rename_follow_migrates_write_authority_when_the_target_identity_is_unchanged() {
+        let workspace = tempdir().unwrap();
+        let old_path = workspace.path().join("old.md");
+        let new_path = workspace.path().join("new.md");
+        fs::write(&old_path, "authorized content").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        authorize_file_inner(&state, old_path.clone()).unwrap();
+        let canonical_old = old_path.canonicalize().unwrap();
+        fs::rename(&canonical_old, &new_path).unwrap();
+        let canonical_new = new_path.canonicalize().unwrap();
+        let mut context = reconcile_context(&canonical_old, WorkspaceFileKind::Markdown);
+        context
+            .rename_candidates
+            .push((canonical_old.clone(), canonical_new.clone()));
+        let mut resolved = resolve_disk_state(&state, &context).unwrap();
+        let watch = ActiveDocumentWatchState::default();
+        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
+        let mut watch_state = watch.lock().unwrap();
+        let entry = watch_state.current.as_mut().unwrap();
+
+        finalize_authorization_transition(&state, entry, &mut resolved).unwrap();
+
+        assert_eq!(entry.path, canonical_new);
+        assert!(ensure_authorized_write_file_inner(&state, &entry.path).is_ok());
+        assert!(ensure_authorized_write_file_inner(&state, &canonical_old).is_err());
     }
 
     #[test]
@@ -1838,6 +1926,7 @@ mod tests {
                 mime_type: None,
                 bytes_base64: None,
             },
+            file_identity: "matching-identity".to_string(),
             reason: ActiveDocumentWatchReason::Changed,
             previous_path: None,
         };
@@ -1851,6 +1940,7 @@ mod tests {
                 mime_type: None,
                 bytes_base64: None,
             },
+            file_identity: "different-identity".to_string(),
             reason: ActiveDocumentWatchReason::Changed,
             previous_path: None,
         };

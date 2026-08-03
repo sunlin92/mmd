@@ -1320,7 +1320,12 @@ mod tests {
     };
     use crate::{
         models::{OpenCommitResult, OpenCommitStatus, RecentFilesSnapshot},
-        path_auth::FileAuthorizationSession,
+        path_auth::{
+            authorize_directory_root_inner, ensure_authorized_existing_file_inner,
+            ensure_authorized_write_file_inner, is_authorized_image_path,
+            open_authorized_existing_file_inner, FileAuthorizationSession,
+        },
+        state::AppState,
     };
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2344,6 +2349,115 @@ mod tests {
                 LockEvent::RecentRuntimeReleased,
             ]
         );
+    }
+
+    #[test]
+    fn committed_workspace_open_does_not_authorize_a_replacement_root() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let displaced = directory.path().join("displaced");
+        let document = root.join("note.md");
+        let asset = root.join("image.png");
+        fs::create_dir(&root).unwrap();
+        fs::write(&document, "authorized content").unwrap();
+        fs::write(&asset, b"authorized image").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, root.clone()).unwrap();
+        let opened = open_authorized_existing_file_inner(&state, &document).unwrap();
+        let recent = state_with(
+            directory.path().join("app-data"),
+            Arc::new(SystemRecentStoreAtomicReplacer),
+        );
+        let identifiers = recent
+            .issue_workspace_open(
+                "main",
+                opened
+                    .workspace_authorization()
+                    .expect("workspace reads carry their authorization"),
+            )
+            .unwrap();
+        drop(opened);
+
+        assert!(matches!(
+            recent
+                .commit_open(
+                    &identifiers.open_receipt,
+                    "main",
+                    state.file_authorization()
+                )
+                .unwrap(),
+            OpenCommitResult::Committed { .. }
+        ));
+        assert!(ensure_authorized_write_file_inner(&state, &document).is_ok());
+        assert!(is_authorized_image_path(&state, &asset.canonicalize().unwrap()).unwrap());
+
+        fs::rename(&canonical_root, &displaced).unwrap();
+        fs::create_dir(&canonical_root).unwrap();
+        fs::write(canonical_root.join("note.md"), "external secret").unwrap();
+        fs::write(canonical_root.join("image.png"), b"external image").unwrap();
+        let replacement_document = canonical_root.join("note.md");
+        let replacement_asset = canonical_root.join("image.png").canonicalize().unwrap();
+
+        assert!(ensure_authorized_existing_file_inner(&state, &replacement_document).is_err());
+        assert!(open_authorized_existing_file_inner(&state, &replacement_document).is_err());
+        assert!(ensure_authorized_write_file_inner(&state, &replacement_document).is_err());
+        assert!(state
+            .file_authorization()
+            .with_exact_write_authority(&replacement_document, |_, _| Ok(()))
+            .is_err());
+        assert!(!is_authorized_image_path(&state, &replacement_asset).unwrap());
+    }
+
+    #[test]
+    fn workspace_commit_does_not_transfer_write_authority_to_a_replaced_file() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let document = root.join("note.md");
+        let displaced = root.join("displaced.md");
+        fs::create_dir(&root).unwrap();
+        fs::write(&document, "authorized content").unwrap();
+        let state = Arc::new(AppState::default());
+        authorize_directory_root_inner(&state, root).unwrap();
+        let opened = open_authorized_existing_file_inner(&state, &document).unwrap();
+        let (replacer, replacement_entered, release_replacement) = PausingReplacer::new();
+        let recent = Arc::new(state_with(
+            directory.path().join("app-data"),
+            replacer.clone(),
+        ));
+        let identifiers = recent
+            .issue_workspace_open(
+                "main",
+                opened
+                    .workspace_authorization()
+                    .expect("workspace reads carry their authorization"),
+            )
+            .unwrap();
+        drop(opened);
+        replacer.pause_next_replacement();
+        let commit_recent = recent.clone();
+        let commit_state = state.clone();
+        let open_receipt = identifiers.open_receipt;
+        let commit = thread::spawn(move || {
+            commit_recent.commit_open(&open_receipt, "main", commit_state.file_authorization())
+        });
+        replacement_entered
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        fs::rename(&document, &displaced).unwrap();
+        fs::write(&document, "replacement content").unwrap();
+        release_replacement.send(()).unwrap();
+
+        assert!(matches!(
+            commit.join().unwrap().unwrap(),
+            OpenCommitResult::Committed { .. }
+        ));
+        assert!(ensure_authorized_write_file_inner(&state, &document).is_err());
+        assert!(state
+            .file_authorization()
+            .with_exact_write_authority(&document, |_, _| Ok(()))
+            .is_err());
     }
 
     #[test]

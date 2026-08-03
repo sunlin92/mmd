@@ -3164,14 +3164,15 @@ mod tests {
         fs::create_dir(&removed_root).unwrap();
         let removed_document = removed_root.join("index.html");
         let retained_document = workspace.path().join("retained.html");
+        let search_document = workspace.path().join("search.md");
         fs::write(&removed_document, "removed").unwrap();
         fs::write(&retained_document, "retained").unwrap();
+        fs::write(&search_document, "needle").unwrap();
         let canonical_removed_root = normalize_existing_path(&removed_root).unwrap();
         let canonical_removed_document = normalize_existing_path(&removed_document).unwrap();
         let canonical_retained_document = normalize_existing_path(&retained_document).unwrap();
         let state = AppState::default();
         let opened = open_directory_inner(&state, workspace.path()).unwrap();
-        fs::write(workspace.path().join("search.md"), "needle").unwrap();
         rebuild_workspace_index_inner(
             &state,
             &opened.workspace_token,
