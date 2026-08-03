@@ -6,15 +6,18 @@ use std::{
 };
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use walkdir::WalkDir;
 
 use crate::{
     commands::open_regular_file_without_following_links,
     workspace_file_kind::WorkspaceFileKind,
-    workspace_index::{CancellationToken, WorkspaceIndex},
+    workspace_index::{build_index, CancellationToken, IndexDocument, WorkspaceIndex},
+    workspace_snapshot::{is_excluded_walk_dir, MAX_WORKSPACE_INDEX_WALK_ENTRIES},
 };
 
 const MAX_ACTIVE_OPERATIONS: usize = 16;
 const MAX_OPERATION_DURATION: Duration = Duration::from_secs(30);
+const MAX_BUILD_RECONCILIATION_PASSES: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceIndexScope {
@@ -42,6 +45,7 @@ struct ActiveOperation {
 struct ActiveWorkspaceIndex {
     scope: WorkspaceIndexScope,
     index: Option<StoredWorkspaceIndex>,
+    dirty_during_build: bool,
 }
 
 trait WatchHandlePort: Send {
@@ -141,6 +145,7 @@ impl WorkspaceIndexRuntime {
             state.active = Some(ActiveWorkspaceIndex {
                 scope: scope.clone(),
                 index: None,
+                dirty_during_build: false,
             });
             let (cancellation, deadline) = new_deadline_bound_cancellation();
             state.operations.insert(
@@ -237,17 +242,46 @@ impl WorkspaceIndexRuntime {
         lease: &WorkspaceIndexLease,
         index: WorkspaceIndex,
     ) -> Result<bool, String> {
-        let mut state = self.lock()?;
-        let Some(active) = state.active.as_mut() else {
-            return Ok(false);
-        };
-        if !lease_matches(&active.scope, lease) || lease.is_cancelled() {
-            return Ok(false);
+        self.publish_rebuild_with_reconcile_hook(lease, index, || {})
+    }
+
+    fn publish_rebuild_with_reconcile_hook(
+        &self,
+        lease: &WorkspaceIndexLease,
+        index: WorkspaceIndex,
+        mut before_reconcile: impl FnMut(),
+    ) -> Result<bool, String> {
+        let index = Arc::new(index);
+        let mut reconciliation_passes = 0usize;
+        loop {
+            {
+                let mut state = self.lock()?;
+                let Some(active) = state.active.as_mut() else {
+                    return Ok(false);
+                };
+                if !lease_matches(&active.scope, lease) || lease.is_cancelled() {
+                    return Ok(false);
+                }
+                if !active.dirty_during_build {
+                    active.index = Some(StoredWorkspaceIndex {
+                        index: Arc::clone(&index),
+                    });
+                    return Ok(true);
+                }
+                if reconciliation_passes >= MAX_BUILD_RECONCILIATION_PASSES {
+                    drop(state);
+                    invalidate_exact_binding(&self.state, &lease_scope(lease), false);
+                    return Ok(false);
+                }
+                active.dirty_during_build = false;
+            }
+            reconciliation_passes = reconciliation_passes.saturating_add(1);
+            before_reconcile();
+            if !workspace_matches_index(&lease_scope(lease), &index, Some(lease)) {
+                invalidate_exact_binding(&self.state, &lease_scope(lease), false);
+                return Ok(false);
+            }
         }
-        active.index = Some(StoredWorkspaceIndex {
-            index: Arc::new(index),
-        });
-        Ok(true)
     }
 
     pub(crate) fn is_current(&self, lease: &WorkspaceIndexLease) -> Result<bool, String> {
@@ -376,6 +410,12 @@ fn handle_native_watch_result(
     scope: &WorkspaceIndexScope,
     result: Result<notify::Event, notify::Error>,
 ) {
+    if matches!(&result, Ok(event) if event.need_rescan()) {
+        if let Some(state) = state.upgrade() {
+            invalidate_exact_binding(&state, scope, false);
+        }
+        return;
+    }
     if matches!(&result, Ok(event) if event.kind.is_access()) {
         return;
     }
@@ -383,26 +423,38 @@ fn handle_native_watch_result(
         if event_paths_are_benign_directory_metadata(scope, event) {
             return;
         }
-        let published_index = state.upgrade().and_then(|state| {
-            state.lock().ok().and_then(|state| {
-                state
-                    .active
-                    .as_ref()
-                    .filter(|active| active.scope == *scope)
-                    .and_then(|active| active.index.as_ref())
-                    .map(|stored| Arc::clone(&stored.index))
-            })
-        });
-        if published_index
-            .as_ref()
-            .is_some_and(|index| event_paths_match_published_index(scope, index, &event.paths))
-        {
-            return;
+    }
+    let Some(state) = state.upgrade() else {
+        return;
+    };
+    if let Ok(event) = result {
+        let published_index = {
+            let Ok(mut state) = state.lock() else {
+                return;
+            };
+            let Some(active) = state
+                .active
+                .as_mut()
+                .filter(|active| active.scope == *scope)
+            else {
+                return;
+            };
+            if let Some(stored) = &active.index {
+                Some(Arc::clone(&stored.index))
+            } else if event_paths_are_relevant_before_publication(scope, &event.paths) {
+                active.dirty_during_build = true;
+                return;
+            } else {
+                None
+            }
+        };
+        if let Some(index) = published_index {
+            if event_paths_match_published_index(scope, &index, &event.paths) {
+                return;
+            }
         }
     }
-    if let Some(state) = state.upgrade() {
-        invalidate_exact_binding(&state, scope, false);
-    }
+    invalidate_exact_binding(&state, scope, false);
 }
 
 fn event_paths_are_benign_directory_metadata(
@@ -431,6 +483,126 @@ fn event_paths_match_published_index(
             .all(|path| event_path_matches_published_index(scope, index, path))
 }
 
+fn lease_scope(lease: &WorkspaceIndexLease) -> WorkspaceIndexScope {
+    WorkspaceIndexScope {
+        workspace_token: lease.workspace_token.clone(),
+        workspace_root: lease.workspace_root.clone(),
+        generation: lease.generation,
+    }
+}
+
+fn event_paths_are_relevant_before_publication(
+    scope: &WorkspaceIndexScope,
+    paths: &[PathBuf],
+) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.strip_prefix(&scope.workspace_root).is_ok()
+                && match std::fs::symlink_metadata(path) {
+                    Ok(metadata) => !metadata.file_type().is_symlink(),
+                    Err(_) => true,
+                }
+        })
+}
+
+fn workspace_matches_index(
+    scope: &WorkspaceIndexScope,
+    index: &WorkspaceIndex,
+    lease: Option<&WorkspaceIndexLease>,
+) -> bool {
+    let cancellation = lease
+        .map(|lease| lease.cancellation.clone())
+        .unwrap_or_else(|| new_deadline_bound_cancellation().0);
+    let Ok(root_metadata) = std::fs::symlink_metadata(&scope.workspace_root) else {
+        return false;
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return false;
+    }
+    let limits = index.limits();
+    let mut markdown_paths = Vec::new();
+    let entries = WalkDir::new(&scope.workspace_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_excluded_walk_dir(entry.path()));
+    let mut walked_entries = 0usize;
+    for entry in entries {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        walked_entries = walked_entries.saturating_add(1);
+        if walked_entries > MAX_WORKSPACE_INDEX_WALK_ENTRIES {
+            return false;
+        }
+        let file_type = entry.file_type();
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(&scope.workspace_root) else {
+            return false;
+        };
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        if WorkspaceFileKind::classify(Path::new(&relative_path))
+            != Some(WorkspaceFileKind::Markdown)
+        {
+            continue;
+        }
+        markdown_paths.push((relative_path, entry.into_path()));
+    }
+    markdown_paths.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut documents = Vec::new();
+    let mut eligible_files = 0usize;
+    let mut aggregate_bytes = 0usize;
+    for (relative_path, path) in markdown_paths {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        if eligible_files >= limits.max_files {
+            continue;
+        }
+        eligible_files = eligible_files.saturating_add(1);
+        let Ok(file) = open_regular_file_without_following_links(&path) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        let file_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if file_bytes > limits.max_file_bytes
+            || aggregate_bytes.saturating_add(file_bytes) > limits.max_aggregate_bytes
+        {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(file_bytes.min(limits.max_file_bytes));
+        let mut bounded = file.take((limits.max_file_bytes as u64).saturating_add(1));
+        if bounded.read_to_end(&mut bytes).is_err() || bytes.len() > limits.max_file_bytes {
+            continue;
+        }
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if aggregate_bytes.saturating_add(content.len()) > limits.max_aggregate_bytes {
+            continue;
+        }
+        aggregate_bytes = aggregate_bytes.saturating_add(content.len());
+        documents.push(IndexDocument {
+            relative_path,
+            content,
+        });
+    }
+
+    build_index(documents, limits, &cancellation)
+        .completed()
+        .is_some_and(|(rebuilt, _)| index.has_same_exact_documents(&rebuilt))
+}
+
 fn event_path_matches_published_index(
     scope: &WorkspaceIndexScope,
     index: &WorkspaceIndex,
@@ -445,21 +617,34 @@ fn event_path_matches_published_index(
     if metadata.file_type().is_symlink() {
         return false;
     }
+    if relative.components().any(|component| match component {
+        std::path::Component::Normal(name) => is_excluded_walk_dir(Path::new(name)),
+        _ => false,
+    }) {
+        return true;
+    }
     if metadata.is_dir() {
+        return workspace_matches_index(scope, index, None);
+    }
+    if !metadata.is_file() {
         return false;
     }
     let relative_path = relative.to_string_lossy().replace('\\', "/");
     if WorkspaceFileKind::classify(Path::new(&relative_path)) != Some(WorkspaceFileKind::Markdown) {
         return metadata.is_file();
     }
-    let Some(expected) = index.content_for_relative_path(&relative_path) else {
+    let Some(expected) = index.exact_content_for_relative_path(&relative_path) else {
         return false;
     };
+    file_matches_expected_content(path, expected, index.max_file_bytes())
+}
+
+fn file_matches_expected_content(path: &Path, expected: &str, max_file_bytes: usize) -> bool {
     let Ok(file) = open_regular_file_without_following_links(path) else {
         return false;
     };
-    let mut bytes = Vec::with_capacity(expected.len().min(index.max_file_bytes()));
-    let mut bounded = file.take((index.max_file_bytes() as u64).saturating_add(1));
+    let mut bytes = Vec::with_capacity(expected.len().min(max_file_bytes));
+    let mut bounded = file.take((max_file_bytes as u64).saturating_add(1));
     bounded.read_to_end(&mut bytes).is_ok() && bytes == expected.as_bytes()
 }
 
@@ -715,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_access_events_preserve_the_binding_while_other_results_invalidate_it() {
+    fn watcher_events_are_buffered_before_publication_but_errors_invalidate() {
         let directory = tempdir().unwrap();
 
         for (result, should_invalidate) in [
@@ -726,12 +911,17 @@ mod tests {
                 false,
             ),
             (
-                Ok(notify::Event::new(notify::EventKind::Modify(
-                    notify::event::ModifyKind::Any,
-                ))),
-                true,
+                Ok(
+                    notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                        .add_path(directory.path().to_path_buf()),
+                ),
+                false,
             ),
-            (Ok(notify::Event::new(notify::EventKind::Any)), true),
+            (
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(directory.path().to_path_buf())),
+                false,
+            ),
             (
                 Err(notify::Error::generic("injected watcher overflow")),
                 true,
@@ -757,6 +947,230 @@ mod tests {
                 Some(build.generation + u64::from(should_invalidate))
             );
         }
+    }
+
+    #[test]
+    fn watcher_rescan_always_cancels_the_build() {
+        for kind in [
+            notify::EventKind::Access(notify::event::AccessKind::Any),
+            notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                notify::event::MetadataKind::Any,
+            )),
+        ] {
+            let directory = tempdir().unwrap();
+            let runtime = WorkspaceIndexRuntime::default();
+            let build = runtime
+                .begin_rebuild("workspace-1", directory.path(), "build-1")
+                .unwrap();
+            let watcher = runtime.state.lock().unwrap().watcher.take();
+            stop_watch(watcher);
+            let scope = lease_scope(&build);
+
+            handle_native_watch_result(
+                &Arc::downgrade(&runtime.state),
+                &scope,
+                Ok(notify::Event::new(kind).set_flag(notify::event::Flag::Rescan)),
+            );
+
+            assert!(build.cancellation.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn watcher_event_storm_coalesces_into_one_bounded_reconciliation() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let document = root.join("note.md");
+        std::fs::write(&document, "needle").unwrap();
+        std::fs::write(
+            root.join("oversized.md"),
+            vec![b'x'; IndexLimits::default().max_file_bytes + 1],
+        )
+        .unwrap();
+        std::fs::write(root.join("invalid.md"), [0xff, 0xfe]).unwrap();
+        let runtime = WorkspaceIndexRuntime::default();
+        let build = runtime
+            .begin_rebuild("workspace-1", &root, "build-1")
+            .unwrap();
+        let watcher = runtime.state.lock().unwrap().watcher.take();
+        stop_watch(watcher);
+        let scope = lease_scope(&build);
+
+        for _ in 0..10_000 {
+            handle_native_watch_result(
+                &Arc::downgrade(&runtime.state),
+                &scope,
+                Ok(
+                    notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                        notify::event::DataChange::Content,
+                    )))
+                    .add_path(document.clone()),
+                ),
+            );
+        }
+
+        assert!(!build.cancellation.is_cancelled());
+        let (index, _) = index();
+        assert!(runtime.publish_rebuild(&build, index).unwrap());
+    }
+
+    #[test]
+    fn event_arriving_during_reconciliation_is_checked_before_publication() {
+        use std::sync::Barrier;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let document = root.join("note.md");
+        std::fs::write(&document, "needle").unwrap();
+        let runtime = Arc::new(WorkspaceIndexRuntime::default());
+        let build = runtime
+            .begin_rebuild("workspace-1", &root, "build-1")
+            .unwrap();
+        let watcher = runtime.state.lock().unwrap().watcher.take();
+        stop_watch(watcher);
+        let scope = lease_scope(&build);
+        let event = || {
+            Ok(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(document.clone()),
+            )
+        };
+        handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, event());
+
+        let entered = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+        let publisher = Arc::clone(&runtime);
+        let publisher_entered = Arc::clone(&entered);
+        let publisher_proceed = Arc::clone(&proceed);
+        let result = std::thread::spawn(move || {
+            let (index, _) = index();
+            let mut first_pass = true;
+            publisher.publish_rebuild_with_reconcile_hook(&build, index, || {
+                if first_pass {
+                    first_pass = false;
+                    publisher_entered.wait();
+                    publisher_proceed.wait();
+                }
+            })
+        });
+
+        entered.wait();
+        handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, event());
+        proceed.wait();
+
+        assert!(result.join().unwrap().unwrap());
+        assert!(runtime
+            .is_result_current("workspace-1", &root, scope.generation)
+            .unwrap());
+    }
+
+    #[test]
+    fn continuous_build_events_fail_closed_after_bounded_reconciliation() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let document = root.join("note.md");
+        std::fs::write(&document, "needle").unwrap();
+        let runtime = WorkspaceIndexRuntime::default();
+        let build = runtime
+            .begin_rebuild("workspace-1", &root, "build-1")
+            .unwrap();
+        let watcher = runtime.state.lock().unwrap().watcher.take();
+        stop_watch(watcher);
+        let scope = lease_scope(&build);
+        let event = || {
+            Ok(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(document.clone()),
+            )
+        };
+        handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, event());
+
+        let (index, _) = index();
+        assert!(!runtime
+            .publish_rebuild_with_reconcile_hook(&build, index, || {
+                handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, event());
+            })
+            .unwrap());
+        assert!(build.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn publish_reconciles_buffered_file_and_directory_events() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let document = root.join("note.md");
+        std::fs::write(&document, "needle").unwrap();
+        let runtime = WorkspaceIndexRuntime::default();
+        let build = runtime
+            .begin_rebuild("workspace-1", &root, "build-1")
+            .unwrap();
+        let watcher = runtime.state.lock().unwrap().watcher.take();
+        stop_watch(watcher);
+        let scope = lease_scope(&build);
+
+        for event in [
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(document),
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::Folder))
+                .add_path(root.clone()),
+        ] {
+            handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, Ok(event));
+        }
+
+        let (index, _) = index();
+        assert!(runtime.publish_rebuild(&build, index).unwrap());
+        assert!(runtime
+            .is_result_current("workspace-1", &root, build.generation)
+            .unwrap());
+        let root_replay = || {
+            Ok(
+                notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder))
+                    .add_path(root.clone()),
+            )
+        };
+        handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, root_replay());
+        assert!(runtime
+            .is_result_current("workspace-1", &root, build.generation)
+            .unwrap());
+
+        std::fs::write(root.join("new.md"), "not indexed").unwrap();
+        handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, root_replay());
+        assert!(!runtime
+            .is_result_current("workspace-1", &root, build.generation)
+            .unwrap());
+    }
+
+    #[test]
+    fn publish_rejects_buffered_events_that_do_not_match_the_rebuilt_index() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let document = root.join("note.md");
+        std::fs::write(&document, "changed").unwrap();
+        let runtime = WorkspaceIndexRuntime::default();
+        let build = runtime
+            .begin_rebuild("workspace-1", &root, "build-1")
+            .unwrap();
+        let watcher = runtime.state.lock().unwrap().watcher.take();
+        stop_watch(watcher);
+        let scope = lease_scope(&build);
+        handle_native_watch_result(
+            &Arc::downgrade(&runtime.state),
+            &scope,
+            Ok(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(document),
+            ),
+        );
+
+        let (index, _) = index();
+        assert!(!runtime.publish_rebuild(&build, index).unwrap());
+        assert!(build.cancellation.is_cancelled());
     }
 
     #[test]
@@ -789,6 +1203,16 @@ mod tests {
             &Arc::downgrade(&runtime.state),
             &scope,
             directory_metadata_event(),
+        );
+        assert!(!build.cancellation.is_cancelled());
+
+        handle_native_watch_result(
+            &Arc::downgrade(&runtime.state),
+            &scope,
+            Ok(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(document.clone()),
+            ),
         );
         assert!(!build.cancellation.is_cancelled());
 

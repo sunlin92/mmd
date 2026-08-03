@@ -1506,6 +1506,14 @@ pub(crate) fn read_file_inner(
     state: &AppState,
     path: impl AsRef<Path>,
 ) -> Result<OpenFileResponse, String> {
+    read_file_with_before_open_inner(state, path, || {})
+}
+
+fn read_file_with_before_open_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+    before_open: impl FnOnce(),
+) -> Result<OpenFileResponse, String> {
     let path = ensure_authorized_existing_file_inner(state, path)?;
     let kind = WorkspaceFileKind::classify(&path)
         .filter(|kind| kind.is_editable())
@@ -1515,7 +1523,8 @@ pub(crate) fn read_file_inner(
     if !kind.is_editable() {
         return Err("Only Markdown, HTML, and Excalidraw files can be read as text".into());
     }
-    kind.open_response(&path)
+    before_open();
+    open_authorized_file_response(path)
 }
 
 fn validate_editable_content(path: &Path, content: &str, action: &str) -> Result<(), String> {
@@ -2371,7 +2380,7 @@ fn create_workspace_file_with_kind_and_ports_inner(
         }
     };
     let committed_path = file.into_path();
-    let committed = match kind.open_response(&committed_path) {
+    let committed = match open_authorized_file_response(committed_path.clone()) {
         Ok(response) => response,
         Err(error) => {
             return Ok(MutationOutcome::Indeterminate {
@@ -4161,6 +4170,18 @@ mod tests {
         );
 
         assert!(result.is_err());
+
+        let reread_nested = workspace.path().join("reread-nested");
+        let reread_moved = workspace.path().join("reread-moved");
+        fs::create_dir(&reread_nested).unwrap();
+        fs::write(reread_nested.join("note.md"), "authorized reread").unwrap();
+        let reread =
+            read_file_with_before_open_inner(&state, reread_nested.join("note.md"), || {
+                fs::rename(&reread_nested, &reread_moved).unwrap();
+                replace_directory_with_test_link(&reread_nested, outside.path());
+            });
+
+        assert!(reread.is_err());
     }
 
     #[test]
@@ -4304,7 +4325,7 @@ mod tests {
         open_standalone_file_with_ports_inner(
             &state,
             &markdown,
-            |path| WorkspaceFileKind::Markdown.open_response(path),
+            |path| open_authorized_file_response(path.to_path_buf()),
             |_| Ok(()),
         )
         .unwrap();

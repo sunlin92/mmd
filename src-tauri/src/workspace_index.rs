@@ -79,12 +79,30 @@ impl WorkspaceIndex {
             .collect()
     }
 
-    pub(crate) fn content_for_relative_path(&self, relative_path: &str) -> Option<&str> {
+    pub(crate) fn exact_content_for_relative_path(&self, relative_path: &str) -> Option<&str> {
         let normalized_path = normalize_for_search(relative_path);
         self.documents
             .binary_search_by(|document| document.normalized_path.cmp(&normalized_path))
             .ok()
-            .map(|index| self.documents[index].content.as_str())
+            .and_then(|index| {
+                let document = &self.documents[index];
+                (document.relative_path == relative_path).then_some(document.content.as_str())
+            })
+    }
+
+    pub(crate) fn has_same_exact_documents(&self, other: &Self) -> bool {
+        self.documents.len() == other.documents.len()
+            && self
+                .documents
+                .iter()
+                .zip(&other.documents)
+                .all(|(left, right)| {
+                    left.relative_path == right.relative_path && left.content == right.content
+                })
+    }
+
+    pub(crate) fn limits(&self) -> IndexLimits {
+        self.limits
     }
 
     pub(crate) fn max_file_bytes(&self) -> usize {

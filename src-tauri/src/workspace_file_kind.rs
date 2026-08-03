@@ -3,8 +3,7 @@ use std::{fs::File, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    durable_write::{read_versioned_file, read_versioned_open_file},
-    excalidraw_scene::validate_excalidraw_scene,
+    durable_write::read_versioned_open_file, excalidraw_scene::validate_excalidraw_scene,
     models::OpenFileResponse,
 };
 
@@ -134,42 +133,6 @@ impl WorkspaceFileKind {
         matches!(self, Self::Pdf | Self::Docx)
     }
 
-    pub(crate) fn open_response(self, path: &Path) -> Result<OpenFileResponse, String> {
-        if !path.is_file() {
-            return Err("Path is not a file".to_string());
-        }
-        if self.requires_embedded_bytes() {
-            return Err("PDF and DOCX responses require validated binary bytes".to_string());
-        }
-        let content_mode = self.content_mode();
-        let (content, file_version) = match content_mode {
-            ContentMode::Text => {
-                let observed = read_versioned_file(path, usize::MAX)
-                    .map_err(|error| format!("Failed to read stable file contents: {error}"))?
-                    .ok_or_else(|| "Path is not a file".to_string())?;
-                let content = String::from_utf8(observed.bytes)
-                    .map_err(|_| "Failed to read file: content is not valid UTF-8".to_string())?;
-                (Some(content), Some(observed.version))
-            }
-            ContentMode::Binary => (None, None),
-        };
-        if self == Self::Excalidraw {
-            let scene = content
-                .as_deref()
-                .ok_or_else(|| "Excalidraw scene response requires text content".to_string())?;
-            validate_excalidraw_scene(scene)?;
-        }
-        Ok(OpenFileResponse {
-            kind: self,
-            path: path.to_string_lossy().to_string(),
-            content_mode,
-            file_version,
-            content,
-            mime_type: self.mime_type(path),
-            bytes_base64: None,
-        })
-    }
-
     pub(crate) fn open_response_from_handle(
         self,
         path: &Path,
@@ -209,7 +172,7 @@ impl WorkspaceFileKind {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, fs::File, path::Path};
 
     use super::{ContentMode, WorkspaceFileKind};
     use tempfile::tempdir;
@@ -454,7 +417,9 @@ mod tests {
             fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
             let kind = WorkspaceFileKind::classify(&path).unwrap();
 
-            let response = kind.open_response(&path).unwrap();
+            let response = kind
+                .open_response_from_handle(&path, File::open(&path).unwrap())
+                .unwrap();
 
             assert_eq!(kind, expected_kind);
             assert_eq!(response.kind, expected_kind);
