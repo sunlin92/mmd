@@ -1025,6 +1025,7 @@ impl RecentFilesState {
                 pending.workspace_authorization.as_ref(),
                 |grant| {
                     self.store.persist_locked(&promoted)?;
+                    grant.apply()?;
                     runtime.apply_terminal_outcome(
                         prepared_outcome
                             .take()
@@ -1033,7 +1034,6 @@ impl RecentFilesState {
                             recent_files: retained_snapshot,
                         },
                     );
-                    grant.apply();
                     Ok((snapshot, post_commit_target))
                 },
             )
@@ -2451,7 +2451,7 @@ mod tests {
 
         assert!(matches!(
             commit.join().unwrap().unwrap(),
-            OpenCommitResult::Committed { .. }
+            OpenCommitResult::NotCommitted { .. }
         ));
         assert!(ensure_authorized_write_file_inner(&state, &document).is_err());
         assert!(state

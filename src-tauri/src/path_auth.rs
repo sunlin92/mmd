@@ -323,6 +323,7 @@ pub(crate) struct WorkspaceReadAuthorization {
     relative: PathBuf,
     token: WorkspaceToken,
     root_binding: WorkspaceRootBinding,
+    file_binding: Arc<fs::File>,
     file_identity: String,
 }
 
@@ -587,6 +588,11 @@ fn workspace_read_authorization_is_current(
     state: &AuthorizationState,
     authorization: &WorkspaceReadAuthorization,
 ) -> bool {
+    if !opened_file_platform_identity(&authorization.file_binding)
+        .is_ok_and(|identity| identity == authorization.file_identity)
+    {
+        return false;
+    }
     let workspace_is_current =
         state
             .workspaces
@@ -780,6 +786,10 @@ pub(crate) struct SaveAuthorizationScope<'a> {
     path: PathBuf,
 }
 
+pub(crate) struct SaveIdentityOrigins {
+    document_ids: Vec<DocumentGrantId>,
+}
+
 impl SaveAuthorizationScope<'_> {
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -806,9 +816,48 @@ impl SaveAuthorizationScope<'_> {
                 .is_some_and(|reservation| reservation.path == self.path)
     }
 
-    pub(crate) fn refresh_document_origin_identities(&mut self) {
-        self.state
-            .refresh_document_origin_identities_for_path(&self.path);
+    pub(crate) fn capture_identity_origins(&self) -> SaveIdentityOrigins {
+        let document_ids = self
+            .state
+            .grants
+            .get(&GrantKey::ExactReadWrite(self.path.clone()))
+            .into_iter()
+            .filter(|ledger| ledger.is_active())
+            .flat_map(|ledger| ledger.origins.keys())
+            .filter_map(|origin| match origin {
+                GrantOrigin::OpenDocument(id)
+                    if self.state.document_origin_identities.contains_key(id)
+                        && exact_origin_is_current_for_path(self.state, &self.path, origin) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        SaveIdentityOrigins { document_ids }
+    }
+
+    pub(crate) fn settle_identity_origins(
+        &mut self,
+        origins: &SaveIdentityOrigins,
+        platform_identity: &str,
+    ) -> Result<(), String> {
+        let changes = origins.document_ids.iter().any(|id| {
+            self.state
+                .document_origin_identities
+                .get(id)
+                .is_some_and(|identity| identity != platform_identity)
+        });
+        if !changes {
+            return Ok(());
+        }
+        self.state.advance_authorization_generation()?;
+        for id in &origins.document_ids {
+            if let Some(identity) = self.state.document_origin_identities.get_mut(id) {
+                *identity = platform_identity.to_string();
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn publish_pending(&mut self, pending: &PendingSaveAuthority) {
@@ -938,6 +987,7 @@ pub(crate) enum PreparedWorkspaceSettlement {
 pub(crate) struct PreparedOpenDocumentGrant<'a> {
     state: AuthorizationGuard<'a>,
     mutations: Vec<PreparedGrantMutation>,
+    workspace_authorization: Option<WorkspaceReadAuthorization>,
     workspace_document_origin: Option<(DocumentGrantId, WorkspaceToken)>,
     document_origin_identity: Option<(DocumentGrantId, String)>,
     next_document_grant_id: u64,
@@ -946,7 +996,16 @@ pub(crate) struct PreparedOpenDocumentGrant<'a> {
 }
 
 impl PreparedOpenDocumentGrant<'_> {
-    pub(crate) fn apply(mut self) {
+    pub(crate) fn apply(mut self) -> Result<(), String> {
+        if self
+            .workspace_authorization
+            .as_ref()
+            .is_some_and(|authorization| {
+                !workspace_read_authorization_is_current(&self.state, authorization)
+            })
+        {
+            return Err("Workspace file identity changed before open was committed".to_string());
+        }
         self.state.next_document_grant_id = self.next_document_grant_id;
         self.state.next_grant_sequence = self.next_grant_sequence;
         self.state.authorization_generation = self.next_authorization_generation;
@@ -981,6 +1040,7 @@ impl PreparedOpenDocumentGrant<'_> {
                 .insert(document_id, file_identity);
             debug_assert!(replaced.is_none());
         }
+        Ok(())
     }
 }
 
@@ -1402,32 +1462,6 @@ impl AuthorizationState {
         }
     }
 
-    fn refresh_document_origin_identities_for_path(&mut self, path: &Path) {
-        let document_ids = self
-            .grants
-            .get(&GrantKey::ExactReadWrite(path.to_path_buf()))
-            .into_iter()
-            .flat_map(|ledger| ledger.origins.keys())
-            .filter_map(|origin| match origin {
-                GrantOrigin::OpenDocument(id)
-                    if self.document_origin_identities.contains_key(id) =>
-                {
-                    Some(*id)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for id in document_ids {
-            if let Some(identity) = current_file_identity_for_origin(
-                self,
-                path,
-                self.workspace_document_origins.get(&id),
-            ) {
-                self.document_origin_identities.insert(id, identity);
-            }
-        }
-    }
-
     #[cfg(test)]
     fn revoke_origin(
         &mut self,
@@ -1519,12 +1553,7 @@ impl AuthorizationState {
         if old_prefix == new_prefix {
             return Ok(HashSet::new());
         }
-        let identity_bound_documents = if let Some(expected_identity) = expected_identity {
-            let current_identity = current_file_identity_for_origin(self, new_prefix, None)
-                .ok_or_else(|| "Renamed document could not be securely reidentified".to_string())?;
-            if current_identity != expected_identity {
-                return Err("Renamed document identity changed before authorization moved".into());
-            }
+        let unbound_documents = if expected_identity.is_some() {
             let document_ids = self
                 .grants
                 .iter()
@@ -1538,16 +1567,17 @@ impl AuthorizationState {
                     _ => None,
                 })
                 .collect::<HashSet<_>>();
-            let additional = document_ids
+            let unbound = document_ids
                 .iter()
                 .filter(|id| !self.document_origin_identities.contains_key(id))
-                .count();
+                .copied()
+                .collect::<Vec<_>>();
             self.document_origin_identities
-                .try_reserve(additional)
+                .try_reserve(unbound.len())
                 .map_err(|_| "Cannot reserve renamed document identity provenance".to_string())?;
-            document_ids
+            unbound
         } else {
-            HashSet::new()
+            Vec::new()
         };
         let invalidates_preview = self.grants.values().any(|ledger| {
             ledger.origins.keys().any(|origin| {
@@ -1606,7 +1636,7 @@ impl AuthorizationState {
             }
         }
         if let Some(expected_identity) = expected_identity {
-            for document_id in identity_bound_documents {
+            for document_id in unbound_documents {
                 self.document_origin_identities
                     .insert(document_id, expected_identity.to_string());
             }
@@ -2564,6 +2594,7 @@ impl FileAuthorizationSession {
         operation(PreparedOpenDocumentGrant {
             state,
             mutations,
+            workspace_authorization: workspace_authorization.cloned(),
             workspace_document_origin,
             document_origin_identity,
             next_document_grant_id,
@@ -2813,12 +2844,19 @@ impl FileAuthorizationSession {
                         canonical.display()
                     )
                 })?;
+                let file_binding = Arc::new(file.try_clone().map_err(|error| {
+                    format!(
+                        "Failed to retain securely opened file {}: {error}",
+                        canonical.display()
+                    )
+                })?);
                 let workspace_authorization = WorkspaceReadAuthorization {
                     path: canonical.clone(),
                     root,
                     relative,
                     token,
                     root_binding: binding,
+                    file_binding,
                     file_identity,
                 };
                 (file, Some(workspace_authorization))
@@ -3384,13 +3422,29 @@ impl FileAuthorizationSession {
         expected_identity: &str,
     ) -> Result<HashSet<PreviewLeaseId>, String> {
         let mut state = self.lock()?;
+        let current_identity = current_file_identity_for_origin(&state, new_prefix, None)
+            .ok_or_else(|| "Renamed document could not be securely reidentified".to_string())?;
+        if current_identity != expected_identity {
+            return Err("Renamed document identity changed before authorization moved".into());
+        }
         state.relocate_path_prefix_with_identity(old_prefix, new_prefix, Some(expected_identity))
     }
 
-    fn refresh_document_origin_identities(&self, path: &Path) -> Result<(), String> {
+    fn relocate_path_prefix_with_workspace_authorization(
+        &self,
+        old_prefix: &Path,
+        new_prefix: &Path,
+        expected_identity: &str,
+        authorization: &WorkspaceReadAuthorization,
+    ) -> Result<HashSet<PreviewLeaseId>, String> {
         let mut state = self.lock()?;
-        state.refresh_document_origin_identities_for_path(path);
-        Ok(())
+        if authorization.path != new_prefix
+            || authorization.file_identity != expected_identity
+            || !workspace_read_authorization_is_current(&state, authorization)
+        {
+            return Err("Renamed document identity changed before authorization moved".into());
+        }
+        state.relocate_path_prefix_with_identity(old_prefix, new_prefix, Some(expected_identity))
     }
 
     fn revoke_path_prefix(&self, prefix: &Path) -> Result<HashSet<PreviewLeaseId>, String> {
@@ -3695,12 +3749,7 @@ fn write_authorized_document_with_preview_inner(
 ) -> Result<AuthorizedWriteOutcome, String> {
     let path = state.file_authorization().write_document(path, preflight)?;
     match write(&path) {
-        Ok(()) => {
-            let _ = state
-                .file_authorization()
-                .refresh_document_origin_identities(&path);
-            Ok(AuthorizedWriteOutcome::Committed(path))
-        }
+        Ok(()) => Ok(AuthorizedWriteOutcome::Committed(path)),
         Err(recovery_message) => Ok(reconcile_indeterminate_write_with_preview_inner(
             state,
             path,
@@ -4072,6 +4121,30 @@ pub(crate) fn relocate_authorized_path_prefix_with_identity_inner(
     )
 }
 
+pub(crate) fn relocate_authorized_path_prefix_with_workspace_authorization_inner(
+    state: &AppState,
+    old_prefix: &Path,
+    new_prefix: &Path,
+    expected_identity: &str,
+    authorization: &WorkspaceReadAuthorization,
+) -> Result<(), String> {
+    apply_authorization_then_preview_invalidation(
+        || {
+            state
+                .file_authorization()
+                .relocate_path_prefix_with_workspace_authorization(
+                    old_prefix,
+                    new_prefix,
+                    expected_identity,
+                    authorization,
+                )
+        },
+        |invalidated_preview_leases| {
+            invalidate_preview_leases_after_authorization(state, &invalidated_preview_leases)
+        },
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn commit_indeterminate_delete_inner(
     state: &AppState,
@@ -4353,7 +4426,11 @@ pub(crate) fn preview_lease_support_statuses_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html_preview_server::prepare_html_preview_inner;
+    use crate::{
+        document_save::{DocumentSaveCoordinator, DocumentSaveDisposition, MAIN_SAVE_OWNER},
+        durable_write::capture_file_version,
+        html_preview_server::prepare_html_preview_inner,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -4388,6 +4465,56 @@ mod tests {
         assert!(!authorization
             .is_authorized_preview_asset(&canonical_root.join("note.md"))
             .unwrap());
+    }
+
+    #[test]
+    fn save_does_not_refresh_a_stale_workspace_origin_through_a_standalone_origin() {
+        let directory = tempdir().unwrap();
+        let document = directory.path().join("note.md");
+        let displaced = directory.path().join("displaced.md");
+        fs::write(&document, "workspace object").unwrap();
+        let state = AppState::default();
+        state
+            .file_authorization()
+            .authorize_directory_root(directory.path())
+            .unwrap();
+        let workspace_open = state
+            .file_authorization()
+            .open_workspace_file(&document)
+            .unwrap();
+
+        fs::rename(&document, &displaced).unwrap();
+        fs::write(&document, "standalone replacement").unwrap();
+        let standalone_open = state
+            .file_authorization()
+            .authorize_file(&document)
+            .unwrap();
+        let expected = capture_file_version(&document).unwrap().unwrap();
+
+        let disposition = DocumentSaveCoordinator::default()
+            .save_expected(
+                state.file_authorization(),
+                &document,
+                b"saved replacement",
+                expected,
+                "mixed-origin-save",
+                MAIN_SAVE_OWNER,
+            )
+            .unwrap();
+        assert!(matches!(
+            disposition,
+            DocumentSaveDisposition::ConfirmedCommitted { .. }
+        ));
+
+        state
+            .file_authorization()
+            .revoke_authorized_file(&standalone_open)
+            .unwrap();
+        assert!(state
+            .file_authorization()
+            .with_exact_write_authority(&document, |_, _| Ok(()))
+            .is_err());
+        drop(workspace_open);
     }
 
     #[test]
@@ -4653,7 +4780,7 @@ mod tests {
         state
             .file_authorization()
             .with_prepared_open_document_grant(&canonical_document, |prepared| {
-                prepared.apply();
+                prepared.apply().unwrap();
                 Ok(())
             })
             .unwrap();
@@ -4699,7 +4826,7 @@ mod tests {
         state
             .file_authorization()
             .with_prepared_open_document_grant(&canonical, |grant| {
-                grant.apply();
+                grant.apply().unwrap();
                 Ok(())
             })
             .unwrap();

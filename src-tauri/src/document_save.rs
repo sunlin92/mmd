@@ -12,7 +12,9 @@ use crate::{
     durable_write::{
         capture_file_version, durable_write, DurableWriteOutcome, ExpectedFileState, FileVersion,
     },
-    path_auth::{FileAuthorizationSession, PendingSaveAuthority, SaveAuthorizationScope},
+    path_auth::{
+        FileAuthorizationSession, PendingSaveAuthority, SaveAuthorizationScope, SaveIdentityOrigins,
+    },
 };
 
 const OVERWRITE_TOKEN_TTL: Duration = Duration::from_secs(60);
@@ -248,6 +250,7 @@ impl DocumentSaveCoordinator {
                     overwrite_token: Some(overwrite_token),
                 });
             }
+            let identity_origins = scope.capture_identity_origins();
             let outcome = self.writer.write(scope.path(), bytes, &expected);
             if pending.is_some() {
                 if let Ok(DurableWriteOutcome::Conflict {
@@ -269,7 +272,7 @@ impl DocumentSaveCoordinator {
                     });
                 }
             }
-            self.finish_write(scope, pending, outcome)
+            self.finish_write(scope, pending, &identity_origins, outcome)
         })
     }
 
@@ -461,8 +464,9 @@ impl DocumentSaveCoordinator {
                     version: record.observed_version,
                 };
                 let path = scope.path().to_path_buf();
+                let identity_origins = scope.capture_identity_origins();
                 let outcome = self.writer.write(scope.path(), bytes, &expected);
-                self.finish_write(scope, pending.as_ref(), outcome)
+                self.finish_write(scope, pending.as_ref(), &identity_origins, outcome)
                     .map(|disposition| (path, disposition))
             })
         })();
@@ -486,6 +490,7 @@ impl DocumentSaveCoordinator {
         &self,
         scope: &mut SaveAuthorizationScope<'_>,
         pending: Option<&PendingSaveAuthority>,
+        identity_origins: &SaveIdentityOrigins,
         outcome: io::Result<DurableWriteOutcome>,
     ) -> Result<DocumentSaveDisposition, String> {
         let outcome = match outcome {
@@ -496,11 +501,11 @@ impl DocumentSaveCoordinator {
             },
         };
         match &outcome {
-            DurableWriteOutcome::ConfirmedCommitted { .. } => {
+            DurableWriteOutcome::ConfirmedCommitted { version, .. } => {
                 if let Some(pending) = pending {
                     scope.publish_pending(pending);
                 }
-                scope.refresh_document_origin_identities();
+                scope.settle_identity_origins(identity_origins, version.platform_identity())?;
             }
             DurableWriteOutcome::Indeterminate { .. } => {
                 if let Some(pending) = pending {
@@ -552,7 +557,10 @@ fn random_token_id() -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::{
-        path_auth::{authorize_directory_root_inner, authorize_workspace_file_inner},
+        path_auth::{
+            authorize_directory_root_inner, authorize_workspace_file_inner,
+            ensure_authorized_write_file_inner,
+        },
         state::AppState,
     };
     use std::{
@@ -600,6 +608,8 @@ mod tests {
 
     struct CommitThenRemoveWriter;
 
+    struct CommitThenReplaceWriter;
+
     impl DocumentWriter for NotCommittedWriter {
         fn write(
             &self,
@@ -629,6 +639,21 @@ mod tests {
                 version,
                 displaced_path: None,
             })
+        }
+    }
+
+    impl DocumentWriter for CommitThenReplaceWriter {
+        fn write(
+            &self,
+            destination: &Path,
+            bytes: &[u8],
+            expected: &ExpectedFileState,
+        ) -> io::Result<DurableWriteOutcome> {
+            let outcome = durable_write(destination, bytes, expected)?;
+            let displaced = destination.with_extension("committed");
+            fs::rename(destination, displaced)?;
+            fs::write(destination, b"external replacement")?;
+            Ok(outcome)
         }
     }
 
@@ -754,6 +779,42 @@ mod tests {
         }
 
         assert_eq!(fs::read(&path).unwrap(), b"second");
+    }
+
+    #[test]
+    fn confirmed_save_does_not_bind_authority_to_a_post_commit_replacement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, b"old").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+        authorize_workspace_file_inner(&state, &path).unwrap();
+        let authorization = state.file_authorization();
+        let generation_before = authorization.authorization_generation().unwrap();
+        let expected = capture_file_version(&path).unwrap().unwrap();
+        let coordinator = DocumentSaveCoordinator::with_ports(
+            Arc::new(CommitThenReplaceWriter),
+            Arc::new(SystemMonotonicClock),
+        );
+
+        let outcome = coordinator
+            .save_expected(
+                authorization,
+                &path,
+                b"committed content",
+                expected,
+                "op-replaced",
+                MAIN_SAVE_OWNER,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DocumentSaveDisposition::ConfirmedCommitted { .. }
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"external replacement");
+        assert!(ensure_authorized_write_file_inner(&state, &path).is_err());
+        assert!(authorization.authorization_generation().unwrap() > generation_before);
     }
 
     #[test]

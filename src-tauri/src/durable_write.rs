@@ -121,6 +121,10 @@ impl FileVersion {
         self.length
     }
 
+    pub(crate) fn platform_identity(&self) -> &str {
+        &self.platform_identity
+    }
+
     pub(crate) fn opaque_token(&self) -> String {
         let mut digest = Sha256::new();
         let length = self.length.to_string();

@@ -1,7 +1,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::{
     commands::{open_authorized_file_response_from_handle, opened_file_platform_identity},
+    durable_write::FileVersion,
     models::{
         ActiveDocumentDiskSnapshot, ActiveDocumentWatchEvent, ActiveDocumentWatchEventPayload,
         ActiveDocumentWatchHealthStatus, ActiveDocumentWatchReason,
@@ -25,8 +26,9 @@ use crate::{
     },
     path_auth::{
         ensure_authorized_existing_file_inner, ensure_authorized_watch_file_inner,
-        open_authorized_existing_file_inner, relocate_authorized_path_prefix_with_identity_inner,
-        revoke_authorized_path_prefix_inner,
+        open_authorized_existing_file_inner,
+        relocate_authorized_path_prefix_with_workspace_authorization_inner,
+        revoke_authorized_path_prefix_inner, WorkspaceReadAuthorization,
     },
     state::AppState,
     workspace_file_kind::WorkspaceFileKind,
@@ -89,6 +91,8 @@ struct WatchEntry {
     sequence: u64,
     path: PathBuf,
     parent: PathBuf,
+    file_identity: Option<String>,
+    file_binding: Option<Arc<fs::File>>,
     file_kind: WorkspaceFileKind,
     phase: WatchPhase,
     activation_reconcile_required: bool,
@@ -149,6 +153,8 @@ enum DiskRead {
     Present {
         file: OpenFileResponse,
         file_identity: String,
+        file_binding: Arc<fs::File>,
+        workspace_authorization: Option<WorkspaceReadAuthorization>,
     },
     Missing,
 }
@@ -157,6 +163,8 @@ enum ResolvedDisk {
     Present {
         file: OpenFileResponse,
         file_identity: String,
+        file_binding: Arc<fs::File>,
+        workspace_authorization: Option<WorkspaceReadAuthorization>,
         reason: ActiveDocumentWatchReason,
         previous_path: Option<PathBuf>,
     },
@@ -247,6 +255,8 @@ impl ActiveDocumentWatchState {
             sequence: 0,
             path,
             parent,
+            file_identity: None,
+            file_binding: None,
             file_kind,
             phase: WatchPhase::PendingActivation,
             activation_reconcile_required: false,
@@ -299,6 +309,8 @@ impl ActiveDocumentWatchState {
         &self,
         watch_id: &str,
         snapshot: ActiveDocumentDiskSnapshot,
+        file_identity: Option<String>,
+        file_binding: Option<Arc<fs::File>>,
     ) -> Result<ActiveDocumentWatchRegistration, String> {
         let mut state = self.lock()?;
         let entry = state
@@ -315,6 +327,8 @@ impl ActiveDocumentWatchState {
             entry.preview_revision = *preview_revision;
         }
         entry.last_snapshot = Some(snapshot.clone());
+        entry.file_identity = file_identity;
+        entry.file_binding = file_binding;
         Ok(ActiveDocumentWatchRegistration {
             protocol_version: ACTIVE_DOCUMENT_WATCH_PROTOCOL_VERSION,
             watch_id: entry.watch_id.clone(),
@@ -832,9 +846,37 @@ impl ActiveDocumentWatchState {
         &self,
         app: &AppHandle,
         token: AppWriteToken,
-        committed: bool,
+        committed_version: Option<&FileVersion>,
     ) {
-        if let Some(watch_id) = self.settle_app_write(token, committed) {
+        let committed_binding = committed_version.and_then(|version| {
+            let path = self
+                .inner
+                .lock()
+                .ok()?
+                .current
+                .as_ref()
+                .filter(|entry| {
+                    entry.watch_id == token.watch_id && entry.write_epoch == token.write_epoch
+                })?
+                .path
+                .clone();
+            let state = app.state::<AppState>();
+            let opened = open_authorized_existing_file_inner(&state, &path).ok()?;
+            let (_, file) = opened.into_parts();
+            let identity = opened_file_platform_identity(&file).ok()?;
+            (identity == version.platform_identity()).then(|| Arc::new(file))
+        });
+        if let Some(identity) = committed_version.map(FileVersion::platform_identity) {
+            if let Ok(mut state) = self.inner.lock() {
+                if let Some(entry) = state.current.as_mut().filter(|entry| {
+                    entry.watch_id == token.watch_id && entry.write_epoch == token.write_epoch
+                }) {
+                    entry.file_identity = Some(identity.to_string());
+                    entry.file_binding = committed_binding;
+                }
+            }
+        }
+        if let Some(watch_id) = self.settle_app_write(token, committed_version.is_some()) {
             spawn_scheduled_reconcile(app.clone(), watch_id, ScheduledReconcileMode::Event);
         }
     }
@@ -849,12 +891,20 @@ fn read_authorized_disk(state: &AppState, path: &Path) -> Result<DiskRead, Strin
             if canonical != normalized {
                 return Err("Monitored file identity changed unexpectedly".to_string());
             }
+            let workspace_authorization = opened.workspace_authorization().cloned();
             let (canonical, handle) = opened.into_parts();
             let file_identity = opened_file_platform_identity(&handle)
                 .map_err(|_| "Monitored file identity could not be captured".to_string())?;
+            let file_binding = Arc::new(
+                handle
+                    .try_clone()
+                    .map_err(|_| "Monitored file binding could not be retained".to_string())?,
+            );
             Ok(DiskRead::Present {
                 file: open_authorized_file_response_from_handle(canonical, handle)?,
                 file_identity,
+                file_binding,
+                workspace_authorization,
             })
         }
         Ok(_) => Err("Monitored path is no longer a regular file".to_string()),
@@ -870,11 +920,15 @@ fn resolve_disk_state(
     if let DiskRead::Present {
         file,
         file_identity,
+        file_binding,
+        workspace_authorization,
     } = read_authorized_disk(state, &context.path)?
     {
         return Ok(ResolvedDisk::Present {
             file,
             file_identity,
+            file_binding,
+            workspace_authorization,
             reason: ActiveDocumentWatchReason::Changed,
             previous_path: None,
         });
@@ -900,16 +954,21 @@ fn resolve_disk_state(
 
     if authorized_candidates.len() == 1 {
         let new_path = authorized_candidates.pop().expect("one candidate exists");
-        let (file, file_identity) = match read_authorized_disk(state, &new_path)? {
-            DiskRead::Present {
-                file,
-                file_identity,
-            } => (file, file_identity),
-            DiskRead::Missing => return Ok(ResolvedDisk::Missing),
-        };
+        let (file, file_identity, file_binding, workspace_authorization) =
+            match read_authorized_disk(state, &new_path)? {
+                DiskRead::Present {
+                    file,
+                    file_identity,
+                    file_binding,
+                    workspace_authorization,
+                } => (file, file_identity, file_binding, workspace_authorization),
+                DiskRead::Missing => return Ok(ResolvedDisk::Missing),
+            };
         return Ok(ResolvedDisk::Present {
             file,
             file_identity,
+            file_binding,
+            workspace_authorization,
             reason: ActiveDocumentWatchReason::Renamed,
             previous_path: Some(context.path.clone()),
         });
@@ -927,17 +986,37 @@ fn finalize_authorization_transition(
         ResolvedDisk::Present {
             file,
             file_identity,
+            file_binding,
+            workspace_authorization,
             reason: ActiveDocumentWatchReason::Renamed,
             previous_path: Some(previous_path),
         } => {
             let new_path = PathBuf::from(&file.path);
-            relocate_authorized_path_prefix_with_identity_inner(
+            let expected_identity = entry
+                .file_identity
+                .as_deref()
+                .ok_or_else(|| "Monitored file identity is unavailable".to_string())?;
+            if !entry.file_binding.as_ref().is_some_and(|binding| {
+                opened_file_platform_identity(binding)
+                    .is_ok_and(|identity| identity == expected_identity)
+            }) {
+                return Err("Monitored file binding is unavailable".to_string());
+            }
+            if file_identity != expected_identity {
+                return Err("Renamed document is not the monitored file".to_string());
+            }
+            let workspace_authorization = workspace_authorization.as_ref().ok_or_else(|| {
+                "Renamed document is not bound to the authorized workspace".to_string()
+            })?;
+            relocate_authorized_path_prefix_with_workspace_authorization_inner(
                 state,
                 previous_path,
                 &new_path,
-                file_identity,
+                expected_identity,
+                workspace_authorization,
             )?;
             entry.path = new_path;
+            entry.file_binding = Some(file_binding.clone());
         }
         ResolvedDisk::Missing => {
             revoke_authorized_path_prefix_inner(state, &entry.path)?;
@@ -1276,14 +1355,27 @@ pub(crate) fn start_active_document_watch_inner(
         }
     };
     service.attach_handle(&watch_id, handle)?;
-    let snapshot = match read_authorized_disk(state, &canonical) {
-        Ok(DiskRead::Present { file, .. }) => ActiveDocumentDiskSnapshot::Present {
+    let (snapshot, file_identity, file_binding) = match read_authorized_disk(state, &canonical) {
+        Ok(DiskRead::Present {
             file,
-            preview_revision: 1,
-        },
-        Ok(DiskRead::Missing) => ActiveDocumentDiskSnapshot::Missing {
-            path: canonical.to_string_lossy().to_string(),
-        },
+            file_identity,
+            file_binding,
+            ..
+        }) => (
+            ActiveDocumentDiskSnapshot::Present {
+                file,
+                preview_revision: 1,
+            },
+            Some(file_identity),
+            Some(file_binding),
+        ),
+        Ok(DiskRead::Missing) => (
+            ActiveDocumentDiskSnapshot::Missing {
+                path: canonical.to_string_lossy().to_string(),
+            },
+            None,
+            None,
+        ),
         Err(_) => {
             if let Some(entry) = service.remove_if_current(&watch_id) {
                 stop_entry(entry);
@@ -1291,7 +1383,7 @@ pub(crate) fn start_active_document_watch_inner(
             return Err("Monitoring could not read the active file".to_string());
         }
     };
-    service.finalize_registration(&watch_id, snapshot)
+    service.finalize_registration(&watch_id, snapshot, file_identity, file_binding)
 }
 
 #[tauri::command]
@@ -1382,6 +1474,10 @@ impl ActiveDocumentWatchState {
     ) {
         let file_kind = WorkspaceFileKind::Markdown;
         let parent = path.parent().unwrap().to_path_buf();
+        let file_identity = fs::File::open(&path)
+            .ok()
+            .and_then(|file| opened_file_platform_identity(&file).ok());
+        let file_binding = fs::File::open(&path).ok().map(Arc::new);
         self.inner.lock().unwrap().current = Some(WatchEntry {
             watch_id: watch_id.to_string(),
             document_id: document_id.to_string(),
@@ -1390,6 +1486,8 @@ impl ActiveDocumentWatchState {
             sequence: 1,
             path,
             parent,
+            file_identity,
+            file_binding,
             file_kind,
             phase: WatchPhase::PendingActivation,
             activation_reconcile_required: false,
@@ -1526,7 +1624,7 @@ mod tests {
             mpsc, Arc,
         },
     };
-    use tempfile::tempdir;
+    use tempfile::{tempdir, tempfile};
 
     struct CountingHandle(Arc<AtomicUsize>);
 
@@ -1809,6 +1907,8 @@ mod tests {
         authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
         authorize_file_inner(&state, old_path.clone()).unwrap();
         let canonical_old = old_path.canonicalize().unwrap();
+        let watch = ActiveDocumentWatchState::default();
+        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
         fs::rename(&canonical_old, &new_path).unwrap();
         let canonical_new = new_path.canonicalize().unwrap();
         let mut context = reconcile_context(&canonical_old, WorkspaceFileKind::Markdown);
@@ -1816,11 +1916,40 @@ mod tests {
             .rename_candidates
             .push((canonical_old.clone(), canonical_new.clone()));
         let mut resolved = resolve_disk_state(&state, &context).unwrap();
-        let watch = ActiveDocumentWatchState::default();
-        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
 
         fs::rename(&canonical_new, &displaced).unwrap();
         fs::write(&canonical_new, "replacement content").unwrap();
+        let mut watch_state = watch.lock().unwrap();
+        let entry = watch_state.current.as_mut().unwrap();
+
+        assert!(finalize_authorization_transition(&state, entry, &mut resolved).is_err());
+        assert_eq!(entry.path, canonical_old);
+        assert!(ensure_authorized_write_file_inner(&state, &canonical_new).is_err());
+    }
+
+    #[test]
+    fn rename_follow_rejects_a_candidate_replaced_before_it_is_read() {
+        let workspace = tempdir().unwrap();
+        let old_path = workspace.path().join("old.md");
+        let new_path = workspace.path().join("new.md");
+        let displaced = workspace.path().join("displaced.md");
+        fs::write(&old_path, "authorized content").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        authorize_file_inner(&state, old_path.clone()).unwrap();
+        let canonical_old = old_path.canonicalize().unwrap();
+        let watch = ActiveDocumentWatchState::default();
+        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
+
+        fs::rename(&canonical_old, &new_path).unwrap();
+        fs::rename(&new_path, &displaced).unwrap();
+        fs::write(&new_path, "replacement content").unwrap();
+        let canonical_new = new_path.canonicalize().unwrap();
+        let mut context = reconcile_context(&canonical_old, WorkspaceFileKind::Markdown);
+        context
+            .rename_candidates
+            .push((canonical_old.clone(), canonical_new.clone()));
+        let mut resolved = resolve_disk_state(&state, &context).unwrap();
         let mut watch_state = watch.lock().unwrap();
         let entry = watch_state.current.as_mut().unwrap();
 
@@ -1839,6 +1968,8 @@ mod tests {
         authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
         authorize_file_inner(&state, old_path.clone()).unwrap();
         let canonical_old = old_path.canonicalize().unwrap();
+        let watch = ActiveDocumentWatchState::default();
+        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
         fs::rename(&canonical_old, &new_path).unwrap();
         let canonical_new = new_path.canonicalize().unwrap();
         let mut context = reconcile_context(&canonical_old, WorkspaceFileKind::Markdown);
@@ -1846,8 +1977,6 @@ mod tests {
             .rename_candidates
             .push((canonical_old.clone(), canonical_new.clone()));
         let mut resolved = resolve_disk_state(&state, &context).unwrap();
-        let watch = ActiveDocumentWatchState::default();
-        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
         let mut watch_state = watch.lock().unwrap();
         let entry = watch_state.current.as_mut().unwrap();
 
@@ -1927,6 +2056,8 @@ mod tests {
                 bytes_base64: None,
             },
             file_identity: "matching-identity".to_string(),
+            file_binding: Arc::new(tempfile().unwrap()),
+            workspace_authorization: None,
             reason: ActiveDocumentWatchReason::Changed,
             previous_path: None,
         };
@@ -1941,6 +2072,8 @@ mod tests {
                 bytes_base64: None,
             },
             file_identity: "different-identity".to_string(),
+            file_binding: Arc::new(tempfile().unwrap()),
+            workspace_authorization: None,
             reason: ActiveDocumentWatchReason::Changed,
             previous_path: None,
         };

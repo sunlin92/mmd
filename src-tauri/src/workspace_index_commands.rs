@@ -580,6 +580,43 @@ mod tests {
         (snapshot.workspace_token, snapshot.root)
     }
 
+    fn rebuild_and_query_ready(
+        state: &AppState,
+        workspace_token: &str,
+        workspace_root: &str,
+        query: IndexQuery,
+    ) -> WorkspaceIndexQueryResponse {
+        const MAX_ATTEMPTS: usize = 3;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            // A live watcher may legitimately invalidate this generation between
+            // the rebuild response and the query's final currency check.
+            let rebuilt = rebuild_workspace_index_inner(
+                state,
+                workspace_token,
+                workspace_root,
+                &format!("build-{attempt}"),
+            )
+            .unwrap();
+            assert_eq!(rebuilt.status, WorkspaceIndexStatus::Ready);
+
+            match query_workspace_index_inner(
+                state,
+                workspace_token,
+                workspace_root,
+                &format!("query-{attempt}"),
+                query.clone(),
+            ) {
+                Ok(response) if response.status == WorkspaceIndexStatus::Ready => return response,
+                Ok(response) => assert_eq!(response.status, WorkspaceIndexStatus::Invalidated),
+                Err(error) if error == "Workspace index has not been built" => {}
+                Err(error) => panic!("workspace index query failed unexpectedly: {error}"),
+            }
+        }
+
+        panic!("workspace index was invalidated during every rebuild/query attempt");
+    }
+
     #[cfg(unix)]
     fn replace_directory_with_link(link: &Path, target: &Path) {
         symlink(target, link).unwrap();
@@ -603,16 +640,10 @@ mod tests {
         let state = AppState::default();
         let (token, root) = open_workspace(&state, directory.path());
 
-        let rebuilt = rebuild_workspace_index_inner(&state, &token, &root, "build-1").unwrap();
-        assert_eq!(rebuilt.status, WorkspaceIndexStatus::Ready);
-        let response = query_workspace_index_inner(
-            &state,
-            &token,
-            &root,
-            "query-1",
-            IndexQuery::full_text("needle"),
-        )
-        .unwrap();
+        let response =
+            rebuild_and_query_ready(&state, &token, &root, IndexQuery::full_text("needle"));
+        assert_eq!(response.status, WorkspaceIndexStatus::Ready);
+        assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].relative_path, "alpha.md");
         assert!(!Path::new(&response.results[0].relative_path).is_absolute());
 

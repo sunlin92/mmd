@@ -1053,7 +1053,7 @@ mod tests {
         state
             .file_authorization()
             .with_prepared_open_document_grant(&first_document, |grant| {
-                grant.apply();
+                grant.apply()?;
                 Ok(())
             })
             .unwrap();
@@ -1067,7 +1067,7 @@ mod tests {
         state
             .file_authorization()
             .with_prepared_open_document_grant(&second_document, |grant| {
-                grant.apply();
+                grant.apply()?;
                 Ok(())
             })
             .unwrap();

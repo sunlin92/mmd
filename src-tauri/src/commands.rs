@@ -1815,11 +1815,13 @@ fn document_save_response_with_cleanup(
     }
 }
 
-fn document_save_committed(response: &Result<DocumentSaveResponse, String>) -> bool {
-    matches!(
-        response,
-        Ok(DocumentSaveResponse::ConfirmedCommitted { .. })
-    )
+fn committed_document_version(
+    response: &Result<DocumentSaveResponse, String>,
+) -> Option<&FileVersion> {
+    match response {
+        Ok(DocumentSaveResponse::ConfirmedCommitted { version, .. }) => Some(version),
+        _ => None,
+    }
 }
 
 fn discard_workspace_index_after_workspace_mutation(
@@ -1978,7 +1980,7 @@ pub(crate) fn write_file(
         state.active_document_watch().settle_app_write_and_schedule(
             &app,
             write_token,
-            document_save_committed(&result),
+            committed_document_version(&result),
         );
     }
     result
@@ -2044,7 +2046,7 @@ pub(crate) fn retry_document_save_with_token(
         state.active_document_watch().settle_app_write_and_schedule(
             &app,
             write_token,
-            document_save_committed(&result),
+            committed_document_version(&result),
         );
     }
     result
@@ -3341,7 +3343,7 @@ pub(crate) async fn save_as_dialog(
         state.active_document_watch().settle_app_write_and_schedule(
             &app,
             write_token,
-            document_save_committed(&result),
+            committed_document_version(&result),
         );
     }
     result.map(Some)
