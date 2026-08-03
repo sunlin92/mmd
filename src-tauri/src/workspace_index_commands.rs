@@ -870,7 +870,8 @@ mod tests {
             fs::write(directory.path().join(format!("note-{index}.md")), "needle").unwrap();
         }
         let (token, root) = open_workspace(&state, directory.path());
-        rebuild_workspace_index_inner(&state, &token, &root, "build-1").unwrap();
+        let rebuilt = rebuild_workspace_index_inner(&state, &token, &root, "build-1").unwrap();
+        assert_eq!(rebuilt.status, WorkspaceIndexStatus::Ready);
         let response = query_workspace_index_inner(
             &state,
             &token,

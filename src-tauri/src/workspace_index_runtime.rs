@@ -380,6 +380,9 @@ fn handle_native_watch_result(
         return;
     }
     if let Ok(event) = &result {
+        if event_paths_are_benign_directory_metadata(scope, event) {
+            return;
+        }
         let published_index = state.upgrade().and_then(|state| {
             state.lock().ok().and_then(|state| {
                 state
@@ -402,6 +405,21 @@ fn handle_native_watch_result(
     }
 }
 
+fn event_paths_are_benign_directory_metadata(
+    scope: &WorkspaceIndexScope,
+    event: &notify::Event,
+) -> bool {
+    matches!(
+        event.kind,
+        notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+    ) && !event.paths.is_empty()
+        && event.paths.iter().all(|path| {
+            path.strip_prefix(&scope.workspace_root).is_ok()
+                && std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        })
+}
+
 fn event_paths_match_published_index(
     scope: &WorkspaceIndexScope,
     index: &WorkspaceIndex,
@@ -421,13 +439,18 @@ fn event_path_matches_published_index(
     let Ok(relative) = path.strip_prefix(&scope.workspace_root) else {
         return false;
     };
-    if relative.as_os_str().is_empty() {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    if metadata.is_dir() {
         return false;
     }
     let relative_path = relative.to_string_lossy().replace('\\', "/");
     if WorkspaceFileKind::classify(Path::new(&relative_path)) != Some(WorkspaceFileKind::Markdown) {
-        return std::fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+        return metadata.is_file();
     }
     let Some(expected) = index.content_for_relative_path(&relative_path) else {
         return false;
@@ -741,6 +764,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let document = root.join("note.md");
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
         std::fs::write(&document, "needle").unwrap();
         let runtime = WorkspaceIndexRuntime::default();
         let build = runtime
@@ -748,13 +773,27 @@ mod tests {
             .unwrap();
         let watcher = runtime.state.lock().unwrap().watcher.take();
         stop_watch(watcher);
-        let (index, _) = index();
-        assert!(runtime.publish_rebuild(&build, index).unwrap());
         let scope = WorkspaceIndexScope {
             workspace_token: build.workspace_token.clone(),
             workspace_root: build.workspace_root.clone(),
             generation: build.generation,
         };
+        let directory_metadata_event = || {
+            Ok(notify::Event::new(notify::EventKind::Modify(
+                notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Any),
+            ))
+            .add_path(root.clone())
+            .add_path(nested.clone()))
+        };
+        handle_native_watch_result(
+            &Arc::downgrade(&runtime.state),
+            &scope,
+            directory_metadata_event(),
+        );
+        assert!(!build.cancellation.is_cancelled());
+
+        let (index, _) = index();
+        assert!(runtime.publish_rebuild(&build, index).unwrap());
         let event = || {
             Ok(
                 notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
@@ -765,6 +804,15 @@ mod tests {
         };
 
         handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, event());
+        assert!(runtime
+            .is_result_current("workspace-1", &root, build.generation)
+            .unwrap());
+
+        handle_native_watch_result(
+            &Arc::downgrade(&runtime.state),
+            &scope,
+            directory_metadata_event(),
+        );
         assert!(runtime
             .is_result_current("workspace-1", &root, build.generation)
             .unwrap());
