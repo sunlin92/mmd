@@ -12,7 +12,10 @@ use std::{
     fs::File,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::ffi::{OsStrExt, OsStringExt},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::OpenOptionsExt,
+        },
     },
     path::PathBuf,
 };
@@ -454,6 +457,52 @@ fn opened_directory_path(directory: &File) -> io::Result<PathBuf> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_verified_parent(parent: &Path) -> io::Result<File> {
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    if !directory.metadata()?.is_dir() || opened_directory_path(&directory)? != parent {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parent directory changed after authorization",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn open_regular_file_without_following_links(path: &Path) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let directory = open_verified_parent(parent)?;
+    let file_name = CString::new(file_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL"))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "read source is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_file_without_following_links(path: &Path, bytes: &[u8]) -> io::Result<()> {
     unsafe extern "C" {
         fn openat(
@@ -488,13 +537,7 @@ fn write_file_without_following_links(path: &Path, bytes: &[u8]) -> io::Result<(
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let directory = File::open(parent)?;
-    if !directory.metadata()?.is_dir() || opened_directory_path(&directory)? != parent {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "write parent changed after authorization",
-        ));
-    }
+    let directory = open_verified_parent(parent)?;
     let file_name = CString::new(file_name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL"))?;
     let existing_flags = O_WRONLY | O_NOFOLLOW | O_CLOEXEC;
@@ -566,8 +609,9 @@ mod windows_handle_files {
             CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx,
             GetFinalPathNameByHandleW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, OPEN_EXISTING,
+            SYNCHRONIZE,
         },
         System::IO::IO_STATUS_BLOCK,
     };
@@ -816,6 +860,23 @@ mod windows_handle_files {
         file.write_all(bytes)
     }
 
+    pub(super) fn open_read(path: &Path) -> io::Result<File> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid_input("path has no parent"))?;
+        let name = relative_name(path)?;
+        let directory = open_verified_parent(parent)?;
+        let file = nt_open_relative(
+            &directory,
+            &name,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+            REGULAR_FILE_OPEN_OPTIONS,
+        )?;
+        validate_regular_child(&file)?;
+        Ok(file)
+    }
+
     fn destination_exists(directory: &File, name: &[u16]) -> io::Result<bool> {
         match nt_open_relative(
             directory,
@@ -948,11 +1009,24 @@ fn write_file_without_following_links(path: &Path, bytes: &[u8]) -> io::Result<(
     windows_handle_files::write(path, bytes)
 }
 
+#[cfg(windows)]
+pub(crate) fn open_regular_file_without_following_links(path: &Path) -> io::Result<fs::File> {
+    windows_handle_files::open_read(path)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn write_file_without_following_links(_path: &Path, _bytes: &[u8]) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "nofollow handle-based writes are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn open_regular_file_without_following_links(_path: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nofollow handle-based reads are unavailable on this platform",
     ))
 }
 

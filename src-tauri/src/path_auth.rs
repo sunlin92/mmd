@@ -3384,8 +3384,13 @@ pub(crate) fn revoke_authorized_path_prefix_inner(
     state: &AppState,
     prefix: &Path,
 ) -> Result<(), String> {
-    let outcome = apply_authorization_then_preview_invalidation(
-        || state.file_authorization().revoke_path_prefix(prefix),
+    apply_authorization_then_preview_invalidation(
+        || {
+            let invalidated_preview_leases =
+                state.file_authorization().revoke_path_prefix(prefix)?;
+            state.workspace_index().discard_all();
+            Ok(invalidated_preview_leases)
+        },
         |invalidated_preview_leases| match state
             .html_preview_server
             .invalidate_preview_leases(&invalidated_preview_leases)
@@ -3398,11 +3403,7 @@ pub(crate) fn revoke_authorized_path_prefix_inner(
                 Err(error)
             }
         },
-    );
-    if outcome.is_ok() {
-        state.workspace_index().discard_all();
-    }
-    outcome
+    )
 }
 
 #[cfg(test)]

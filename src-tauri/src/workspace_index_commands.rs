@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
-    commands::prepare_workspace_file_inner,
+    commands::{open_regular_file_without_following_links, prepare_workspace_file_inner},
     models::MarkdownFileEntry,
     path_auth::{
         ensure_authorized_existing_file_inner, resolve_authorized_workspace_result_file_inner,
@@ -127,9 +127,19 @@ fn collect_documents(
 
 fn collect_snapshot_files(
     state: &AppState,
+    files: Vec<MarkdownFileEntry>,
+    cancellation: &CancellationToken,
+    limits: IndexLimits,
+) -> Result<CollectedDocuments, String> {
+    collect_snapshot_files_with_before_open(state, files, cancellation, limits, |_| {})
+}
+
+fn collect_snapshot_files_with_before_open(
+    state: &AppState,
     mut files: Vec<MarkdownFileEntry>,
     cancellation: &CancellationToken,
     limits: IndexLimits,
+    mut before_open: impl FnMut(&PathBuf),
 ) -> Result<CollectedDocuments, String> {
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let input_files = files.len();
@@ -164,8 +174,21 @@ fn collect_snapshot_files(
         if canonical != snapshot_path {
             return Err("Workspace index source changed after snapshot capture".to_string());
         }
-        let metadata = fs::metadata(&canonical)
-            .map_err(|error| format!("Failed to inspect workspace index source: {error}"))?;
+        before_open(&canonical);
+        let file = match open_regular_file_without_following_links(&canonical) {
+            Ok(file) => file,
+            Err(_) => {
+                read_errors = read_errors.saturating_add(1);
+                continue;
+            }
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                read_errors = read_errors.saturating_add(1);
+                continue;
+            }
+        };
         let file_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
         if file_bytes > limits.max_file_bytes {
             skipped.oversized += 1;
@@ -176,13 +199,6 @@ fn collect_snapshot_files(
             continue;
         }
         let mut bytes = Vec::with_capacity(file_bytes.min(limits.max_file_bytes));
-        let file = match File::open(&canonical) {
-            Ok(file) => file,
-            Err(_) => {
-                read_errors = read_errors.saturating_add(1);
-                continue;
-            }
-        };
         let mut bounded: Take<File> = file.take((limits.max_file_bytes as u64).saturating_add(1));
         if bounded.read_to_end(&mut bytes).is_err() {
             read_errors = read_errors.saturating_add(1);
@@ -547,6 +563,8 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::process::Command;
 
     use tempfile::tempdir;
 
@@ -559,6 +577,22 @@ mod tests {
     fn open_workspace(state: &AppState, root: &Path) -> (String, String) {
         let snapshot = open_directory_inner(state, root).unwrap();
         (snapshot.workspace_token, snapshot.root)
+    }
+
+    #[cfg(unix)]
+    fn replace_directory_with_link(link: &Path, target: &Path) {
+        symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn replace_directory_with_link(link: &Path, target: &Path) {
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create test junction");
     }
 
     #[test]
@@ -713,6 +747,50 @@ mod tests {
         assert_eq!(response.report.skipped.unsupported, 1);
         assert_eq!(response.report.skipped.oversized, 1);
         assert_eq!(response.report.input_files, 3);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn collection_refuses_a_parent_link_swap_after_authorization() {
+        let directory = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        let moved = directory.path().join("nested-original");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("note.md"), "authorized content").unwrap();
+        fs::write(outside.path().join("note.md"), "external secret needle").unwrap();
+        let state = AppState::default();
+        let (token, root) = open_workspace(&state, directory.path());
+        let workspace =
+            resolve_authorized_workspace_root_for_token_inner(&state, &token, &root).unwrap();
+        let files = match capture_workspace_index_snapshot(&workspace, &CancellationToken::new())
+            .unwrap()
+        {
+            WorkspaceIndexSnapshotCapture::Completed(snapshot) => {
+                snapshot.into_index_files(&workspace).unwrap()
+            }
+            WorkspaceIndexSnapshotCapture::Cancelled => panic!("snapshot must complete"),
+        };
+        let mut swapped = false;
+
+        let collected = collect_snapshot_files_with_before_open(
+            &state,
+            files,
+            &CancellationToken::new(),
+            IndexLimits::default(),
+            |_| {
+                if !swapped {
+                    fs::rename(&nested, &moved).unwrap();
+                    replace_directory_with_link(&nested, outside.path());
+                    swapped = true;
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(swapped);
+        assert_eq!(collected.read_errors, 1);
+        assert!(collected.documents.is_empty());
     }
 
     #[test]

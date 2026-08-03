@@ -1581,6 +1581,7 @@ mod tests {
         },
         state::AppState,
         workspace_file_kind::WorkspaceFileKind,
+        workspace_index_commands::rebuild_workspace_index_inner,
     };
 
     use super::{
@@ -3169,7 +3170,29 @@ mod tests {
         let canonical_removed_document = normalize_existing_path(&removed_document).unwrap();
         let canonical_retained_document = normalize_existing_path(&retained_document).unwrap();
         let state = AppState::default();
-        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        let opened = open_directory_inner(&state, workspace.path()).unwrap();
+        fs::write(workspace.path().join("search.md"), "needle").unwrap();
+        rebuild_workspace_index_inner(
+            &state,
+            &opened.workspace_token,
+            &opened.root,
+            "poisoned-preview-build",
+        )
+        .unwrap();
+        let canonical_workspace = normalize_existing_path(workspace.path()).unwrap();
+        let index_generation = state
+            .workspace_index()
+            .current_generation(&opened.workspace_token, &canonical_workspace)
+            .unwrap()
+            .unwrap();
+        let query = state
+            .workspace_index()
+            .begin_query(
+                &opened.workspace_token,
+                &canonical_workspace,
+                "poisoned-preview-query",
+            )
+            .unwrap();
         prepare_html_preview_inner(&state, &removed_document, "removed").unwrap();
         prepare_html_preview_inner(&state, &retained_document, "retained").unwrap();
 
@@ -3214,6 +3237,22 @@ mod tests {
             error,
             "HTML preview server state was poisoned; all preview sites were stopped"
         );
+        assert!(query.lease.cancellation.is_cancelled());
+        assert_eq!(
+            state
+                .workspace_index()
+                .current_generation(&opened.workspace_token, &canonical_workspace)
+                .unwrap(),
+            None
+        );
+        assert!(!state
+            .workspace_index()
+            .is_result_current(
+                &opened.workspace_token,
+                &canonical_workspace,
+                index_generation,
+            )
+            .unwrap());
         let preview_leases = state.file_authorization().preview_lease_snapshot().unwrap();
         assert!(
             preview_leases.is_empty(),
