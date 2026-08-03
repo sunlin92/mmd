@@ -538,6 +538,11 @@ pub(crate) fn capture_file_version(path: &Path) -> io::Result<Option<FileVersion
     observe_open_file(path, None).map(|observed| observed.map(|observed| observed.version))
 }
 
+fn capture_committed_file_version(path: &Path) -> io::Result<Option<FileVersion>> {
+    observe_open_file_with_binding(path, None)
+        .map(|observed| observed.map(|observed| observed.version))
+}
+
 pub(crate) fn read_versioned_file(
     path: &Path,
     max_bytes: usize,
@@ -595,7 +600,7 @@ pub(crate) fn read_versioned_open_file(
             length: metadata.len(),
             modified_nanos,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
-            file_binding: Some(Arc::new(file)),
+            file_binding: None,
         },
         bytes,
     })
@@ -673,6 +678,21 @@ fn observe_open_file(
     path: &Path,
     max_bytes: Option<usize>,
 ) -> io::Result<Option<VersionedFileBytes>> {
+    observe_open_file_inner(path, max_bytes, false)
+}
+
+fn observe_open_file_with_binding(
+    path: &Path,
+    max_bytes: Option<usize>,
+) -> io::Result<Option<VersionedFileBytes>> {
+    observe_open_file_inner(path, max_bytes, true)
+}
+
+fn observe_open_file_inner(
+    path: &Path,
+    max_bytes: Option<usize>,
+    retain_file_binding: bool,
+) -> io::Result<Option<VersionedFileBytes>> {
     let path_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -684,7 +704,7 @@ fn observe_open_file(
             "durable destination must be a regular file",
         ));
     }
-    let mut file = match File::open(path) {
+    let mut file = match open_observation_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -752,10 +772,28 @@ fn observe_open_file(
             length: metadata.len(),
             modified_nanos,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
-            file_binding: Some(Arc::new(file)),
+            file_binding: retain_file_binding.then(|| Arc::new(file)),
         },
         bytes,
     }))
+}
+
+#[cfg(windows)]
+fn open_observation_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_observation_file(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 #[cfg(unix)]
@@ -1044,7 +1082,7 @@ fn durable_write_inner_with_all_hooks(
                         staged_alias,
                     ));
                 }
-                let version = match capture_file_version(&destination) {
+                let version = match capture_committed_file_version(&destination) {
                     Ok(Some(version)) => version,
                     Ok(None) => {
                         return Ok(creation_indeterminate(
@@ -1324,8 +1362,35 @@ fn durable_write_inner_with_all_hooks(
         });
     }
 
+    let committed_version = match capture_committed_file_version(&destination) {
+        Ok(Some(committed_version)) if committed_version == version => committed_version,
+        Ok(Some(_)) => {
+            return Ok(DurableWriteOutcome::Indeterminate {
+                message:
+                    "The committed destination changed while its retained binding was acquired."
+                        .to_string(),
+                recovery_paths: vec![displaced_path],
+            });
+        }
+        Ok(None) => {
+            return Ok(DurableWriteOutcome::Indeterminate {
+                message: "The committed destination disappeared before its retained binding was acquired."
+                    .to_string(),
+                recovery_paths: vec![displaced_path],
+            });
+        }
+        Err(error) => {
+            return Ok(DurableWriteOutcome::Indeterminate {
+                message: format!(
+                    "The committed destination could not retain its object binding: {error}"
+                ),
+                recovery_paths: vec![displaced_path],
+            });
+        }
+    };
+
     Ok(DurableWriteOutcome::ConfirmedCommitted {
-        version,
+        version: committed_version,
         displaced_path: Some(displaced_path),
     })
 }
@@ -1895,16 +1960,25 @@ mod tests {
 
         let created = durable_write(&destination, b"first", &ExpectedFileState::Absent).unwrap();
         let expected = capture_file_version(&destination).unwrap().unwrap();
+        assert!(expected.retained_file_binding().is_none());
         let replaced = durable_write(&destination, b"second", &exact(&expected)).unwrap();
 
-        assert!(matches!(
-            created,
-            DurableWriteOutcome::ConfirmedCommitted { .. }
-        ));
-        assert!(matches!(
-            replaced,
-            DurableWriteOutcome::ConfirmedCommitted { .. }
-        ));
+        let DurableWriteOutcome::ConfirmedCommitted {
+            version: created_version,
+            ..
+        } = created
+        else {
+            panic!("creation must commit");
+        };
+        let DurableWriteOutcome::ConfirmedCommitted {
+            version: replaced_version,
+            ..
+        } = replaced
+        else {
+            panic!("replacement must commit");
+        };
+        assert!(created_version.retained_file_binding().is_some());
+        assert!(replaced_version.retained_file_binding().is_some());
         assert_eq!(fs::read(&destination).unwrap(), b"second");
     }
 
