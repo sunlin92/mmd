@@ -9,7 +9,7 @@ use std::{
 use crate::{
     commands::{
         open_directory_without_following_links, open_regular_file_beneath_directory,
-        opened_file_platform_identity,
+        open_regular_file_without_following_links, opened_file_platform_identity,
     },
     state::AppState,
 };
@@ -298,7 +298,7 @@ pub(crate) struct WorkspaceToken(u64);
 
 struct WorkspaceGrant {
     root: PathBuf,
-    root_binding: WorkspaceRootBinding,
+    root_identity: String,
 }
 
 #[derive(Clone)]
@@ -306,6 +306,22 @@ pub(crate) struct AuthorizedWorkspace {
     token: WorkspaceToken,
     root: PathBuf,
     root_binding: WorkspaceRootBinding,
+}
+
+pub(crate) struct AuthorizedReadFile {
+    path: PathBuf,
+    file: fs::File,
+    workspace_authorization: Option<WorkspaceReadAuthorization>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceReadAuthorization {
+    path: PathBuf,
+    root: PathBuf,
+    relative: PathBuf,
+    token: WorkspaceToken,
+    root_binding: WorkspaceRootBinding,
+    file_identity: String,
 }
 
 #[derive(Clone)]
@@ -340,6 +356,17 @@ impl WorkspaceRootBinding {
     }
 }
 
+fn capture_current_workspace_binding(
+    workspace: &WorkspaceGrant,
+    root: &Path,
+) -> Option<WorkspaceRootBinding> {
+    if workspace.root != root {
+        return None;
+    }
+    let binding = WorkspaceRootBinding::capture(root).ok()?;
+    (binding.identity == workspace.root_identity).then_some(binding)
+}
+
 fn directory_read_grant_is_current(
     state: &AuthorizationState,
     root: &Path,
@@ -349,10 +376,70 @@ fn directory_read_grant_is_current(
         let GrantOrigin::Workspace(token) = origin else {
             return false;
         };
-        state.workspaces.get(token).is_some_and(|workspace| {
-            workspace.root == root && workspace.root_binding.is_current(root)
+        state
+            .workspaces
+            .get(token)
+            .is_some_and(|workspace| capture_current_workspace_binding(workspace, root).is_some())
+    })
+}
+
+fn current_workspace_binding_for_directory_grant(
+    state: &AuthorizationState,
+    root: &Path,
+    ledger: &GrantLedger,
+) -> Option<(WorkspaceToken, WorkspaceRootBinding)> {
+    ledger.origins.keys().find_map(|origin| {
+        let GrantOrigin::Workspace(token) = origin else {
+            return None;
+        };
+        state.workspaces.get(token).and_then(|workspace| {
+            capture_current_workspace_binding(workspace, root).map(|binding| (*token, binding))
         })
     })
+}
+
+fn internal_asset_grant_is_current(
+    state: &AuthorizationState,
+    root: &Path,
+    ledger: &GrantLedger,
+) -> bool {
+    ledger.origins.keys().any(|origin| match origin {
+        GrantOrigin::Workspace(token) => state
+            .workspaces
+            .get(token)
+            .is_some_and(|workspace| capture_current_workspace_binding(workspace, root).is_some()),
+        GrantOrigin::Preview(lease) => state.preview_lease_is_active_and_supported(lease),
+        GrantOrigin::OpenDocument(_) | GrantOrigin::SaveAs(_) | GrantOrigin::CreatedDocument(_) => {
+            true
+        }
+    })
+}
+
+fn workspace_read_authorization_is_current(
+    state: &AuthorizationState,
+    authorization: &WorkspaceReadAuthorization,
+) -> bool {
+    let workspace_is_current =
+        state
+            .workspaces
+            .get(&authorization.token)
+            .is_some_and(|workspace| {
+                workspace.root == authorization.root
+                    && workspace.root_identity == authorization.root_binding.identity
+                    && authorization.root_binding.is_current(&authorization.root)
+            });
+    let relative_matches = authorization
+        .path
+        .strip_prefix(&authorization.root)
+        .is_ok_and(|relative| relative == authorization.relative);
+    if !workspace_is_current || !relative_matches {
+        return false;
+    }
+    authorization
+        .root_binding
+        .open_regular_file(&authorization.relative)
+        .and_then(|file| opened_file_platform_identity(&file))
+        .is_ok_and(|identity| identity == authorization.file_identity)
 }
 
 pub(crate) struct RenamedWorkspaceEntry {
@@ -810,6 +897,26 @@ impl AuthorizedWorkspace {
     #[cfg(test)]
     fn into_root(self) -> PathBuf {
         self.root
+    }
+}
+
+impl AuthorizedReadFile {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, fs::File) {
+        (self.path, self.file)
+    }
+
+    pub(crate) fn workspace_authorization(&self) -> Option<&WorkspaceReadAuthorization> {
+        self.workspace_authorization.as_ref()
+    }
+}
+
+impl WorkspaceReadAuthorization {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -2030,7 +2137,7 @@ impl FileAuthorizationSession {
             token,
             WorkspaceGrant {
                 root: candidate.root.clone(),
-                root_binding: candidate.root_binding.clone(),
+                root_identity: candidate.root_binding.identity.clone(),
             },
         );
         Ok(AuthorizedWorkspace::new(
@@ -2104,11 +2211,39 @@ impl FileAuthorizationSession {
         if !file.is_file() {
             return Err("Prepared document grant target must be a file".to_string());
         }
+        self.with_prepared_open_document_grant_inner(file, None, operation)
+    }
+
+    pub(crate) fn with_prepared_open_document_grant_for_receipt<T>(
+        &self,
+        file: PathBuf,
+        workspace_authorization: Option<&WorkspaceReadAuthorization>,
+        operation: impl FnOnce(PreparedOpenDocumentGrant<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if workspace_authorization.is_some_and(|authorization| authorization.path != file) {
+            return Err(
+                "Workspace open receipt target does not match its authorization".to_string(),
+            );
+        }
+        self.with_prepared_open_document_grant_inner(file, workspace_authorization, operation)
+    }
+
+    fn with_prepared_open_document_grant_inner<T>(
+        &self,
+        file: PathBuf,
+        workspace_authorization: Option<&WorkspaceReadAuthorization>,
+        operation: impl FnOnce(PreparedOpenDocumentGrant<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
         let parent = file
             .parent()
             .ok_or_else(|| "Prepared document grant target has no parent".to_string())?
             .to_path_buf();
         let mut state = self.lock()?;
+        if workspace_authorization.is_some_and(|authorization| {
+            !workspace_read_authorization_is_current(&state, authorization)
+        }) {
+            return Err("Workspace file identity changed before open was committed".to_string());
+        }
         let document_grant_id = state.next_document_grant_id;
         let next_document_grant_id = document_grant_id
             .checked_add(1)
@@ -2265,6 +2400,117 @@ impl FileAuthorizationSession {
         }
     }
 
+    fn open_file_for_read_with_before_open(
+        &self,
+        path: impl AsRef<Path>,
+        before_open: impl FnOnce(),
+    ) -> Result<AuthorizedReadFile, String> {
+        let canonical = normalize_existing_path(path)?;
+        if !canonical.is_file() {
+            return Err("Path is not a file".into());
+        }
+        enum ReadAuthority {
+            Exact,
+            Workspace {
+                root: PathBuf,
+                token: WorkspaceToken,
+                binding: WorkspaceRootBinding,
+            },
+        }
+        let authority = {
+            let state = self.lock()?;
+            let mut matching_directory_grant = false;
+            let workspace = state
+                .grants
+                .iter()
+                .filter(|(key, ledger)| {
+                    ledger.is_active()
+                        && matches!(key, GrantKey::DirectoryRead(root) if path_is_under(&canonical, root))
+                })
+                .filter_map(|(key, ledger)| {
+                    let GrantKey::DirectoryRead(root) = key else {
+                        return None;
+                    };
+                    matching_directory_grant = true;
+                    current_workspace_binding_for_directory_grant(&state, root, ledger)
+                        .map(|(token, binding)| (root.clone(), token, binding))
+                })
+                .max_by_key(|(root, _, _)| root.components().count());
+            if let Some((root, token, binding)) = workspace {
+                ReadAuthority::Workspace {
+                    root,
+                    token,
+                    binding,
+                }
+            } else if matching_directory_grant {
+                return Err("Workspace root changed after authorization".to_string());
+            } else if state.grants.iter().any(|(key, ledger)| {
+                ledger.is_active()
+                    && matches!(key, GrantKey::ExactReadWrite(file) if file == &canonical)
+            }) {
+                ReadAuthority::Exact
+            } else {
+                return Err(
+                    "File is outside the user-authorized session files and directories".into(),
+                );
+            }
+        };
+        before_open();
+        let secure_open_error = |error| {
+            format!(
+                "Failed to securely open file {}: {error}",
+                canonical.display()
+            )
+        };
+        let (file, workspace_authorization) = match authority {
+            ReadAuthority::Exact => (
+                open_regular_file_without_following_links(&canonical)
+                    .map_err(&secure_open_error)?,
+                None,
+            ),
+            ReadAuthority::Workspace {
+                root,
+                token,
+                binding,
+            } => {
+                let relative = canonical
+                    .strip_prefix(&root)
+                    .map_err(|_| {
+                        "File is outside the user-authorized session files and directories"
+                            .to_string()
+                    })?
+                    .to_path_buf();
+                let file = binding
+                    .open_regular_file(&relative)
+                    .map_err(&secure_open_error)?;
+                let file_identity = opened_file_platform_identity(&file).map_err(|error| {
+                    format!(
+                        "Failed to identify securely opened file {}: {error}",
+                        canonical.display()
+                    )
+                })?;
+                let workspace_authorization = WorkspaceReadAuthorization {
+                    path: canonical.clone(),
+                    root,
+                    relative,
+                    token,
+                    root_binding: binding,
+                    file_identity,
+                };
+                (file, Some(workspace_authorization))
+            }
+        };
+        Ok(AuthorizedReadFile {
+            path: canonical,
+            file,
+            workspace_authorization,
+        })
+    }
+
+    fn open_file_for_read(&self, path: impl AsRef<Path>) -> Result<AuthorizedReadFile, String> {
+        self.open_file_for_read_with_before_open(path, || {})
+    }
+
     fn file_for_watch(&self, path: impl AsRef<Path>) -> Result<PathBuf, String> {
         let normalized = normalize_file_for_write(path)?;
         let state = self.lock()?;
@@ -2343,9 +2589,7 @@ impl FileAuthorizationSession {
         token: &WorkspaceToken,
     ) -> Option<AuthorizedWorkspace> {
         let workspace = state.workspaces.get(token)?;
-        if !workspace.root_binding.is_current(&workspace.root) {
-            return None;
-        }
+        let root_binding = capture_current_workspace_binding(workspace, &workspace.root)?;
         state
             .grants
             .get(&GrantKey::DirectoryRead(workspace.root.clone()))
@@ -2355,7 +2599,7 @@ impl FileAuthorizationSession {
         Some(AuthorizedWorkspace::new(
             *token,
             workspace.root.clone(),
-            workspace.root_binding.clone(),
+            root_binding,
         ))
     }
 
@@ -2820,7 +3064,10 @@ impl FileAuthorizationSession {
                         path_is_under(canonical, root)
                             && directory_read_grant_is_current(&state, root, ledger)
                     }
-                    GrantKey::InternalAsset(root) => path_is_under(canonical, root),
+                    GrantKey::InternalAsset(root) => {
+                        path_is_under(canonical, root)
+                            && internal_asset_grant_is_current(&state, root, ledger)
+                    }
                     GrantKey::ExactReadWrite(_) => false,
                 }
         }))
@@ -3619,6 +3866,23 @@ pub(crate) fn ensure_authorized_existing_file_inner(
     state.file_authorization().file_for_read(path)
 }
 
+pub(crate) fn open_authorized_existing_file_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+) -> Result<AuthorizedReadFile, String> {
+    state.file_authorization().open_file_for_read(path)
+}
+
+pub(crate) fn open_authorized_existing_file_with_before_open_inner(
+    state: &AppState,
+    path: impl AsRef<Path>,
+    before_open: impl FnOnce(),
+) -> Result<AuthorizedReadFile, String> {
+    state
+        .file_authorization()
+        .open_file_for_read_with_before_open(path, before_open)
+}
+
 pub(crate) fn ensure_authorized_watch_file_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -3787,6 +4051,9 @@ mod tests {
             .file_for_watch(canonical_root.join("note.md"))
             .is_err());
         assert!(authorization.directory_for_read(&canonical_root).is_err());
+        assert!(!authorization
+            .is_authorized_preview_asset(&canonical_root.join("note.md"))
+            .unwrap());
     }
 
     #[test]
@@ -4884,7 +5151,18 @@ mod tests {
     }
 
     #[test]
-    fn internal_asset_grants_are_reference_counted_and_revocable_by_origin() {
+    fn published_workspace_ledger_does_not_retain_root_handles() {
+        let directory = tempdir().unwrap();
+        let session = FileAuthorizationSession::default();
+
+        let workspace = session.authorize_directory_root(directory.path()).unwrap();
+
+        assert_eq!(Arc::strong_count(&workspace.root_binding.handle), 1);
+        assert_eq!(session.lock().unwrap().workspaces.len(), 1);
+    }
+
+    #[test]
+    fn preview_internal_asset_origins_are_reference_counted_and_revocable() {
         let directory = tempdir().unwrap();
         let first_document = directory.path().join("first.html");
         let second_document = directory.path().join("second.html");
@@ -4913,16 +5191,22 @@ mod tests {
             .preview_scope_for(&second_document)
             .unwrap()
             .into_parts();
+        let canonical_root = normalize_existing_path(directory.path()).unwrap();
+        let preview_origin_count = || {
+            state
+                .file_authorization()
+                .lock()
+                .unwrap()
+                .grants
+                .get(&GrantKey::InternalAsset(canonical_root.clone()))
+                .unwrap()
+                .origins
+                .keys()
+                .filter(|origin| matches!(origin, GrantOrigin::Preview(_)))
+                .count()
+        };
 
-        state
-            .file_authorization()
-            .revoke_origin(first_document_grant.origin(), RevokeOriginMode::All)
-            .unwrap();
-        state
-            .file_authorization()
-            .revoke_origin(second_document_grant.origin(), RevokeOriginMode::All)
-            .unwrap();
-        assert!(is_authorized_image_path(&state, &canonical_asset).unwrap());
+        assert_eq!(preview_origin_count(), 2);
 
         state
             .file_authorization()
@@ -4931,7 +5215,7 @@ mod tests {
                 RevokeOriginMode::All,
             )
             .unwrap();
-        assert!(is_authorized_image_path(&state, &canonical_asset).unwrap());
+        assert_eq!(preview_origin_count(), 1);
 
         state
             .file_authorization()
@@ -4939,6 +5223,17 @@ mod tests {
                 &GrantOrigin::Preview(second_preview_lease),
                 RevokeOriginMode::All,
             )
+            .unwrap();
+        assert_eq!(preview_origin_count(), 0);
+        assert!(is_authorized_image_path(&state, &canonical_asset).unwrap());
+
+        state
+            .file_authorization()
+            .revoke_origin(first_document_grant.origin(), RevokeOriginMode::All)
+            .unwrap();
+        state
+            .file_authorization()
+            .revoke_origin(second_document_grant.origin(), RevokeOriginMode::All)
             .unwrap();
         assert!(!is_authorized_image_path(&state, &canonical_asset).unwrap());
     }

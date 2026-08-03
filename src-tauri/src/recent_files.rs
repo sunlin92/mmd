@@ -16,7 +16,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::{
     models::{OpenCommitResult, OpenCommitStatus, RecentFileSummary, RecentFilesSnapshot},
-    path_auth::FileAuthorizationSession,
+    path_auth::{FileAuthorizationSession, WorkspaceReadAuthorization},
     workspace_file_kind::WorkspaceFileKind,
 };
 
@@ -505,9 +505,10 @@ pub(crate) struct RecentFileEntryV1 {
     canonical_target: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 struct PendingOpenReceipt {
     canonical_target: String,
+    workspace_authorization: Option<WorkspaceReadAuthorization>,
     commit_operation_id: String,
     owner_window: String,
     issued_at: Duration,
@@ -599,6 +600,7 @@ impl RecentRuntime {
         &mut self,
         owner_window: &str,
         canonical_target: String,
+        workspace_authorization: Option<WorkspaceReadAuthorization>,
         now: Duration,
         open_receipt: String,
         commit_operation_id: String,
@@ -633,6 +635,7 @@ impl RecentRuntime {
             open_receipt,
             PendingOpenReceipt {
                 canonical_target,
+                workspace_authorization,
                 commit_operation_id,
                 owner_window: owner_window.to_string(),
                 issued_at: now,
@@ -904,6 +907,32 @@ impl RecentFilesState {
         runtime.issue(
             owner_window,
             canonical_target,
+            None,
+            self.clock.now(),
+            identifiers.open_receipt.clone(),
+            identifiers.commit_operation_id.clone(),
+        )?;
+        Ok(identifiers)
+    }
+
+    pub(crate) fn issue_workspace_open(
+        &self,
+        owner_window: &str,
+        authorization: &WorkspaceReadAuthorization,
+    ) -> Result<OpenReceiptIdentifiers, String> {
+        let canonical_target = authorization
+            .path()
+            .to_str()
+            .filter(|target| valid_canonical_target(target))
+            .filter(|_| WorkspaceFileKind::classify(authorization.path()).is_some())
+            .ok_or_else(|| "Open target is not a supported file".to_string())?
+            .to_string();
+        let identifiers = self.next_receipt_identifiers()?;
+        let mut runtime = self.lock_runtime()?;
+        runtime.issue(
+            owner_window,
+            canonical_target,
+            Some(authorization.clone()),
             self.clock.now(),
             identifiers.open_receipt.clone(),
             identifiers.commit_operation_id.clone(),
@@ -935,6 +964,7 @@ impl RecentFilesState {
             runtime.issue(
                 owner_window,
                 canonical_target,
+                None,
                 self.clock.now(),
                 identifiers.open_receipt.clone(),
                 identifiers.commit_operation_id.clone(),
@@ -973,27 +1003,40 @@ impl RecentFilesState {
         };
 
         let committed = self.store.with_current_store(|store| {
-            let canonical_target = canonicalize_supported_file(&pending.canonical_target)
-                .filter(|target| target == &pending.canonical_target)
-                .ok_or_else(|| "Open target is no longer a supported file".to_string())?;
+            let canonical_target = if let Some(authorization) = &pending.workspace_authorization {
+                authorization
+                    .path()
+                    .to_str()
+                    .filter(|target| *target == pending.canonical_target)
+                    .ok_or_else(|| "Workspace open receipt target changed".to_string())?
+                    .to_string()
+            } else {
+                canonicalize_supported_file(&pending.canonical_target)
+                    .filter(|target| target == &pending.canonical_target)
+                    .ok_or_else(|| "Open target is no longer a supported file".to_string())?
+            };
             let mut promoted = store;
             promoted.promote(canonical_target.clone(), &mut || self.id_source.next_id())?;
             let snapshot = promoted.snapshot()?;
             let retained_snapshot = snapshot.clone();
             let post_commit_target = canonical_target.clone();
-            authorization.with_prepared_open_document_grant(Path::new(&canonical_target), |grant| {
-                self.store.persist_locked(&promoted)?;
-                runtime.apply_terminal_outcome(
-                    prepared_outcome
-                        .take()
-                        .expect("terminal outcome is applied exactly once"),
-                    TerminalOpenOutcome::Committed {
-                        recent_files: retained_snapshot,
-                    },
-                );
-                grant.apply();
-                Ok((snapshot, post_commit_target))
-            })
+            authorization.with_prepared_open_document_grant_for_receipt(
+                PathBuf::from(&canonical_target),
+                pending.workspace_authorization.as_ref(),
+                |grant| {
+                    self.store.persist_locked(&promoted)?;
+                    runtime.apply_terminal_outcome(
+                        prepared_outcome
+                            .take()
+                            .expect("terminal outcome is applied exactly once"),
+                        TerminalOpenOutcome::Committed {
+                            recent_files: retained_snapshot,
+                        },
+                    );
+                    grant.apply();
+                    Ok((snapshot, post_commit_target))
+                },
+            )
         });
 
         match committed {
@@ -1467,6 +1510,7 @@ mod tests {
                 .issue(
                     "main",
                     absolute_path(format!("docs/{index}.md")),
+                    None,
                     issued_at,
                     opaque_id(index * 2 + 1),
                     opaque_id(index * 2 + 2),
@@ -1495,6 +1539,7 @@ mod tests {
             .issue(
                 "main",
                 absolute_path("docs/a.md"),
+                None,
                 now,
                 opaque_id(1),
                 opaque_id(2),
@@ -1504,6 +1549,7 @@ mod tests {
             .issue(
                 "editor",
                 absolute_path("docs/b.md"),
+                None,
                 now,
                 opaque_id(3),
                 opaque_id(4),
@@ -1513,6 +1559,7 @@ mod tests {
             .issue(
                 "main",
                 absolute_path("docs/c.md"),
+                None,
                 now,
                 opaque_id(5),
                 opaque_id(6),
@@ -1532,6 +1579,7 @@ mod tests {
             .issue(
                 "editor",
                 absolute_path("docs/d.md"),
+                None,
                 now,
                 opaque_id(7),
                 opaque_id(8),
@@ -1551,6 +1599,7 @@ mod tests {
             .issue(
                 "main",
                 absolute_path("docs/pending.md"),
+                None,
                 now,
                 opaque_id(1),
                 opaque_id(2),

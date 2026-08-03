@@ -16,7 +16,7 @@ use notify_debouncer_full::{
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::{
-    commands::open_authorized_file_response,
+    commands::open_authorized_file_response_from_handle,
     models::{
         ActiveDocumentDiskSnapshot, ActiveDocumentWatchEvent, ActiveDocumentWatchEventPayload,
         ActiveDocumentWatchHealthStatus, ActiveDocumentWatchReason,
@@ -25,7 +25,8 @@ use crate::{
     },
     path_auth::{
         ensure_authorized_existing_file_inner, ensure_authorized_watch_file_inner,
-        relocate_authorized_path_prefix_inner, revoke_authorized_path_prefix_inner,
+        open_authorized_existing_file_inner, relocate_authorized_path_prefix_inner,
+        revoke_authorized_path_prefix_inner,
     },
     state::AppState,
     workspace_file_kind::WorkspaceFileKind,
@@ -838,11 +839,15 @@ fn read_authorized_disk(state: &AppState, path: &Path) -> Result<DiskRead, Strin
     let normalized = ensure_authorized_watch_file_inner(state, path)?;
     match fs::metadata(&normalized) {
         Ok(metadata) if metadata.is_file() => {
-            let canonical = ensure_authorized_existing_file_inner(state, &normalized)?;
+            let opened = open_authorized_existing_file_inner(state, &normalized)?;
+            let canonical = opened.path().to_path_buf();
             if canonical != normalized {
                 return Err("Monitored file identity changed unexpectedly".to_string());
             }
-            Ok(DiskRead::Present(open_authorized_file_response(canonical)?))
+            let (canonical, handle) = opened.into_parts();
+            Ok(DiskRead::Present(
+                open_authorized_file_response_from_handle(canonical, handle)?,
+            ))
         }
         Ok(_) => Err("Monitored path is no longer a regular file".to_string()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DiskRead::Missing),

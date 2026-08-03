@@ -39,7 +39,8 @@ use crate::{
     native_menu,
     path_auth::{
         ensure_authorized_existing_file_inner, move_authorized_workspace_entry_inner,
-        normalize_existing_path, normalize_file_for_write, path_is_under,
+        normalize_existing_path, normalize_file_for_write, open_authorized_existing_file_inner,
+        open_authorized_existing_file_with_before_open_inner, path_is_under,
         rename_authorized_workspace_entry_inner,
         resolve_authorized_workspace_directory_for_token_inner,
         resolve_authorized_workspace_root_for_token_inner, trash_authorized_workspace_entry_inner,
@@ -1355,10 +1356,17 @@ fn embedded_binary_open_response(
 pub(crate) fn open_authorized_file_response(
     file: std::path::PathBuf,
 ) -> Result<OpenFileResponse, String> {
-    let kind = WorkspaceFileKind::classify(&file)
-        .ok_or_else(|| "Selected file is not a supported preview file".to_string())?;
     let handle = open_regular_file_without_following_links(&file)
         .map_err(|error| format!("Failed to securely open file {}: {error}", file.display()))?;
+    open_authorized_file_response_from_handle(file, handle)
+}
+
+pub(crate) fn open_authorized_file_response_from_handle(
+    file: std::path::PathBuf,
+    handle: fs::File,
+) -> Result<OpenFileResponse, String> {
+    let kind = WorkspaceFileKind::classify(&file)
+        .ok_or_else(|| "Selected file is not a supported preview file".to_string())?;
     if kind.requires_embedded_bytes() {
         embedded_binary_open_response(kind, &file, handle)
     } else {
@@ -1438,10 +1446,16 @@ fn prepare_workspace_file_with_before_open_inner(
     path: impl AsRef<Path>,
     before_open: impl FnOnce(),
 ) -> Result<PreparedOpenFileResponse, String> {
-    let file = ensure_authorized_existing_file_inner(state, path)?;
-    before_open();
-    let response = open_authorized_file_response(file.clone())?;
-    let identifiers = state.recent_files()?.issue_open(owner_window, &file)?;
+    let opened = open_authorized_existing_file_with_before_open_inner(state, path, before_open)?;
+    let workspace_authorization = opened.workspace_authorization().cloned();
+    let (file, handle) = opened.into_parts();
+    let response = open_authorized_file_response_from_handle(file.clone(), handle)?;
+    let recent_files = state.recent_files()?;
+    let identifiers = if let Some(authorization) = &workspace_authorization {
+        recent_files.issue_workspace_open(owner_window, authorization)?
+    } else {
+        recent_files.issue_open(owner_window, &file)?
+    };
     Ok(PreparedOpenFileResponse {
         file: response,
         open_receipt: identifiers.open_receipt,
@@ -1518,11 +1532,13 @@ pub(crate) fn open_workspace_file_inner(
     state: &AppState,
     path: impl AsRef<Path>,
 ) -> Result<OpenFileResponse, String> {
-    let file = ensure_authorized_existing_file_inner(state, path)?;
+    let opened = open_authorized_existing_file_inner(state, path)?;
+    let file = opened.path().to_path_buf();
     if WorkspaceFileKind::classify(&file).is_none() {
         return Err("Workspace file is not a supported preview file".into());
     }
-    let response = open_authorized_file_response(file.clone())?;
+    let (file, handle) = opened.into_parts();
+    let response = open_authorized_file_response_from_handle(file.clone(), handle)?;
     authorize_workspace_file_inner(state, &file)?;
     Ok(response)
 }
@@ -1704,7 +1720,8 @@ fn read_file_with_before_open_inner(
     path: impl AsRef<Path>,
     before_open: impl FnOnce(),
 ) -> Result<OpenFileResponse, String> {
-    let path = ensure_authorized_existing_file_inner(state, path)?;
+    let opened = open_authorized_existing_file_with_before_open_inner(state, path, before_open)?;
+    let path = opened.path().to_path_buf();
     let kind = WorkspaceFileKind::classify(&path)
         .filter(|kind| kind.is_editable())
         .ok_or_else(|| {
@@ -1713,8 +1730,8 @@ fn read_file_with_before_open_inner(
     if !kind.is_editable() {
         return Err("Only Markdown, HTML, and Excalidraw files can be read as text".into());
     }
-    before_open();
-    open_authorized_file_response(path)
+    let (path, handle) = opened.into_parts();
+    open_authorized_file_response_from_handle(path, handle)
 }
 
 fn validate_editable_content(path: &Path, content: &str, action: &str) -> Result<(), String> {
@@ -3418,14 +3435,17 @@ pub(crate) fn read_workspace_image_inner(
     state: &AppState,
     path: impl AsRef<Path>,
 ) -> Result<String, String> {
-    let path = ensure_authorized_existing_file_inner(state, path)?;
+    let opened = open_authorized_existing_file_inner(state, path)?;
+    let path = opened.path().to_path_buf();
     if WorkspaceFileKind::classify(&path) != Some(WorkspaceFileKind::Image) {
         return Err("Workspace file is not a supported image".into());
     }
     let mime_type = WorkspaceFileKind::Image
         .mime_type(&path)
         .ok_or_else(|| "Workspace image has no supported MIME type".to_string())?;
-    let bytes = read_binary_file_bounded(
+    let (_, handle) = opened.into_parts();
+    let bytes = read_open_binary_file_bounded(
+        handle,
         &path,
         IMAGE_SOURCE_LIMIT_BYTES,
         "Image source exceeds the 64 MiB limit",
@@ -4372,6 +4392,44 @@ mod tests {
             });
 
         assert!(reread.is_err());
+    }
+
+    #[test]
+    fn workspace_prepare_reads_the_bound_root_but_cannot_commit_after_replacement() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let displaced = directory.path().join("workspace-original");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("note.md"), "authorized content").unwrap();
+        let state = AppState::default();
+        let app_data = tempdir().unwrap();
+        state
+            .initialize_recent_files(app_data.path().to_path_buf())
+            .unwrap();
+        authorize_directory_root_inner(&state, root.clone()).unwrap();
+
+        let response = prepare_workspace_file_with_before_open_inner(
+            &state,
+            "main",
+            root.join("note.md"),
+            || {
+                fs::rename(&root, &displaced).unwrap();
+                fs::create_dir(&root).unwrap();
+                fs::write(root.join("note.md"), "external secret").unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.file.content.as_deref(), Some("authorized content"));
+        assert!(matches!(
+            state
+                .recent_files()
+                .unwrap()
+                .commit_open(&response.open_receipt, "main", state.file_authorization(),)
+                .unwrap(),
+            OpenCommitResult::NotCommitted { .. }
+        ));
+        assert!(ensure_authorized_write_file_inner(&state, root.join("note.md")).is_err());
     }
 
     #[test]
