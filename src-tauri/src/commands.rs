@@ -518,6 +518,57 @@ pub(crate) fn open_regular_file_without_following_links(path: &Path) -> io::Resu
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn open_regular_file_beneath_directory(
+    root: &File,
+    relative: &Path,
+) -> io::Result<File> {
+    let mut components = relative.components().peekable();
+    let mut directory = root.try_clone()?;
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace-relative path is invalid",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL")
+        })?;
+        let is_file = components.peek().is_none();
+        let flags = if is_file {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let opened = unsafe { File::from_raw_fd(descriptor) };
+        if is_file {
+            if !opened.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read source is not a regular file",
+                ));
+            }
+            return Ok(opened);
+        }
+        if !opened.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace path component is not a directory",
+            ));
+        }
+        directory = opened;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "workspace-relative path is empty",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_file_without_following_links(path: &Path, bytes: &[u8]) -> io::Result<()> {
     unsafe extern "C" {
         fn openat(
@@ -839,6 +890,17 @@ mod windows_handle_files {
         Ok(())
     }
 
+    fn validate_directory_child(file: &File) -> io::Result<()> {
+        let attributes = attribute_tag(file)?.FileAttributes;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_input("directory is a reparse point"));
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(invalid_input("path is not a directory"));
+        }
+        Ok(())
+    }
+
     fn validate_rename_entry(file: &File) -> io::Result<()> {
         if attribute_tag(file)?.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(invalid_input("rename entry is a reparse point"));
@@ -895,6 +957,47 @@ mod windows_handle_files {
         )?;
         validate_regular_child(&file)?;
         Ok(file)
+    }
+
+    pub(super) fn open_read_beneath(root: &File, relative: &Path) -> io::Result<File> {
+        let mut components = relative.components().peekable();
+        let mut directory = root.try_clone()?;
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(invalid_input("workspace-relative path is invalid"));
+            };
+            let name = name.encode_wide().collect::<Vec<_>>();
+            let byte_length = name
+                .len()
+                .checked_mul(size_of::<u16>())
+                .ok_or_else(|| invalid_input("path component is too long"))?;
+            if name.is_empty() || byte_length > u16::MAX as usize {
+                return Err(invalid_input("path component is too long"));
+            }
+            let is_file = components.peek().is_none();
+            let opened = nt_open_relative(
+                &directory,
+                &name,
+                if is_file {
+                    FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+                } else {
+                    VERIFIED_PARENT_ACCESS | SYNCHRONIZE
+                },
+                FILE_OPEN,
+                if is_file {
+                    REGULAR_FILE_OPEN_OPTIONS
+                } else {
+                    ENTRY_OPEN_OPTIONS
+                },
+            )?;
+            if is_file {
+                validate_regular_child(&opened)?;
+                return Ok(opened);
+            }
+            validate_directory_child(&opened)?;
+            directory = opened;
+        }
+        Err(invalid_input("workspace-relative path is empty"))
     }
 
     fn destination_exists(directory: &File, name: &[u16]) -> io::Result<bool> {
@@ -1035,6 +1138,14 @@ pub(crate) fn open_regular_file_without_following_links(path: &Path) -> io::Resu
 }
 
 #[cfg(windows)]
+pub(crate) fn open_regular_file_beneath_directory(
+    root: &fs::File,
+    relative: &Path,
+) -> io::Result<fs::File> {
+    windows_handle_files::open_read_beneath(root, relative)
+}
+
+#[cfg(windows)]
 pub(crate) fn open_directory_without_following_links(path: &Path) -> io::Result<fs::File> {
     windows_handle_files::open_directory(path)
 }
@@ -1079,6 +1190,17 @@ pub(crate) fn open_regular_file_without_following_links(_path: &Path) -> io::Res
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "nofollow handle-based reads are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn open_regular_file_beneath_directory(
+    _root: &fs::File,
+    _relative: &Path,
+) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "root-bound nofollow reads are unavailable on this platform",
     ))
 }
 

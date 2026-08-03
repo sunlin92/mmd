@@ -8,10 +8,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
-    commands::{open_regular_file_without_following_links, prepare_workspace_file_inner},
+    commands::prepare_workspace_file_inner,
     models::MarkdownFileEntry,
     path_auth::{
-        ensure_authorized_existing_file_inner, resolve_authorized_workspace_result_file_inner,
+        resolve_authorized_workspace_result_file_inner,
         resolve_authorized_workspace_root_for_token_inner, AuthorizedWorkspace,
     },
     state::AppState,
@@ -122,25 +122,30 @@ fn collect_documents(
             });
         }
     };
-    collect_snapshot_files(state, files, cancellation, limits)
+    collect_snapshot_files(state, workspace, files, cancellation, limits)
 }
 
 fn collect_snapshot_files(
     state: &AppState,
+    workspace: &AuthorizedWorkspace,
     files: Vec<MarkdownFileEntry>,
     cancellation: &CancellationToken,
     limits: IndexLimits,
 ) -> Result<CollectedDocuments, String> {
-    collect_snapshot_files_with_before_open(state, files, cancellation, limits, |_| {})
+    collect_snapshot_files_with_before_open(state, workspace, files, cancellation, limits, |_| {})
 }
 
 fn collect_snapshot_files_with_before_open(
     state: &AppState,
+    workspace: &AuthorizedWorkspace,
     mut files: Vec<MarkdownFileEntry>,
     cancellation: &CancellationToken,
     limits: IndexLimits,
     mut before_open: impl FnMut(&PathBuf),
 ) -> Result<CollectedDocuments, String> {
+    state
+        .file_authorization()
+        .ensure_workspace_is_current(workspace)?;
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let input_files = files.len();
     let mut documents = Vec::new();
@@ -170,12 +175,8 @@ fn collect_snapshot_files_with_before_open(
         }
         eligible_files += 1;
         let snapshot_path = PathBuf::from(&entry.path);
-        let canonical = ensure_authorized_existing_file_inner(state, &snapshot_path)?;
-        if canonical != snapshot_path {
-            return Err("Workspace index source changed after snapshot capture".to_string());
-        }
-        before_open(&canonical);
-        let file = match open_regular_file_without_following_links(&canonical) {
+        before_open(&snapshot_path);
+        let file = match workspace.open_regular_file(&snapshot_path) {
             Ok(file) => file,
             Err(_) => {
                 read_errors = read_errors.saturating_add(1);
@@ -775,6 +776,7 @@ mod tests {
 
         let collected = collect_snapshot_files_with_before_open(
             &state,
+            &workspace,
             files,
             &CancellationToken::new(),
             IndexLimits::default(),
@@ -791,6 +793,55 @@ mod tests {
         assert!(swapped);
         assert_eq!(collected.read_errors, 1);
         assert!(collected.documents.is_empty());
+    }
+
+    #[test]
+    fn collection_remains_bound_to_the_authorized_root_object_after_replacement() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let displaced = directory.path().join("workspace-original");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("note.md"), "authorized content").unwrap();
+        let state = AppState::default();
+        let (token, canonical_root) = open_workspace(&state, &root);
+        let canonical_root_path = PathBuf::from(&canonical_root);
+        let workspace =
+            resolve_authorized_workspace_root_for_token_inner(&state, &token, &canonical_root)
+                .unwrap();
+        let files = match capture_workspace_index_snapshot(&workspace, &CancellationToken::new())
+            .unwrap()
+        {
+            WorkspaceIndexSnapshotCapture::Completed(snapshot) => {
+                snapshot.into_index_files(&workspace).unwrap()
+            }
+            WorkspaceIndexSnapshotCapture::Cancelled => panic!("snapshot must complete"),
+        };
+        let mut replaced = false;
+
+        let result = collect_snapshot_files_with_before_open(
+            &state,
+            &workspace,
+            files,
+            &CancellationToken::new(),
+            IndexLimits::default(),
+            |_| {
+                if !replaced {
+                    fs::rename(&canonical_root_path, &displaced).unwrap();
+                    fs::create_dir(&canonical_root_path).unwrap();
+                    fs::write(
+                        canonical_root_path.join("note.md"),
+                        "external secret needle",
+                    )
+                    .unwrap();
+                    replaced = true;
+                }
+            },
+        );
+
+        assert!(replaced);
+        let collected = result.unwrap();
+        assert_eq!(collected.documents.len(), 1);
+        assert_eq!(collected.documents[0].content, "authorized content");
     }
 
     #[test]

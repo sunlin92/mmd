@@ -7,7 +7,10 @@ use std::{
 };
 
 use crate::{
-    commands::{open_directory_without_following_links, opened_file_platform_identity},
+    commands::{
+        open_directory_without_following_links, open_regular_file_beneath_directory,
+        opened_file_platform_identity,
+    },
     state::AppState,
 };
 
@@ -308,7 +311,7 @@ pub(crate) struct AuthorizedWorkspace {
 #[derive(Clone)]
 struct WorkspaceRootBinding {
     identity: String,
-    _handle: Arc<fs::File>,
+    handle: Arc<fs::File>,
 }
 
 impl WorkspaceRootBinding {
@@ -319,10 +322,7 @@ impl WorkspaceRootBinding {
         );
         let identity = opened_file_platform_identity(&handle)
             .map_err(|error| format!("Could not identify the workspace root: {error}"))?;
-        Ok(Self {
-            identity,
-            _handle: handle,
-        })
+        Ok(Self { identity, handle })
     }
 
     fn is_current(&self, root: &Path) -> bool {
@@ -334,6 +334,25 @@ impl WorkspaceRootBinding {
     fn same_object(&self, other: &Self) -> bool {
         self.identity == other.identity
     }
+
+    fn open_regular_file(&self, relative: &Path) -> std::io::Result<fs::File> {
+        open_regular_file_beneath_directory(&self.handle, relative)
+    }
+}
+
+fn directory_read_grant_is_current(
+    state: &AuthorizationState,
+    root: &Path,
+    ledger: &GrantLedger,
+) -> bool {
+    ledger.origins.keys().any(|origin| {
+        let GrantOrigin::Workspace(token) = origin else {
+            return false;
+        };
+        state.workspaces.get(token).is_some_and(|workspace| {
+            workspace.root == root && workspace.root_binding.is_current(root)
+        })
+    })
 }
 
 pub(crate) struct RenamedWorkspaceEntry {
@@ -778,6 +797,16 @@ impl AuthorizedWorkspace {
         &self.root
     }
 
+    pub(crate) fn open_regular_file(&self, path: &Path) -> std::io::Result<fs::File> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "file is outside the authorized workspace root",
+            )
+        })?;
+        self.root_binding.open_regular_file(relative)
+    }
+
     #[cfg(test)]
     fn into_root(self) -> PathBuf {
         self.root
@@ -1119,7 +1148,10 @@ impl AuthorizationState {
                 GrantKey::ExactReadWrite(path) if path == authority_document => {
                     Some(&ledger.origins)
                 }
-                GrantKey::DirectoryRead(root) if path_is_under(authority_document, root) => {
+                GrantKey::DirectoryRead(root)
+                    if path_is_under(authority_document, root)
+                        && directory_read_grant_is_current(self, root, ledger) =>
+                {
                     Some(&ledger.origins)
                 }
                 _ => None,
@@ -2211,7 +2243,10 @@ impl FileAuthorizationSession {
             ledger.is_active()
                 && match key {
                     GrantKey::ExactReadWrite(file) => file == canonical,
-                    GrantKey::DirectoryRead(root) => path_is_under(canonical, root),
+                    GrantKey::DirectoryRead(root) => {
+                        path_is_under(canonical, root)
+                            && directory_read_grant_is_current(state, root, ledger)
+                    }
                     GrantKey::InternalAsset(_) => false,
                 }
         })
@@ -2237,7 +2272,10 @@ impl FileAuthorizationSession {
             ledger.is_active()
                 && match key {
                     GrantKey::ExactReadWrite(file) => file == &normalized,
-                    GrantKey::DirectoryRead(root) => path_is_under(&normalized, root),
+                    GrantKey::DirectoryRead(root) => {
+                        path_is_under(&normalized, root)
+                            && directory_read_grant_is_current(&state, root, ledger)
+                    }
                     GrantKey::InternalAsset(_) => false,
                 }
         }) {
@@ -2290,7 +2328,9 @@ impl FileAuthorizationSession {
         let state = self.lock()?;
         if state.grants.iter().any(|(key, ledger)| {
             ledger.is_active()
-                && matches!(key, GrantKey::DirectoryRead(root) if path_is_under(&canonical, root))
+                && matches!(key, GrantKey::DirectoryRead(root)
+                    if path_is_under(&canonical, root)
+                        && directory_read_grant_is_current(&state, root, ledger))
         }) {
             Ok(canonical)
         } else {
@@ -2776,9 +2816,11 @@ impl FileAuthorizationSession {
         Ok(state.grants.iter().any(|(key, ledger)| {
             ledger.is_active()
                 && match key {
-                    GrantKey::DirectoryRead(root) | GrantKey::InternalAsset(root) => {
+                    GrantKey::DirectoryRead(root) => {
                         path_is_under(canonical, root)
+                            && directory_read_grant_is_current(&state, root, ledger)
                     }
+                    GrantKey::InternalAsset(root) => path_is_under(canonical, root),
                     GrantKey::ExactReadWrite(_) => false,
                 }
         }))
@@ -2796,7 +2838,10 @@ impl FileAuthorizationSession {
             .filter(|(_, ledger)| ledger.is_active())
             .filter_map(|(key, ledger)| match key {
                 GrantKey::ExactReadWrite(path) if path == &document => Some(&ledger.origins),
-                GrantKey::DirectoryRead(root) if path_is_under(&document, root) => {
+                GrantKey::DirectoryRead(root)
+                    if path_is_under(&document, root)
+                        && directory_read_grant_is_current(&state, root, ledger) =>
+                {
                     Some(&ledger.origins)
                 }
                 _ => None,
@@ -2868,7 +2913,10 @@ impl FileAuthorizationSession {
             .filter(|(_, ledger)| ledger.is_active())
             .filter_map(|(key, ledger)| match key {
                 GrantKey::ExactReadWrite(path) if path == &anchor => Some(&ledger.origins),
-                GrantKey::DirectoryRead(root) if path_is_under(&anchor, root) => {
+                GrantKey::DirectoryRead(root)
+                    if path_is_under(&anchor, root)
+                        && directory_read_grant_is_current(&state, root, ledger) =>
+                {
                     Some(&ledger.origins)
                 }
                 _ => None,
@@ -3732,6 +3780,13 @@ mod tests {
         assert!(authorization
             .authorized_workspace_root_for_token(&token, &canonical_root)
             .is_err());
+        assert!(authorization
+            .file_for_read(canonical_root.join("note.md"))
+            .is_err());
+        assert!(authorization
+            .file_for_watch(canonical_root.join("note.md"))
+            .is_err());
+        assert!(authorization.directory_for_read(&canonical_root).is_err());
     }
 
     #[test]
