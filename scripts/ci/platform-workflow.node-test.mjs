@@ -147,6 +147,20 @@ test('runs packaged lifecycle feature tests on every native target before packag
   );
 });
 
+test('runs packaged-open verifier integration tests on the Windows native runner', async () => {
+  const value = await workflow();
+  const step = [
+    '- name: Windows packaged-open verifier tests',
+    "        if: runner.os == 'Windows'",
+    '        run: node --test scripts/ci/packaged-open-evidence.node-test.mjs',
+  ].join('\n');
+  const stepIndex = value.indexOf(step);
+  const packageIndex = value.indexOf('- name: Build non-macOS package');
+
+  assert.notEqual(stepIndex, -1, 'Windows must execute the win32-only verifier tests');
+  assert.ok(stepIndex < packageIndex, 'Windows verifier tests must pass before packaging');
+});
+
 test('keeps the CI-only instrumentation out of default release packages', async () => {
   const release = await readFile(releaseWorkflowPath, 'utf8');
 

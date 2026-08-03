@@ -93,6 +93,9 @@ jobs:
           key: ${{ matrix.target }}
       - run: npm ci
       - run: npm run check:release-version
+      - name: Windows packaged-open verifier tests
+        if: runner.os == 'Windows'
+        run: node --test scripts/ci/packaged-open-evidence.node-test.mjs
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release --features bench-cli
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release --features packaged-lifecycle-e2e packaged_lifecycle_e2e::tests
