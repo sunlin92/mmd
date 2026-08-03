@@ -543,7 +543,10 @@ pub(crate) fn open_workspace_index_result(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink, path::Path};
+    use std::{fs, path::Path};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
 

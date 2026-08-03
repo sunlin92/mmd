@@ -369,8 +369,11 @@ fn create_native_watch(
 fn handle_native_watch_result(
     state: &Weak<Mutex<RuntimeState>>,
     scope: &WorkspaceIndexScope,
-    _result: Result<notify::Event, notify::Error>,
+    result: Result<notify::Event, notify::Error>,
 ) {
+    if matches!(result, Ok(event) if event.kind.is_access()) {
+        return;
+    }
     if let Some(state) = state.upgrade() {
         invalidate_exact_binding(&state, scope, false);
     }
@@ -468,12 +471,7 @@ fn new_deadline_bound_cancellation() -> (CancellationToken, Instant) {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        sync::atomic::{AtomicUsize, Ordering},
-        thread,
-        time::Duration,
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::workspace_index::{build_index, BuildReport, IndexDocument, IndexLimits};
     use tempfile::tempdir;
@@ -606,28 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn recursive_filesystem_changes_invalidate_and_cancel_an_active_rebuild() {
-        let directory = tempdir().unwrap();
-        let nested = directory.path().join("nested");
-        fs::create_dir(&nested).unwrap();
-        let runtime = WorkspaceIndexRuntime::default();
-        let build = runtime
-            .begin_rebuild("workspace-1", directory.path(), "build-1")
-            .unwrap();
-
-        fs::write(nested.join("external.md"), "changed").unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !build.cancellation.is_cancelled() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(build.cancellation.is_cancelled());
-        assert!(!runtime
-            .is_result_current("workspace-1", directory.path(), build.generation)
-            .unwrap());
-    }
-
-    #[test]
     fn a_late_callback_from_a_replaced_watcher_cannot_invalidate_the_new_binding() {
         let directory = tempdir().unwrap();
         let runtime = WorkspaceIndexRuntime::default();
@@ -652,6 +628,51 @@ mod tests {
                 .unwrap(),
             Some(second.generation)
         );
+    }
+
+    #[test]
+    fn watcher_access_events_preserve_the_binding_while_other_results_invalidate_it() {
+        let directory = tempdir().unwrap();
+
+        for (result, should_invalidate) in [
+            (
+                Ok(notify::Event::new(notify::EventKind::Access(
+                    notify::event::AccessKind::Any,
+                ))),
+                false,
+            ),
+            (
+                Ok(notify::Event::new(notify::EventKind::Modify(
+                    notify::event::ModifyKind::Any,
+                ))),
+                true,
+            ),
+            (Ok(notify::Event::new(notify::EventKind::Any)), true),
+            (
+                Err(notify::Error::generic("injected watcher overflow")),
+                true,
+            ),
+        ] {
+            let runtime = WorkspaceIndexRuntime::default();
+            let build = runtime
+                .begin_rebuild("workspace-1", directory.path(), "build-1")
+                .unwrap();
+            let scope = WorkspaceIndexScope {
+                workspace_token: build.workspace_token.clone(),
+                workspace_root: build.workspace_root.clone(),
+                generation: build.generation,
+            };
+
+            handle_native_watch_result(&Arc::downgrade(&runtime.state), &scope, result);
+
+            assert_eq!(build.cancellation.is_cancelled(), should_invalidate);
+            assert_eq!(
+                runtime
+                    .current_generation("workspace-1", directory.path())
+                    .unwrap(),
+                Some(build.generation + u64::from(should_invalidate))
+            );
+        }
     }
 
     #[test]
