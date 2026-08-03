@@ -892,6 +892,7 @@ enum DurableWriteFault {
     CreationObserve,
     DisplacedObserve,
     ParentSync,
+    CommittedBindingObserve,
 }
 
 fn durable_write_inner(
@@ -1353,13 +1354,8 @@ fn durable_write_inner_with_all_hooks(
             recovery_paths: vec![intended_recovery, displaced_path],
         });
     }
-    if let Err(error) = fs::remove_file(&intended_recovery) {
-        return Ok(DurableWriteOutcome::Indeterminate {
-            message: format!(
-                "The commit was observed but the independent recovery image could not be retired: {error}"
-            ),
-            recovery_paths: vec![intended_recovery, displaced_path],
-        });
+    if fault == Some(DurableWriteFault::CommittedBindingObserve) {
+        fs::remove_file(&destination)?;
     }
 
     let committed_version = match capture_committed_file_version(&destination) {
@@ -1369,14 +1365,14 @@ fn durable_write_inner_with_all_hooks(
                 message:
                     "The committed destination changed while its retained binding was acquired."
                         .to_string(),
-                recovery_paths: vec![displaced_path],
+                recovery_paths: vec![intended_recovery, displaced_path],
             });
         }
         Ok(None) => {
             return Ok(DurableWriteOutcome::Indeterminate {
                 message: "The committed destination disappeared before its retained binding was acquired."
                     .to_string(),
-                recovery_paths: vec![displaced_path],
+                recovery_paths: vec![intended_recovery, displaced_path],
             });
         }
         Err(error) => {
@@ -1384,10 +1380,18 @@ fn durable_write_inner_with_all_hooks(
                 message: format!(
                     "The committed destination could not retain its object binding: {error}"
                 ),
-                recovery_paths: vec![displaced_path],
+                recovery_paths: vec![intended_recovery, displaced_path],
             });
         }
     };
+    if let Err(error) = fs::remove_file(&intended_recovery) {
+        return Ok(DurableWriteOutcome::Indeterminate {
+            message: format!(
+                "The commit was observed but the independent recovery image could not be retired: {error}"
+            ),
+            recovery_paths: vec![intended_recovery, displaced_path],
+        });
+    }
 
     Ok(DurableWriteOutcome::ConfirmedCommitted {
         version: committed_version,
@@ -2410,6 +2414,38 @@ mod tests {
             panic!("unknown backup disposition must be indeterminate");
         };
         assert_eq!(fs::read(&destination).unwrap(), b"intended");
+        assert!(recovery_paths
+            .iter()
+            .any(|path| fs::read(path).ok().as_deref() == Some(b"old")));
+        assert!(recovery_paths
+            .iter()
+            .any(|path| fs::read(path).ok().as_deref() == Some(b"intended")));
+    }
+
+    #[test]
+    fn committed_binding_observation_failure_retains_new_and_old_recovery_images() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("document.md");
+        fs::write(&destination, b"old").unwrap();
+        let expected = capture_file_version(&destination).unwrap().unwrap();
+
+        let outcome = durable_write_inner(
+            &destination,
+            b"intended",
+            &exact(&expected),
+            Some(DurableWriteFault::CommittedBindingObserve),
+        )
+        .unwrap();
+
+        let DurableWriteOutcome::Indeterminate {
+            message,
+            recovery_paths,
+        } = outcome
+        else {
+            panic!("a missing committed binding must remain indeterminate");
+        };
+        assert!(message.contains("disappeared before its retained binding"));
+        assert!(!destination.exists());
         assert!(recovery_paths
             .iter()
             .any(|path| fs::read(path).ok().as_deref() == Some(b"old")));
