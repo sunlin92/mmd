@@ -438,23 +438,31 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    fn work_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\work")
+        } else {
+            PathBuf::from("/work")
+        }
+    }
+
     #[test]
     fn parser_discards_program_name_and_resolves_one_relative_target() {
         assert_eq!(
-            parse_open_intent_args(args(&["mmd", "notes/../draft.md"]), Path::new("/work")),
-            Ok(PathBuf::from("/work/draft.md"))
+            parse_open_intent_args(args(&["mmd", "notes/../draft.md"]), &work_root()),
+            Ok(work_root().join("draft.md"))
         );
     }
 
     #[test]
     fn parser_requires_double_dash_for_dash_prefixed_filename() {
         assert_eq!(
-            parse_open_intent_args(args(&["mmd", "-draft.md"]), Path::new("/work")),
+            parse_open_intent_args(args(&["mmd", "-draft.md"]), &work_root()),
             Err(OpenIntentParseError::UnexpectedOption)
         );
         assert_eq!(
-            parse_open_intent_args(args(&["mmd", "--", "-draft.md"]), Path::new("/work")),
-            Ok(PathBuf::from("/work/-draft.md"))
+            parse_open_intent_args(args(&["mmd", "--", "-draft.md"]), &work_root()),
+            Ok(work_root().join("-draft.md"))
         );
     }
 
@@ -470,15 +478,15 @@ mod tests {
     #[test]
     fn parser_rejects_missing_multiple_and_option_arguments() {
         assert_eq!(
-            parse_open_intent_args(args(&["mmd"]), Path::new("/work")),
+            parse_open_intent_args(args(&["mmd"]), &work_root()),
             Err(OpenIntentParseError::MissingTarget)
         );
         assert_eq!(
-            parse_open_intent_args(args(&["mmd", "a.md", "b.md"]), Path::new("/work")),
+            parse_open_intent_args(args(&["mmd", "a.md", "b.md"]), &work_root()),
             Err(OpenIntentParseError::MultipleTargets)
         );
         assert_eq!(
-            parse_open_intent_args(args(&["mmd", "--help"]), Path::new("/work")),
+            parse_open_intent_args(args(&["mmd", "--help"]), &work_root()),
             Err(OpenIntentParseError::UnexpectedOption)
         );
         assert_eq!(
@@ -486,7 +494,7 @@ mod tests {
             Err(OpenIntentParseError::InvalidWorkingDirectory)
         );
         assert_eq!(
-            parse_open_intent_args(args(&["mmd", ""]), Path::new("/work")),
+            parse_open_intent_args(args(&["mmd", ""]), &work_root()),
             Err(OpenIntentParseError::EmptyTarget)
         );
     }
@@ -497,7 +505,7 @@ mod tests {
         let first = coordinator
             .enqueue_args(
                 args(&["mmd", "one.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::StartupArguments,
             )
             .unwrap()
@@ -505,7 +513,7 @@ mod tests {
         let second = coordinator
             .enqueue_args(
                 args(&["mmd", "two.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::SecondaryInstance,
             )
             .unwrap()
@@ -517,7 +525,7 @@ mod tests {
         assert_eq!(preview.source(), OpenIntentSource::StartupArguments);
         assert_eq!(
             preview.target(),
-            &OpenIntentPreviewTarget::CandidatePath(PathBuf::from("/work/one.md"))
+            &OpenIntentPreviewTarget::CandidatePath(work_root().join("one.md"))
         );
         assert_eq!(first.source(), OpenIntentSource::StartupArguments);
         assert!(!coordinator.discard_matching_head(second.id()));
@@ -526,7 +534,7 @@ mod tests {
         assert_eq!(consumed.source(), OpenIntentSource::StartupArguments);
         assert!(matches!(
             consumed.target(),
-            ConsumedOpenIntentTarget::CandidatePath(path) if path == Path::new("/work/one.md")
+            ConsumedOpenIntentTarget::CandidatePath(path) if path == &work_root().join("one.md")
         ));
         assert_eq!(coordinator.peek_head(), Some(second));
     }
@@ -537,7 +545,7 @@ mod tests {
         let startup = coordinator
             .enqueue_args(
                 args(&["mmd", "startup.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::StartupArguments,
             )
             .unwrap()
@@ -548,7 +556,7 @@ mod tests {
         let startup = coordinator.consume_matching_head(startup.id()).unwrap();
         assert!(matches!(
             startup.target(),
-            ConsumedOpenIntentTarget::CandidatePath(path) if path == Path::new("/work/startup.md")
+            ConsumedOpenIntentTarget::CandidatePath(path) if path == &work_root().join("startup.md")
         ));
         assert_eq!(coordinator.peek_head(), Some(restore));
         let preview = coordinator.peek_preview().unwrap();
@@ -567,7 +575,7 @@ mod tests {
         let startup = coordinator
             .enqueue_args(
                 args(&["mmd", "startup.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::StartupArguments,
             )
             .unwrap()
@@ -585,10 +593,7 @@ mod tests {
     fn opened_file_urls_enqueue_only_absolute_candidates() {
         let coordinator = OpenIntentCoordinator::new(2);
         let preview = coordinator
-            .enqueue_path(
-                PathBuf::from("/work/opened.md"),
-                OpenIntentSource::OpenedEvent,
-            )
+            .enqueue_path(work_root().join("opened.md"), OpenIntentSource::OpenedEvent)
             .unwrap()
             .head();
         assert_eq!(coordinator.peek_head(), Some(preview));
@@ -604,7 +609,7 @@ mod tests {
         let first = coordinator
             .enqueue_args(
                 args(&["mmd", "same.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::StartupArguments,
             )
             .unwrap()
@@ -612,7 +617,7 @@ mod tests {
         let duplicate = coordinator
             .enqueue_args(
                 args(&["mmd", "./same.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::StartupArguments,
             )
             .unwrap();
@@ -621,7 +626,7 @@ mod tests {
         let other_source = coordinator
             .enqueue_args(
                 args(&["mmd", "same.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::SecondaryInstance,
             )
             .unwrap();
@@ -634,7 +639,7 @@ mod tests {
         let first = coordinator
             .enqueue_args(
                 args(&["mmd", "one.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::StartupArguments,
             )
             .unwrap()
@@ -642,7 +647,7 @@ mod tests {
         assert_eq!(
             coordinator.enqueue_args(
                 args(&["mmd", "two.md"]),
-                Path::new("/work"),
+                &work_root(),
                 OpenIntentSource::StartupArguments
             ),
             Err(OpenIntentEnqueueError::QueueFull)
@@ -659,7 +664,7 @@ mod tests {
                 thread::spawn(move || {
                     coordinator.enqueue_args(
                         vec![OsString::from("mmd"), OsString::from(format!("{index}.md"))],
-                        Path::new("/work"),
+                        &work_root(),
                         OpenIntentSource::SecondaryInstance,
                     )
                 })
