@@ -788,6 +788,7 @@ pub(crate) struct SaveAuthorizationScope<'a> {
 
 pub(crate) struct SaveIdentityOrigins {
     document_ids: Vec<DocumentGrantId>,
+    settlement_generation: Option<u64>,
 }
 
 impl SaveAuthorizationScope<'_> {
@@ -816,7 +817,7 @@ impl SaveAuthorizationScope<'_> {
                 .is_some_and(|reservation| reservation.path == self.path)
     }
 
-    pub(crate) fn capture_identity_origins(&self) -> SaveIdentityOrigins {
+    pub(crate) fn capture_identity_origins(&self) -> Result<SaveIdentityOrigins, String> {
         let document_ids = self
             .state
             .grants
@@ -833,15 +834,23 @@ impl SaveAuthorizationScope<'_> {
                 }
                 _ => None,
             })
-            .collect();
-        SaveIdentityOrigins { document_ids }
+            .collect::<Vec<_>>();
+        let settlement_generation = if document_ids.is_empty() {
+            None
+        } else {
+            Some(self.state.next_authorization_generation()?)
+        };
+        Ok(SaveIdentityOrigins {
+            document_ids,
+            settlement_generation,
+        })
     }
 
     pub(crate) fn settle_identity_origins(
         &mut self,
         origins: &SaveIdentityOrigins,
         platform_identity: &str,
-    ) -> Result<(), String> {
+    ) {
         let changes = origins.document_ids.iter().any(|id| {
             self.state
                 .document_origin_identities
@@ -849,15 +858,16 @@ impl SaveAuthorizationScope<'_> {
                 .is_some_and(|identity| identity != platform_identity)
         });
         if !changes {
-            return Ok(());
+            return;
         }
-        self.state.advance_authorization_generation()?;
+        self.state.authorization_generation = origins
+            .settlement_generation
+            .expect("identity-bound save origins reserve their settlement generation");
         for id in &origins.document_ids {
             if let Some(identity) = self.state.document_origin_identities.get_mut(id) {
                 *identity = platform_identity.to_string();
             }
         }
-        Ok(())
     }
 
     pub(crate) fn publish_pending(&mut self, pending: &PendingSaveAuthority) {

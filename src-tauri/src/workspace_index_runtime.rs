@@ -143,6 +143,26 @@ impl WorkspaceIndexRuntime {
         workspace_root: &Path,
         operation_id: &str,
     ) -> Result<WorkspaceIndexLease, String> {
+        self.begin_rebuild_with_watch(workspace_token, workspace_root, operation_id, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_rebuild_without_watch_for_test(
+        &self,
+        workspace_token: &str,
+        workspace_root: &Path,
+        operation_id: &str,
+    ) -> Result<WorkspaceIndexLease, String> {
+        self.begin_rebuild_with_watch(workspace_token, workspace_root, operation_id, false)
+    }
+
+    fn begin_rebuild_with_watch(
+        &self,
+        workspace_token: &str,
+        workspace_root: &Path,
+        operation_id: &str,
+        install_native_watch: bool,
+    ) -> Result<WorkspaceIndexLease, String> {
         validate_operation_id(operation_id)?;
         let workspace_root_handle = Arc::new(
             open_directory_without_following_links(workspace_root)
@@ -186,6 +206,18 @@ impl WorkspaceIndexRuntime {
             (scope, cancellation, deadline, previous_watcher)
         };
         stop_watch(previous_watcher);
+
+        if !install_native_watch {
+            return Ok(WorkspaceIndexLease {
+                workspace_token: scope.workspace_token,
+                workspace_root: scope.workspace_root,
+                workspace_root_identity: scope.workspace_root_identity,
+                workspace_root_handle,
+                generation: scope.generation,
+                cancellation,
+                deadline,
+            });
+        }
 
         let watcher =
             match create_native_watch(workspace_root, Arc::downgrade(&self.state), scope.clone()) {

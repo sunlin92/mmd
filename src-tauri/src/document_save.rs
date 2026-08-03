@@ -250,7 +250,7 @@ impl DocumentSaveCoordinator {
                     overwrite_token: Some(overwrite_token),
                 });
             }
-            let identity_origins = scope.capture_identity_origins();
+            let identity_origins = scope.capture_identity_origins()?;
             let outcome = self.writer.write(scope.path(), bytes, &expected);
             if pending.is_some() {
                 if let Ok(DurableWriteOutcome::Conflict {
@@ -464,7 +464,7 @@ impl DocumentSaveCoordinator {
                     version: record.observed_version,
                 };
                 let path = scope.path().to_path_buf();
-                let identity_origins = scope.capture_identity_origins();
+                let identity_origins = scope.capture_identity_origins()?;
                 let outcome = self.writer.write(scope.path(), bytes, &expected);
                 self.finish_write(scope, pending.as_ref(), &identity_origins, outcome)
                     .map(|disposition| (path, disposition))
@@ -505,7 +505,7 @@ impl DocumentSaveCoordinator {
                 if let Some(pending) = pending {
                     scope.publish_pending(pending);
                 }
-                scope.settle_identity_origins(identity_origins, version.platform_identity())?;
+                scope.settle_identity_origins(identity_origins, version.platform_identity());
             }
             DurableWriteOutcome::Indeterminate { .. } => {
                 if let Some(pending) = pending {
@@ -779,6 +779,70 @@ mod tests {
         }
 
         assert_eq!(fs::read(&path).unwrap(), b"second");
+    }
+
+    #[test]
+    fn workspace_identity_settlement_reserves_its_terminal_generation_before_writing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, b"old").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+        authorize_workspace_file_inner(&state, &path).unwrap();
+        let authorization = state.file_authorization();
+        let expected = capture_file_version(&path).unwrap().unwrap();
+        authorization
+            .set_authorization_generation_for_test(u64::MAX - 1)
+            .unwrap();
+
+        let outcome = DocumentSaveCoordinator::default()
+            .save_expected(
+                authorization,
+                &path,
+                b"new",
+                expected,
+                "generation-limit",
+                MAIN_SAVE_OWNER,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DocumentSaveDisposition::ConfirmedCommitted { .. }
+        ));
+        assert_eq!(authorization.authorization_generation().unwrap(), u64::MAX);
+        assert_eq!(fs::read(path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn exhausted_workspace_identity_generation_fails_before_the_writer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, b"old").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, dir.path().to_path_buf()).unwrap();
+        authorize_workspace_file_inner(&state, &path).unwrap();
+        let authorization = state.file_authorization();
+        let expected = capture_file_version(&path).unwrap().unwrap();
+        authorization
+            .set_authorization_generation_for_test(u64::MAX)
+            .unwrap();
+        let writer = Arc::new(CountingWriter::new());
+        let coordinator =
+            DocumentSaveCoordinator::with_ports(writer.clone(), Arc::new(SystemMonotonicClock));
+
+        assert!(coordinator
+            .save_expected(
+                authorization,
+                &path,
+                b"new",
+                expected,
+                "generation-exhausted",
+                MAIN_SAVE_OWNER,
+            )
+            .is_err());
+        assert_eq!(writer.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(path).unwrap(), b"old");
     }
 
     #[test]

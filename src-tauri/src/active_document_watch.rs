@@ -848,36 +848,22 @@ impl ActiveDocumentWatchState {
         token: AppWriteToken,
         committed_version: Option<&FileVersion>,
     ) {
-        let committed_binding = committed_version.and_then(|version| {
-            let path = self
-                .inner
-                .lock()
-                .ok()?
-                .current
-                .as_ref()
-                .filter(|entry| {
-                    entry.watch_id == token.watch_id && entry.write_epoch == token.write_epoch
-                })?
-                .path
-                .clone();
-            let state = app.state::<AppState>();
-            let opened = open_authorized_existing_file_inner(&state, &path).ok()?;
-            let (_, file) = opened.into_parts();
-            let identity = opened_file_platform_identity(&file).ok()?;
-            (identity == version.platform_identity()).then(|| Arc::new(file))
-        });
-        if let Some(identity) = committed_version.map(FileVersion::platform_identity) {
-            if let Ok(mut state) = self.inner.lock() {
-                if let Some(entry) = state.current.as_mut().filter(|entry| {
-                    entry.watch_id == token.watch_id && entry.write_epoch == token.write_epoch
-                }) {
-                    entry.file_identity = Some(identity.to_string());
-                    entry.file_binding = committed_binding;
-                }
-            }
+        if let Some(version) = committed_version {
+            self.apply_committed_version(&token, version);
         }
         if let Some(watch_id) = self.settle_app_write(token, committed_version.is_some()) {
             spawn_scheduled_reconcile(app.clone(), watch_id, ScheduledReconcileMode::Event);
+        }
+    }
+
+    fn apply_committed_version(&self, token: &AppWriteToken, version: &FileVersion) {
+        if let Ok(mut state) = self.inner.lock() {
+            if let Some(entry) = state.current.as_mut().filter(|entry| {
+                entry.watch_id == token.watch_id && entry.write_epoch == token.write_epoch
+            }) {
+                entry.file_identity = Some(version.platform_identity().to_string());
+                entry.file_binding = version.retained_file_binding();
+            }
         }
     }
 }
@@ -1609,8 +1595,10 @@ impl ActiveDocumentWatchState {
 mod tests {
     use super::*;
     use crate::{
+        document_save::{DocumentSaveCoordinator, DocumentSaveDisposition, MAIN_SAVE_OWNER},
+        durable_write::capture_file_version,
         path_auth::{
-            authorize_directory_root_inner, authorize_file_inner,
+            authorize_directory_root_inner, authorize_file_inner, authorize_workspace_file_inner,
             ensure_authorized_write_file_inner,
         },
         state::AppState,
@@ -1972,6 +1960,56 @@ mod tests {
         watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
         fs::rename(&canonical_old, &new_path).unwrap();
         let canonical_new = new_path.canonicalize().unwrap();
+        let mut context = reconcile_context(&canonical_old, WorkspaceFileKind::Markdown);
+        context
+            .rename_candidates
+            .push((canonical_old.clone(), canonical_new.clone()));
+        let mut resolved = resolve_disk_state(&state, &context).unwrap();
+        let mut watch_state = watch.lock().unwrap();
+        let entry = watch_state.current.as_mut().unwrap();
+
+        finalize_authorization_transition(&state, entry, &mut resolved).unwrap();
+
+        assert_eq!(entry.path, canonical_new);
+        assert!(ensure_authorized_write_file_inner(&state, &entry.path).is_ok());
+        assert!(ensure_authorized_write_file_inner(&state, &canonical_old).is_err());
+    }
+
+    #[test]
+    fn committed_save_binding_survives_an_immediate_rename_before_watch_settlement() {
+        let workspace = tempdir().unwrap();
+        let old_path = workspace.path().join("old.md");
+        let new_path = workspace.path().join("new.md");
+        fs::write(&old_path, "old content").unwrap();
+        let state = AppState::default();
+        authorize_directory_root_inner(&state, workspace.path().to_path_buf()).unwrap();
+        authorize_workspace_file_inner(&state, &old_path).unwrap();
+        let canonical_old = old_path.canonicalize().unwrap();
+        let watch = ActiveDocumentWatchState::default();
+        watch.install_for_test("watch-1", "pane-document-1", 7, canonical_old.clone());
+        assert!(watch.activate_for_test("watch-1", "pane-document-1", 7, 1));
+        let token = watch
+            .begin_app_write(&canonical_old, b"saved content".to_vec())
+            .unwrap();
+        let expected = capture_file_version(&canonical_old).unwrap().unwrap();
+        let outcome = DocumentSaveCoordinator::default()
+            .save_expected(
+                state.file_authorization(),
+                &canonical_old,
+                b"saved content",
+                expected,
+                "save-before-rename",
+                MAIN_SAVE_OWNER,
+            )
+            .unwrap();
+        let DocumentSaveDisposition::ConfirmedCommitted { version, .. } = outcome else {
+            panic!("save must commit");
+        };
+
+        fs::rename(&canonical_old, &new_path).unwrap();
+        let canonical_new = new_path.canonicalize().unwrap();
+        watch.apply_committed_version(&token, &version);
+        watch.settle_app_write(token, true);
         let mut context = reconcile_context(&canonical_old, WorkspaceFileKind::Markdown);
         context
             .rename_candidates

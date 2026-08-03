@@ -580,41 +580,27 @@ mod tests {
         (snapshot.workspace_token, snapshot.root)
     }
 
-    fn rebuild_and_query_ready(
+    fn rebuild_without_watch(
         state: &AppState,
         workspace_token: &str,
         workspace_root: &str,
-        query: IndexQuery,
-    ) -> WorkspaceIndexQueryResponse {
-        const MAX_ATTEMPTS: usize = 3;
-
-        for attempt in 1..=MAX_ATTEMPTS {
-            // A live watcher may legitimately invalidate this generation between
-            // the rebuild response and the query's final currency check.
-            let rebuilt = rebuild_workspace_index_inner(
-                state,
-                workspace_token,
-                workspace_root,
-                &format!("build-{attempt}"),
-            )
+    ) -> WorkspaceIndexRebuildResponse {
+        let workspace = resolve_authorized_workspace_root_for_token_inner(
+            state,
+            workspace_token,
+            workspace_root,
+        )
+        .unwrap();
+        let canonical_root = fs::canonicalize(workspace_root).unwrap();
+        let lease = state
+            .workspace_index()
+            .begin_rebuild_without_watch_for_test(workspace_token, &canonical_root, "build-1")
             .unwrap();
-            assert_eq!(rebuilt.status, WorkspaceIndexStatus::Ready);
-
-            match query_workspace_index_inner(
-                state,
-                workspace_token,
-                workspace_root,
-                &format!("query-{attempt}"),
-                query.clone(),
-            ) {
-                Ok(response) if response.status == WorkspaceIndexStatus::Ready => return response,
-                Ok(response) => assert_eq!(response.status, WorkspaceIndexStatus::Invalidated),
-                Err(error) if error == "Workspace index has not been built" => {}
-                Err(error) => panic!("workspace index query failed unexpectedly: {error}"),
-            }
-        }
-
-        panic!("workspace index was invalidated during every rebuild/query attempt");
+        let _guard = OperationGuard {
+            state,
+            operation_id: "build-1",
+        };
+        rebuild_authorized_workspace_index(state, &workspace, &lease).unwrap()
     }
 
     #[cfg(unix)]
@@ -640,8 +626,16 @@ mod tests {
         let state = AppState::default();
         let (token, root) = open_workspace(&state, directory.path());
 
-        let response =
-            rebuild_and_query_ready(&state, &token, &root, IndexQuery::full_text("needle"));
+        let rebuilt = rebuild_without_watch(&state, &token, &root);
+        assert_eq!(rebuilt.status, WorkspaceIndexStatus::Ready);
+        let response = query_workspace_index_inner(
+            &state,
+            &token,
+            &root,
+            "query-1",
+            IndexQuery::full_text("needle"),
+        )
+        .unwrap();
         assert_eq!(response.status, WorkspaceIndexStatus::Ready);
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].relative_path, "alpha.md");

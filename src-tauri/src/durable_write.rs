@@ -2,7 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 const STAGING_ATTEMPTS: usize = 32;
 static DURABLE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileVersion {
     canonical_path: String,
@@ -22,7 +22,21 @@ pub(crate) struct FileVersion {
     #[serde(serialize_with = "serialize_decimal")]
     modified_nanos: u128,
     sha256: String,
+    #[serde(skip)]
+    file_binding: Option<Arc<File>>,
 }
+
+impl PartialEq for FileVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_path == other.canonical_path
+            && self.platform_identity == other.platform_identity
+            && self.length == other.length
+            && self.modified_nanos == other.modified_nanos
+            && self.sha256 == other.sha256
+    }
+}
+
+impl Eq for FileVersion {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -62,6 +76,7 @@ impl<'de> Deserialize<'de> for FileVersion {
             length: parse_decimal(&wire.length).map_err(D::Error::custom)?,
             modified_nanos: parse_decimal(&wire.modified_nanos).map_err(D::Error::custom)?,
             sha256: wire.sha256,
+            file_binding: None,
         })
     }
 }
@@ -123,6 +138,10 @@ impl FileVersion {
 
     pub(crate) fn platform_identity(&self) -> &str {
         &self.platform_identity
+    }
+
+    pub(crate) fn retained_file_binding(&self) -> Option<Arc<File>> {
+        self.file_binding.clone()
     }
 
     pub(crate) fn opaque_token(&self) -> String {
@@ -576,6 +595,7 @@ pub(crate) fn read_versioned_open_file(
             length: metadata.len(),
             modified_nanos,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
+            file_binding: Some(Arc::new(file)),
         },
         bytes,
     })
@@ -732,6 +752,7 @@ fn observe_open_file(
             length: metadata.len(),
             modified_nanos,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
+            file_binding: Some(Arc::new(file)),
         },
         bytes,
     }))
@@ -1804,6 +1825,7 @@ mod tests {
             length: u64::MAX,
             modified_nanos: u128::MAX,
             sha256: "a".repeat(64),
+            file_binding: None,
         };
         let json = serde_json::to_value(&version).unwrap();
         assert_eq!(json["length"], u64::MAX.to_string());

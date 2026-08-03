@@ -998,6 +998,7 @@ impl RecentFilesState {
         let prepared_outcome =
             runtime.prepare_terminal_outcome(owner_window, pending.commit_operation_id, now)?;
         let mut prepared_outcome = Some(prepared_outcome);
+        let mut indeterminate_error = None;
         let failure_outcome = TerminalOpenOutcome::NotCommitted {
             message: COMMIT_FAILURE_MESSAGE.to_string(),
         };
@@ -1015,7 +1016,8 @@ impl RecentFilesState {
                     .filter(|target| target == &pending.canonical_target)
                     .ok_or_else(|| "Open target is no longer a supported file".to_string())?
             };
-            let mut promoted = store;
+            let original = store;
+            let mut promoted = original.clone();
             promoted.promote(canonical_target.clone(), &mut || self.id_source.next_id())?;
             let snapshot = promoted.snapshot()?;
             let retained_snapshot = snapshot.clone();
@@ -1025,7 +1027,14 @@ impl RecentFilesState {
                 pending.workspace_authorization.as_ref(),
                 |grant| {
                     self.store.persist_locked(&promoted)?;
-                    grant.apply()?;
+                    if let Err(error) = grant.apply() {
+                        if let Err(rollback_error) = self.store.persist_locked(&original) {
+                            indeterminate_error = Some(format!(
+                                "Recent file commit became indeterminate after authorization failed ({error}) and rollback failed: {rollback_error}"
+                            ));
+                        }
+                        return Err(error);
+                    }
                     runtime.apply_terminal_outcome(
                         prepared_outcome
                             .take()
@@ -1044,6 +1053,10 @@ impl RecentFilesState {
                 drop(runtime);
                 post_commit(Path::new(&canonical_target));
                 Ok(OpenCommitResult::Committed { recent_files })
+            }
+            Err(_) if indeterminate_error.is_some() => {
+                Err(indeterminate_error
+                    .expect("indeterminate commit failure retains its diagnostic"))
             }
             Err(_) => {
                 runtime.apply_terminal_outcome(
@@ -1300,7 +1313,7 @@ mod tests {
         path::{Path, PathBuf},
         process::{Child, Command},
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc::{self, Receiver, Sender},
             Arc, Mutex,
         },
@@ -1733,6 +1746,47 @@ mod tests {
                     .map_err(|_| io::Error::other("replacement release sender dropped"))?;
             }
             SystemRecentStoreAtomicReplacer.replace_complete_image(staged, active)
+        }
+    }
+
+    struct PausingRollbackFailingReplacer {
+        calls: AtomicUsize,
+        entered: Sender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl PausingRollbackFailingReplacer {
+        fn new() -> (Arc<Self>, Receiver<()>, Sender<()>) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    impl RecentStoreAtomicReplacer for PausingRollbackFailingReplacer {
+        fn replace_complete_image(&self, staged: &Path, active: &Path) -> io::Result<()> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    self.entered
+                        .send(())
+                        .map_err(|_| io::Error::other("replacement entry receiver dropped"))?;
+                    self.release
+                        .lock()
+                        .map_err(|_| io::Error::other("replacement release gate poisoned"))?
+                        .recv()
+                        .map_err(|_| io::Error::other("replacement release sender dropped"))?;
+                    SystemRecentStoreAtomicReplacer.replace_complete_image(staged, active)
+                }
+                _ => Err(io::Error::other("injected rollback replacement failure")),
+            }
         }
     }
 
@@ -2458,6 +2512,56 @@ mod tests {
             .file_authorization()
             .with_exact_write_authority(&document, |_, _| Ok(()))
             .is_err());
+        assert!(recent.list().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn workspace_commit_reports_indeterminate_when_recent_store_rollback_fails() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let document = root.join("note.md");
+        let displaced = root.join("displaced.md");
+        fs::create_dir(&root).unwrap();
+        fs::write(&document, "authorized content").unwrap();
+        let state = Arc::new(AppState::default());
+        authorize_directory_root_inner(&state, root).unwrap();
+        let opened = open_authorized_existing_file_inner(&state, &document).unwrap();
+        let (replacer, replacement_entered, release_replacement) =
+            PausingRollbackFailingReplacer::new();
+        let recent = Arc::new(state_with(directory.path().join("app-data"), replacer));
+        let identifiers = recent
+            .issue_workspace_open(
+                "main",
+                opened
+                    .workspace_authorization()
+                    .expect("workspace reads carry their authorization"),
+            )
+            .unwrap();
+        drop(opened);
+        let commit_recent = recent.clone();
+        let commit_state = state.clone();
+        let open_receipt = identifiers.open_receipt;
+        let commit = thread::spawn(move || {
+            commit_recent.commit_open(&open_receipt, "main", commit_state.file_authorization())
+        });
+        replacement_entered
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        fs::rename(&document, &displaced).unwrap();
+        fs::write(&document, "replacement content").unwrap();
+        release_replacement.send(()).unwrap();
+
+        let error = commit.join().unwrap().unwrap_err();
+        assert!(error.contains("indeterminate"));
+        assert!(matches!(
+            recent
+                .status("main", &identifiers.commit_operation_id)
+                .unwrap(),
+            OpenCommitStatus::Unknown
+        ));
+        assert_eq!(recent.list().unwrap().entries.len(), 1);
+        assert!(ensure_authorized_write_file_inner(&state, &document).is_err());
     }
 
     #[test]
