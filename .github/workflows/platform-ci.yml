@@ -28,6 +28,7 @@ jobs:
       - run: npm run test:metadata
       - run: npm run test:packaged-main-binary
       - run: npm run test:perf
+      - run: npm run verify:m3-attestation
       - run: npm test
       - run: npm run typecheck
       - run: npm run lint

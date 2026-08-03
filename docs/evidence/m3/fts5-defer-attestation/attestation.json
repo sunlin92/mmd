@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "attestation": "m3-fts5-three-run-series",
+  "baseline": {
+    "path": "../../../../scripts/perf/baselines/100k.json",
+    "sha256": "7beea421055b841c3dd58ef828c24a60de182be164b26a4f3912749b33cabfb0"
+  },
+  "runs": [
+    {
+      "sequence": 1,
+      "candidate": {
+        "path": "mmd-m3-100k-b6b2335-run1.json",
+        "sha256": "cba03c0b096ad7960bb6e112b357333bf9e7057dade15fc7b6cf3411608ff4b7"
+      },
+      "gateReport": {
+        "path": "mmd-m3-100k-b6b2335-run1-gate.json",
+        "sha256": "415fcfc29a1b03afa74b1ab37dfa0e03adc3f1393a911ebc135de744b86a3840"
+      }
+    },
+    {
+      "sequence": 2,
+      "candidate": {
+        "path": "mmd-m3-100k-b6b2335-run2.json",
+        "sha256": "b3a2565147dc17bd1adfe141654b9c5c993104f4b4fde1d040f75a4778959154"
+      },
+      "gateReport": {
+        "path": "mmd-m3-100k-b6b2335-run2-gate.json",
+        "sha256": "ffbee9e78fc9d5e0dcbff6fa84667add88980ed29c3930574e24fd337b557bfe"
+      }
+    },
+    {
+      "sequence": 3,
+      "candidate": {
+        "path": "mmd-m3-100k-b6b2335-ab-b.json",
+        "sha256": "f08166a53c1a01020f596734a4707a2ba8fb87baed51191ecb4796d0917e15da"
+      },
+      "gateReport": {
+        "path": "mmd-m3-100k-b6b2335-ab-b-gate.json",
+        "sha256": "5f99b6edaf6880d5b1d2179cadcfb1af123c39a2999b1aee76d7bbd50b7dda30"
+      }
+    }
+  ]
+}

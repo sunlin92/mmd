@@ -25,14 +25,18 @@ incremental memory, and cancellation passed in all three runs. The first
 failure remains valid evidence and is not erased by the later passes, but the
 series does not establish a sustained capacity failure.
 
-The existing index contract is also broader than default FTS5 behavior. It
-provides arbitrary-length Unicode substring matching, full case folding such
-as `ss` matching sharp S, CJK substring matching, whitespace-term AND,
-deterministic normalized-path and filename-rank ordering, bounded snippets,
-and exact line and UTF-8 byte locations in the source. FTS5's closest built-in
-option is the trigram tokenizer, but its full-text queries do not match
-substrings shorter than three Unicode characters. Its query grammar, ranking,
-and snippet behavior also differ.
+The existing index contract is also broader than default FTS5 behavior. Its
+schema-versioned custom normalization lowercases Unicode characters, maps
+sharp S (`ß` and `ẞ`) to `ss`, and maps final sigma (`ς`) to sigma (`σ`). It
+does not implement the complete Unicode case-folding table and must not be
+described as full Unicode case folding. The index provides arbitrary-length
+Unicode substring matching under that normalization contract, CJK substring
+matching, whitespace-term AND, deterministic normalized-path and
+filename-rank ordering, bounded snippets, and exact line and UTF-8 byte
+locations in the source. FTS5's closest built-in option is the trigram
+tokenizer, but its full-text queries do not match substrings shorter than three
+Unicode characters. Its query grammar, ranking, snippet behavior, and
+normalization contract also differ.
 
 ## Decision
 
@@ -52,6 +56,13 @@ Reopen dependency adoption when either condition is met:
 2. A newly approved corpus, limit, or correctness requirement cannot be met by
    the in-memory implementation without weakening result correctness,
    authorization, cancellation, or the approved resource bounds.
+
+For an otherwise valid three-run series, the machine decision is
+metric-specific: `reopen` when any one frozen metric fails in at least two
+runs, and `defer` only when every metric fails in fewer than two runs. Failures
+of different metrics are not combined. The checked-in fail/pass/pass series
+therefore evaluates to `defer` because cold-build p95 fails once and every
+other metric fails zero times.
 
 If reopened, evaluate a time-boxed prototype pinned as:
 
@@ -81,7 +92,7 @@ of these properties:
 - Treat the cache as derived, non-authoritative, disposable, and rebuildable
   only from currently authorized Markdown.
 - Bind it to an opaque workspace authorization identity and generation, index
-  implementation/schema IDs, tokenizer and case-folding contract, corpus
+  implementation/schema IDs, tokenizer and custom normalization contract, corpus
   digest, and configured limits.
 - Avoid raw content duplication where possible. Assume FTS terms can disclose
   document text and that default deletion does not reliably remove old terms.
@@ -115,8 +126,10 @@ implementation for:
 
 - Exact normalized result paths, ordering, result limits, and truncation.
 - Filename rank buckets and whitespace-term AND semantics.
-- Unicode full case folding, CJK, sigma, sharp S, and arbitrary one- and
-  two-character substring queries.
+- The schema-versioned custom normalization contract: Unicode lowercase,
+  sharp S to `ss`, final sigma to sigma, CJK, and arbitrary one- and
+  two-character substring queries. A prototype must not assume equivalence to
+  the complete Unicode case-folding table.
 - Literal handling of input that FTS5 would otherwise parse as query syntax.
 - Snippets, line numbers, and exact original-source UTF-8 byte offsets.
 - Cancellation, configured resource limits, implementation/schema identity,
@@ -124,6 +137,9 @@ implementation for:
 
 Adoption additionally requires all frozen 10,000- and 100,000-file build,
 query, memory, and cancellation gates to pass on macOS, Windows, and Linux.
+Platform-specific frozen baselines and three complete comparable measurements
+on each supported platform are prerequisites. No current platform-specific
+adoption baseline is claimed by this ADR or its attestation.
 
 ## Consequences
 
@@ -153,14 +169,35 @@ be updated at adoption time.
 
 ## Evidence
 
+The durable attestation manifest is
+`docs/evidence/m3/fts5-defer-attestation/attestation.json`; its provenance and
+SHA-256 inventory are in the adjacent `README.md`. `npm run
+verify:m3-attestation` verifies the frozen-baseline digest, all six evidence
+digests, exact run count and ordering, complete clean-commit candidates,
+cross-run environment/corpus/limits/index identity, baseline comparability,
+gate-report content, and the metric-specific series decision.
+
+Platform CI and release CI run this verifier over checked-in bytes. This is a
+release-attestation integrity and enforceability boundary: it proves the ADR's
+historical evidence remains present, untampered, comparable, and reproducible
+by the evaluator. It deliberately does not execute the unstable 100,000-file
+timing benchmark on hosted runners and is not fresh performance evidence for
+those runners or any supported platform.
+
 - Frozen 100,000-file baseline:
   `scripts/perf/baselines/100k.json`
-- First comparable failure:
-  `.omx/tmp/m3-fts5-research/evidence/mmd-m3-100k-b6b2335-run1-gate.json`
-- First repeat pass:
-  `.omx/tmp/m3-fts5-research/evidence/mmd-m3-100k-b6b2335-run2-gate.json`
-- Second repeat pass:
-  `.omx/tmp/m3-fts5-research/evidence/mmd-m3-100k-b6b2335-ab-b-gate.json`
+- First comparable failure candidate and gate report:
+  `docs/evidence/m3/fts5-defer-attestation/mmd-m3-100k-b6b2335-run1.json`
+  and
+  `docs/evidence/m3/fts5-defer-attestation/mmd-m3-100k-b6b2335-run1-gate.json`
+- First repeat-pass candidate and gate report:
+  `docs/evidence/m3/fts5-defer-attestation/mmd-m3-100k-b6b2335-run2.json`
+  and
+  `docs/evidence/m3/fts5-defer-attestation/mmd-m3-100k-b6b2335-run2-gate.json`
+- Second repeat-pass candidate and gate report:
+  `docs/evidence/m3/fts5-defer-attestation/mmd-m3-100k-b6b2335-ab-b.json`
+  and
+  `docs/evidence/m3/fts5-defer-attestation/mmd-m3-100k-b6b2335-ab-b-gate.json`
 - Production index implementation and equivalence tests:
   `src-tauri/src/workspace_index.rs`
 - Authorization-scoped runtime invalidation:

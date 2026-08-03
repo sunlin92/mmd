@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "status": "complete",
+  "environment": {
+    "os": "darwin",
+    "arch": "arm64"
+  },
+  "app": {
+    "name": "mmd",
+    "version": "0.1.0"
+  },
+  "build": {
+    "profile": "release",
+    "gitCommit": "b6b2335564eccf0616e84bf911ca363ce84b7100",
+    "dirty": false,
+    "runner": "cargo mmd_bench"
+  },
+  "index": {
+    "implementationId": "mmd-memory-substring-v1",
+    "schemaId": "mmd-workspace-index-v1"
+  },
+  "corpus": {
+    "fixtureVersion": 1,
+    "fixtureDigest": "6373ddfac9cb09ba48e6572a5417569cdf4adefd2e974510117f84c430497ea2",
+    "seed": 7417,
+    "fileCount": 100000,
+    "digest": "sha256-v1:1a19d73ae96f843980377289fbe3b362ea99fa5fa818caf2a0ab111ab8d79cac",
+    "indexedMarkdownBytes": 35969134,
+    "limits": {
+      "maxFiles": 100000,
+      "maxFileBytes": 1048576,
+      "maxAggregateBytes": 268435456,
+      "maxResults": 100,
+      "maxQueryChars": 256,
+      "maxSnippetChars": 240
+    }
+  },
+  "measurement": {
+    "wallClock": "std::time::Instant",
+    "timingUnit": "milliseconds",
+    "warmupCount": 2,
+    "sampleCount": 5,
+    "processCount": 10,
+    "errorCount": 0
+  },
+  "memory": {
+    "measurementKind": "independentProcessPeakRssDelta",
+    "peakIncrementalBytesSamples": [
+      105693184,
+      103809024,
+      103792640,
+      103743488,
+      103661568
+    ],
+    "estimatedIndexBytes": 75738268
+  },
+  "metrics": {
+    "coldBuildMs": {
+      "min": 435.587,
+      "median": 476.972,
+      "p95": 487.922,
+      "max": 487.922,
+      "samples": 5
+    },
+    "warmQueryMs": {
+      "min": 5.785,
+      "median": 6.221,
+      "p95": 6.814,
+      "max": 6.814,
+      "samples": 5
+    },
+    "peakIncrementalMemoryBytes": {
+      "min": 103661568,
+      "median": 103792640,
+      "p95": 105693184,
+      "max": 105693184,
+      "samples": 5
+    },
+    "cancellationMs": {
+      "min": 2.583,
+      "median": 2.701,
+      "p95": 3.346,
+      "max": 3.346,
+      "samples": 5
+    }
+  },
+  "errors": [],
+  "incompleteReason": null,
+  "rebaseline": null
+}

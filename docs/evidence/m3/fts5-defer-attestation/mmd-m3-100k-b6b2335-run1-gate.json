@@ -1,0 +1,205 @@
+{
+  "schemaVersion": 1,
+  "status": "fail",
+  "corpusFileCount": 100000,
+  "comparable": true,
+  "fts5AdrRequired": true,
+  "failedThresholds": [
+    "coldBuildMs"
+  ],
+  "comparabilityFailures": [],
+  "checks": [
+    {
+      "kind": "identity",
+      "name": "environment.os",
+      "expected": "darwin",
+      "actual": "darwin",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "environment.arch",
+      "expected": "arm64",
+      "actual": "arm64",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "app.name",
+      "expected": "mmd",
+      "actual": "mmd",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "build.profile",
+      "expected": "release",
+      "actual": "release",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "build.runner",
+      "expected": "cargo mmd_bench",
+      "actual": "cargo mmd_bench",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "index.implementationId",
+      "expected": "mmd-memory-substring-v1",
+      "actual": "mmd-memory-substring-v1",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "index.schemaId",
+      "expected": "mmd-workspace-index-v1",
+      "actual": "mmd-workspace-index-v1",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "corpus.fixtureVersion",
+      "expected": 1,
+      "actual": 1,
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "corpus.fixtureDigest",
+      "expected": "6373ddfac9cb09ba48e6572a5417569cdf4adefd2e974510117f84c430497ea2",
+      "actual": "6373ddfac9cb09ba48e6572a5417569cdf4adefd2e974510117f84c430497ea2",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "corpus.seed",
+      "expected": 7417,
+      "actual": 7417,
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "corpus.fileCount",
+      "expected": 100000,
+      "actual": 100000,
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "corpus.digest",
+      "expected": "sha256-v1:1a19d73ae96f843980377289fbe3b362ea99fa5fa818caf2a0ab111ab8d79cac",
+      "actual": "sha256-v1:1a19d73ae96f843980377289fbe3b362ea99fa5fa818caf2a0ab111ab8d79cac",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "corpus.indexedMarkdownBytes",
+      "expected": 35969134,
+      "actual": 35969134,
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "corpus.limits",
+      "expected": {
+        "maxFiles": 100000,
+        "maxFileBytes": 1048576,
+        "maxAggregateBytes": 268435456,
+        "maxResults": 100,
+        "maxQueryChars": 256,
+        "maxSnippetChars": 240
+      },
+      "actual": {
+        "maxFiles": 100000,
+        "maxFileBytes": 1048576,
+        "maxAggregateBytes": 268435456,
+        "maxResults": 100,
+        "maxQueryChars": 256,
+        "maxSnippetChars": 240
+      },
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "measurement.wallClock",
+      "expected": "std::time::Instant",
+      "actual": "std::time::Instant",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "measurement.timingUnit",
+      "expected": "milliseconds",
+      "actual": "milliseconds",
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "measurement.warmupCount",
+      "expected": 2,
+      "actual": 2,
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "measurement.sampleCount",
+      "expected": 5,
+      "actual": 5,
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "measurement.processCount",
+      "expected": 10,
+      "actual": 10,
+      "passed": true
+    },
+    {
+      "kind": "identity",
+      "name": "memory.measurementKind",
+      "expected": "independentProcessPeakRssDelta",
+      "actual": "independentProcessPeakRssDelta",
+      "passed": true
+    },
+    {
+      "kind": "threshold",
+      "name": "coldBuildMs",
+      "expected": 602.721,
+      "actual": 621.794,
+      "operator": "<=",
+      "passed": false,
+      "skipped": false
+    },
+    {
+      "kind": "threshold",
+      "name": "warmQueryMs",
+      "expected": 108.578,
+      "actual": 20.689,
+      "operator": "<=",
+      "passed": true,
+      "skipped": false
+    },
+    {
+      "kind": "threshold",
+      "name": "peakIncrementalMemoryBytes",
+      "expected": 156745728,
+      "actual": 106954752,
+      "operator": "<=",
+      "passed": true,
+      "skipped": false
+    },
+    {
+      "kind": "threshold",
+      "name": "cancellationMs",
+      "expected": 56.385,
+      "actual": 7.808,
+      "operator": "<=",
+      "passed": true,
+      "skipped": false
+    }
+  ],
+  "frozenArtifact": "scripts/perf/baselines/100k.json",
+  "candidateArtifact": "/tmp/mmd-m3-100k-b6b2335-run1.json"
+}

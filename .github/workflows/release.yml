@@ -30,6 +30,7 @@ jobs:
       - id: version
         run: npm run check:release-version -- --github-output
       - run: npm run test:release-tools
+      - run: npm run verify:m3-attestation
       - run: npm test
       - run: npm run typecheck
       - run: npm run lint
