@@ -220,20 +220,49 @@ fn sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+#[cfg(any(windows, test))]
+fn windows_verbatim_drive_root_matches(root: &[u16], canonical: &[u16]) -> bool {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+
+    let absolute_drive = root.first().copied().is_some_and(|value| {
+        (b'A' as u16..=b'Z' as u16).contains(&value) || (b'a' as u16..=b'z' as u16).contains(&value)
+    }) && root.get(1) == Some(&(b':' as u16))
+        && root.get(2) == Some(&BACKSLASH);
+    absolute_drive
+        && canonical
+            .strip_prefix(&VERBATIM_PREFIX)
+            .is_some_and(|remainder| remainder == root)
+}
+
+fn canonical_challenge_root(root: &Path) -> Result<PathBuf, String> {
+    let canonical = fs::canonicalize(root)
+        .map_err(|error| format!("Cannot canonicalize packaged open challenge: {error}"))?;
+    if canonical == root {
+        return Ok(root.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let root_wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
+        let canonical_wide = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
+        if windows_verbatim_drive_root_matches(&root_wide, &canonical_wide) {
+            return Ok(root.to_path_buf());
+        }
+    }
+    Err("Packaged open E2E challenge root is not canonical".to_string())
+}
+
 impl PackagedOpenObserver {
     fn from_environment() -> Result<Option<Self>, String> {
         let Some(root) = optional_env("MMD_PACKAGED_OPEN_E2E_CHALLENGE") else {
             return Ok(None);
         };
-        let root = PathBuf::from(root);
+        let root = canonical_challenge_root(&PathBuf::from(root))?;
         let nonce = required_env("MMD_PACKAGED_OPEN_E2E_NONCE")?;
         if nonce.len() != 64 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("Packaged open E2E nonce is invalid".to_string());
-        }
-        let canonical_root = fs::canonicalize(&root)
-            .map_err(|error| format!("Cannot canonicalize packaged open challenge: {error}"))?;
-        if canonical_root != root {
-            return Err("Packaged open E2E challenge root is not canonical".to_string());
         }
         let fixtures = root.join("fixtures with spaces");
         let profile = required_env("MMD_PACKAGED_OPEN_E2E_PROFILE")?;
@@ -925,6 +954,50 @@ pub(crate) fn record_packaged_open_app_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_only_the_equivalent_windows_verbatim_drive_root() {
+        let dos = r"C:\Users\runneradmin\AppData\Local\Temp\challenge";
+        let verbatim = r"\\?\C:\Users\runneradmin\AppData\Local\Temp\challenge";
+
+        assert!(windows_verbatim_drive_root_matches(
+            &dos.encode_utf16().collect::<Vec<_>>(),
+            &verbatim.encode_utf16().collect::<Vec<_>>(),
+        ));
+        assert!(!windows_verbatim_drive_root_matches(
+            &dos.encode_utf16().collect::<Vec<_>>(),
+            &r"\\?\c:\Users\runneradmin\AppData\Local\Temp\challenge"
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+        ));
+        assert!(!windows_verbatim_drive_root_matches(
+            &r"\\server\share\challenge"
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+            &r"\\?\UNC\server\share\challenge"
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+        ));
+        assert!(!windows_verbatim_drive_root_matches(
+            &dos.encode_utf16().collect::<Vec<_>>(),
+            &r"\\?\C:\Users\runneradmin\AppData\Local\Temp\other"
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_a_windows_temp_root_after_verbatim_canonicalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(directory.path()).unwrap();
+
+        assert_ne!(canonical, directory.path());
+        assert_eq!(
+            canonical_challenge_root(directory.path()).unwrap(),
+            directory.path(),
+        );
+    }
 
     fn test_observer(root: &Path, package_variant: &str, profile: &str) -> PackagedOpenObserver {
         let fixtures = root.join("fixtures with spaces");

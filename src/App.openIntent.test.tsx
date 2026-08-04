@@ -4,7 +4,10 @@
 import { act, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import App from './App';
+import App, {
+  syncOpenIntentCoordinatorModalState,
+  updatePackagedSettlementBarrier,
+} from './App';
 import { NATIVE_MENU_EVENT } from './lib/nativeMenu';
 import { OPEN_INTENT_FOCUS_EVENT, OPEN_INTENT_PENDING_EVENT } from './lib/openIntent';
 
@@ -279,6 +282,19 @@ describe('App open intent routing', () => {
     container.remove();
     delete (window as unknown as { __TAURI_INTERNALS__?: object }).__TAURI_INTERNALS__;
     vi.unstubAllEnvs();
+  });
+
+  it('keeps the coordinator blocked when a stale modal effect flushes during barrier activation', () => {
+    const barrierRef = { current: false };
+    const coordinator = { setModalActive: vi.fn<(active: boolean) => void>() };
+    const setRenderedActive = vi.fn<(active: boolean) => void>(() => {
+      syncOpenIntentCoordinatorModalState(coordinator, false, barrierRef);
+    });
+
+    updatePackagedSettlementBarrier(barrierRef, setRenderedActive, true);
+
+    expect(setRenderedActive).toHaveBeenCalledWith(true);
+    expect(coordinator.setModalActive).toHaveBeenCalledWith(true);
   });
 
   it('polls the backend queue and resolves a clean request', async () => {

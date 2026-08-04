@@ -189,6 +189,23 @@ test('runs packaged lifecycle feature tests on every native target before packag
   );
 });
 
+test('runs packaged-open feature tests on every native target before packaging', async () => {
+  const value = await workflow();
+  const featureTest =
+    'cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --release --features packaged-lifecycle-e2e packaged_open_e2e::tests';
+  const featureTestIndex = value.indexOf(featureTest);
+  const macosBuildIndex = value.indexOf('- name: Build macOS package');
+  const nonMacosBuildIndex = value.indexOf('- name: Build non-macOS package');
+
+  assert.equal(value.split(featureTest).length - 1, 1);
+  assert.ok(featureTestIndex !== -1, 'native matrix must run the packaged-open feature tests');
+  assert.ok(featureTestIndex < macosBuildIndex, 'feature tests must run before the macOS package build');
+  assert.ok(
+    featureTestIndex < nonMacosBuildIndex,
+    'feature tests must run before the non-macOS package build',
+  );
+});
+
 test('runs packaged-open verifier integration tests on the Windows native runner', async () => {
   const value = await workflow();
   const step = [

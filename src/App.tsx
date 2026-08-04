@@ -302,6 +302,27 @@ const PACKAGED_UNICODE_READY_POLL_INTERVAL_MS = 50;
 const PACKAGED_UNICODE_READY_MAX_ATTEMPTS = 200;
 const PACKAGED_DIRTY_SEED = '<!-- mmd-packaged-open-dirty -->';
 
+interface MutableBooleanRef {
+  current: boolean;
+}
+
+export function updatePackagedSettlementBarrier(
+  barrierRef: MutableBooleanRef,
+  setRenderedActive: (active: boolean) => void,
+  active: boolean,
+): void {
+  barrierRef.current = active;
+  setRenderedActive(active);
+}
+
+export function syncOpenIntentCoordinatorModalState(
+  coordinator: Pick<OpenIntentCoordinator, 'setModalActive'>,
+  renderedModalActive: boolean,
+  barrierRef: Readonly<MutableBooleanRef>,
+): void {
+  coordinator.setModalActive(renderedModalActive || barrierRef.current);
+}
+
 export default function App() {
   const { locale, t } = useI18n();
   const packagedOpenEvidenceEnabled = import.meta.env.VITE_MMD_PACKAGED_OPEN_E2E === '1';
@@ -322,7 +343,7 @@ export default function App() {
     intent: Extract<AppOpenIntent, { origin: 'backend' }>;
     status: 'accepted' | 'cancelled' | 'failed';
   } | null>(null);
-  const [packagedSettlementBarrierActive, setPackagedSettlementBarrierActive] = useState(false);
+  const [packagedSettlementBarrierActive, setPackagedSettlementBarrierState] = useState(false);
   const [packagedDirtySeedPending, setPackagedDirtySeedPending] = useState(false);
   const [openIntentPollRevision, setOpenIntentPollRevision] = useState(0);
   const [workspaceEntryOperation, setWorkspaceEntryOperation] = useState<WorkspaceEntryOperation | null>(null);
@@ -360,6 +381,14 @@ export default function App() {
   const packagedModalEvidenceRef = useRef(new Set<string>());
   const packagedDirtySeededRef = useRef(false);
   const packagedAutomatedDecisionRef = useRef(new Set<string>());
+  const packagedSettlementBarrierRef = useRef(false);
+  const setPackagedSettlementBarrierActive = useCallback((active: boolean) => {
+    updatePackagedSettlementBarrier(
+      packagedSettlementBarrierRef,
+      setPackagedSettlementBarrierState,
+      active,
+    );
+  }, []);
   const openIntentCoordinatorRef = useRef<OpenIntentCoordinator | null>(null);
   if (!openIntentCoordinatorRef.current) {
     openIntentCoordinatorRef.current = new OpenIntentCoordinator({
@@ -654,6 +683,7 @@ export default function App() {
     reportPackagedEvidenceFailure,
     setError,
     setNotice,
+    setPackagedSettlementBarrierActive,
     updateContent,
     workspaceRoot,
     workspaceToken,
@@ -664,7 +694,7 @@ export default function App() {
     setPackagedDirtySeedPending(false);
     setPackagedSettlementBarrierActive(false);
     setOpenIntentPollRevision((revision) => revision + 1);
-  }, [dirty, packagedDirtySeedPending]);
+  }, [dirty, packagedDirtySeedPending, setPackagedSettlementBarrierActive]);
 
   useEffect(() => {
     if (
@@ -753,7 +783,11 @@ export default function App() {
   }, [isPopout, locale, setError, setNotice, settleWorkspaceSessionRestore]);
 
   useEffect(() => {
-    openIntentCoordinator.setModalActive(openIntentModalActive);
+    syncOpenIntentCoordinatorModalState(
+      openIntentCoordinator,
+      openIntentModalActive,
+      packagedSettlementBarrierRef,
+    );
   }, [openIntentCoordinator, openIntentModalActive]);
 
   useEffect(() => {
@@ -1448,7 +1482,7 @@ export default function App() {
         ? openIntentCoordinator.cancelActive(intent.id)
         : openIntentCoordinator.failActive(intent.id, error ?? new Error('Open request failed'));
     if (!settled && deferSuccessor) setPackagedSettlementBarrierActive(false);
-  }, [openIntentCoordinator, packagedOpenEvidenceEnabled]);
+  }, [openIntentCoordinator, packagedOpenEvidenceEnabled, setPackagedSettlementBarrierActive]);
 
   const processOpenIntent = useCallback(async (
     saveBeforeOpen: boolean,

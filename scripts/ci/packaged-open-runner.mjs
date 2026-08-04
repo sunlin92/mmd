@@ -110,8 +110,11 @@ function appEnvironment(challenge) {
   return { ...process.env, ...packagedOpenEnvironment(challenge) };
 }
 
-function launch(binary, target, challenge) {
-  return spawn(binary, [path.basename(target)], {
+export function launchPackagedTarget(binary, target, challenge, {
+  spawn: spawnProcess = spawn,
+} = {}) {
+  const targetArgument = challenge.packageVariant === 'appimage' ? target : path.basename(target);
+  return spawnProcess(binary, [targetArgument], {
     cwd: path.dirname(target),
     env: appEnvironment(challenge),
     stdio: 'inherit',
@@ -391,7 +394,7 @@ export async function runPackagedOpen({
   challenge: suppliedChallenge,
 }, dependencies = {}) {
   const operations = {
-    launch,
+    launch: launchPackagedTarget,
     launchMacPrimary,
     waitUntil,
     readJsonIfComplete,

@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   applicationSettledReady,
   isPrimaryReceiptReady,
+  launchPackagedTarget,
   launchMacPrimary,
   observePrimaryFocus,
   requireSuccessfulExit,
@@ -288,6 +289,54 @@ test('launchMacPrimary cold-starts through LaunchServices with only the native a
   assert.equal(invocation.arguments_.at(-1), '/tmp/fixtures/association.md');
   assert.equal(invocation.arguments_.includes('--args'), false);
   assert.equal(invocation.options.shell, false);
+});
+
+test('launchPackagedTarget preserves an absolute AppImage target across AppRun cwd changes', () => {
+  const invocations = [];
+  const challenge = {
+    root: '/tmp/challenge-root',
+    nonce: 'a'.repeat(64),
+    runId: '123',
+    runAttempt: '1',
+    commit: 'b'.repeat(40),
+    target: 'x86_64-unknown-linux-gnu',
+    platform: 'linux',
+    profile: 'apply-reobserve',
+  };
+  const spawn = (command, arguments_, options) => {
+    invocations.push({ command, arguments_, options });
+    return {};
+  };
+
+  launchPackagedTarget(
+    '/tmp/MMD.AppImage',
+    '/tmp/fixtures with spaces/primary.md',
+    { ...challenge, packageVariant: 'appimage' },
+    { spawn },
+  );
+  launchPackagedTarget(
+    '/usr/bin/mmd',
+    '/tmp/fixtures with spaces/primary.md',
+    { ...challenge, packageVariant: 'deb' },
+    { spawn },
+  );
+
+  assert.deepEqual(invocations.map(({ command, arguments_, options }) => ({
+    command,
+    arguments_,
+    cwd: options.cwd,
+  })), [
+    {
+      command: '/tmp/MMD.AppImage',
+      arguments_: ['/tmp/fixtures with spaces/primary.md'],
+      cwd: '/tmp/fixtures with spaces',
+    },
+    {
+      command: '/usr/bin/mmd',
+      arguments_: ['primary.md'],
+      cwd: '/tmp/fixtures with spaces',
+    },
+  ]);
 });
 
 test('stopPrimary finds the macOS app by exact binary when no receipt exposed its PID', async () => {
