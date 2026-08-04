@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 const lifecycleScript = fileURLToPath(new URL('./lifecycle-evidence.mjs', import.meta.url));
 const COMPETING_BYTES = 'external competing bytes\n';
 const TIMEOUT_MS = 120_000;
+const ATOMIC_RENAME_RETRY_ATTEMPTS = 20;
+const ATOMIC_RENAME_RETRY_DELAY_MS = 25;
+const ATOMIC_RENAME_RETRY_TIMEOUT_MS = 1_000;
 const STOP_GRACE_MS = Number(process.env.MMD_PACKAGED_LIFECYCLE_E2E_STOP_GRACE_MS ?? 5_000);
 const STOP_TERM_MS = Number(process.env.MMD_PACKAGED_LIFECYCLE_E2E_STOP_TERM_MS ?? 5_000);
 const STOP_KILL_MS = Number(process.env.MMD_PACKAGED_LIFECYCLE_E2E_STOP_KILL_MS ?? 5_000);
@@ -84,7 +87,17 @@ async function waitUntil(predicate, completion, description) {
 async function writeAtomic(file, contents) {
   const temporary = `${file}.${process.pid}.tmp`;
   await writeFile(temporary, contents, { flag: 'wx' });
-  await rename(temporary, file);
+  const deadline = Date.now() + ATOMIC_RENAME_RETRY_TIMEOUT_MS;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rename(temporary, file);
+      return;
+    } catch (error) {
+      const transientLock = error?.code === 'EPERM' || error?.code === 'EACCES';
+      if (!transientLock || attempt >= ATOMIC_RENAME_RETRY_ATTEMPTS || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, ATOMIC_RENAME_RETRY_DELAY_MS));
+    }
+  }
 }
 
 function sanitizeReceiptError(message) {

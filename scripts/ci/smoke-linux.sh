@@ -14,6 +14,10 @@ deb=$(find "$artifact_dir" -maxdepth 1 -type f -name '*.deb' -print)
 dpkg-deb --info "$deb"
 sudo apt-get update
 sudo apt-get install -y "$deb"
+sudo update-desktop-database /usr/share/applications
+mime_association=$(gio mime text/markdown)
+printf '%s\n' "$mime_association"
+[[ "$mime_association" == *MMD.desktop* ]]
 
 installed_binary=$(command -v mmd)
 deb_challenge="$RUNNER_TEMP/mmd-packaged-lifecycle-deb.json"

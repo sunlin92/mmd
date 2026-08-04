@@ -66,3 +66,42 @@ exit 42
     await realpath(deb),
   ]);
 });
+
+test('refreshes the installed desktop database and verifies the Markdown association', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mmd-smoke-linux-association-'));
+  const binDir = path.join(root, 'bin');
+  const artifactDir = path.join(root, 'artifacts');
+  const commandLog = path.join(root, 'commands.log');
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  await mkdir(binDir);
+  await mkdir(artifactDir);
+  await writeFile(path.join(artifactDir, 'MMD_0.1.0_amd64.deb'), 'fake deb');
+  await writeFile(path.join(artifactDir, 'MMD_0.1.0_amd64.AppImage'), 'fake appimage');
+  await writeExecutable(path.join(binDir, 'node'), 'exit 0\n');
+  await writeExecutable(path.join(binDir, 'uname'), 'printf "x86_64\\n"\n');
+  await writeExecutable(path.join(binDir, 'dpkg-deb'), 'exit 0\n');
+  await writeExecutable(path.join(binDir, 'mmd'), 'exit 0\n');
+  await writeExecutable(path.join(binDir, 'sudo'), 'printf "sudo %s\\n" "$*" >> "$COMMAND_LOG"\n');
+  await writeExecutable(path.join(binDir, 'gio'), `printf 'gio %s\\n' "$*" >> "$COMMAND_LOG"
+printf 'Default application for text/markdown: MMD.desktop\\n'
+`);
+
+  spawnSync('/bin/bash', [script, artifactDir, 'x86_64-unknown-linux-gnu'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      COMMAND_LOG: commandLog,
+      PATH: `${binDir}:${process.env.PATH}`,
+      RUNNER_TEMP: root,
+    },
+  });
+
+  const commands = (await readFile(commandLog, 'utf8')).trim().split('\n');
+  const installIndex = commands.findIndex((command) => command.startsWith('sudo apt-get install -y '));
+  const refreshIndex = commands.indexOf('sudo update-desktop-database /usr/share/applications');
+  const mimeIndex = commands.indexOf('gio mime text/markdown');
+  assert.ok(installIndex !== -1 && refreshIndex > installIndex, 'desktop cache refresh must follow deb install');
+  assert.ok(mimeIndex > refreshIndex, 'MIME ownership must be checked after refreshing the desktop cache');
+});

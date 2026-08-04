@@ -224,6 +224,24 @@ function useReactiveDirtySession(session: ReturnType<typeof createSession>) {
   };
 }
 
+function useReactiveFeedbackSession(session: ReturnType<typeof createSession>) {
+  const [error, setError] = useState<string | null>(session.error);
+  const [notice, setNotice] = useState<string | null>(session.notice);
+  return {
+    ...session,
+    error,
+    notice,
+    setError: (message: string | null) => {
+      session.setError(message);
+      setError(message);
+    },
+    setNotice: (message: string | null) => {
+      session.setNotice(message);
+      setNotice(message);
+    },
+  };
+}
+
 describe('App open intent routing', () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -420,6 +438,74 @@ describe('App open intent routing', () => {
       next.id,
     ]);
     expect(session.updateContent).toHaveBeenCalledOnce();
+  });
+
+  it('records a rejected packaged intent and continues with the queued successor', async () => {
+    vi.stubEnv('VITE_MMD_PACKAGED_OPEN_E2E', '1');
+    const failed = {
+      id: 'open-intent-unicode-rejected', source: 'opened_event',
+      displayPath: '/fixtures/unicode space.md', targetKind: 'file',
+    };
+    const successor = {
+      id: 'open-intent-directory-successor', source: 'opened_event',
+      displayPath: '/fixtures/workspace', targetKind: 'directory',
+    };
+    const finalSuccessor = {
+      id: 'open-intent-stale-successor', source: 'opened_event',
+      displayPath: '/fixtures/stale.md', targetKind: 'file',
+    };
+    mocks.getPackagedOpenE2eConfig.mockResolvedValue({
+      profile: 'apply-reobserve',
+      unicodeRenameReady: true,
+      paths: {
+        primaryFile: '/fixtures/primary.md', unicodeFile: failed.displayPath,
+        renamedUnicodeFile: '/fixtures/unicode renamed.md', associationFile: '/fixtures/association.md',
+        workspaceDirectory: successor.displayPath, staleFile: finalSuccessor.displayPath,
+      },
+    });
+    let backendHead: typeof failed | typeof successor | typeof finalSuccessor | null = failed;
+    mocks.peekOpenIntent.mockImplementation(async () => backendHead);
+    mocks.resolveOpenIntentRequest.mockImplementation(async (intentId) => {
+      if (intentId === failed.id) {
+        backendHead = successor;
+        throw new Error('backend rejected Unicode path');
+      }
+      if (intentId === successor.id) {
+        backendHead = finalSuccessor;
+        return 'accepted';
+      }
+      backendHead = null;
+      return 'accepted';
+    });
+    const session = createSession(false);
+    mocks.useDocumentSession.mockImplementation(() => useReactiveFeedbackSession(session));
+
+    await act(async () => root.render(<App />));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const events = mocks.recordPackagedOpenAppEvent.mock.calls.map(([event]) => event as {
+      fields: Record<string, unknown>; intentId: string; type: string;
+    });
+    expect(events.filter((event) => event.intentId === failed.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'app_settled', fields: expect.objectContaining({ status: 'failed' }) }),
+    ]));
+    expect(session.resolveOpenIntentRequest.mock.calls.map(([intentId]) => intentId)).toEqual([
+      failed.id,
+      successor.id,
+      finalSuccessor.id,
+    ]);
+    expect(events.filter((event) => event.intentId === successor.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'app_settled', fields: expect.objectContaining({ status: 'accepted' }) }),
+    ]));
+    expect(events.filter((event) => event.intentId === finalSuccessor.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'app_settled', fields: expect.objectContaining({ status: 'accepted' }) }),
+    ]));
   });
 
   it('records activation evidence before resolving a clean backend intent', async () => {

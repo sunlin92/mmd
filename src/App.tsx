@@ -624,7 +624,12 @@ export default function App() {
       },
       spellcheck: getPackagedSpellcheckEvidence(),
     }).then(() => {
-      if (!shouldSeedDirty || !mountedRef.current) return;
+      if (!mountedRef.current) return;
+      if (settlement.status === 'failed') {
+        setError(null);
+        setNotice(null);
+      }
+      if (!shouldSeedDirty) return;
       packagedDirtySeededRef.current = true;
       const currentContent = currentContentRef.current;
       updateContent(currentContent.includes(PACKAGED_DIRTY_SEED)
@@ -643,6 +648,8 @@ export default function App() {
     pendingPackagedSettlement,
     recordPackagedEvidence,
     reportPackagedEvidenceFailure,
+    setError,
+    setNotice,
     updateContent,
     workspaceRoot,
     workspaceToken,

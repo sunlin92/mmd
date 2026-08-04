@@ -202,6 +202,14 @@ test('passes canonical workflow identity to installed packages and runs both Lin
   assert.match(value, /MMD_ci_amd64\.AppImage/);
 });
 
+test('installs desktop-file-utils for Linux package association smoke tests', async () => {
+  const value = await workflow();
+  const release = await readFile(releaseWorkflowPath, 'utf8');
+
+  assert.match(value, /sudo apt-get install -y[^\n]*desktop-file-utils/);
+  assert.match(release, /sudo apt-get install -y[^\n]*desktop-file-utils/);
+});
+
 test('uses the Windows user-local temp volume for packaged Trash fixtures', async () => {
   const value = await readFile(windowsSmokePath, 'utf8');
   const runner = await readFile(packagedRunnerPath, 'utf8');

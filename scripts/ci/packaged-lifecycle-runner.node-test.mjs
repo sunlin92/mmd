@@ -112,6 +112,76 @@ const timer = setInterval(() => {
   await removeChallengeRoot(challengePath);
 });
 
+test('retries a transient EPERM while atomically replacing the lifecycle control file', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mmd-packaged-runner-rename-eperm-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const evidencePath = path.join(root, 'evidence.json');
+  const challengePath = path.join(root, 'challenge.json');
+  const injectedMarker = path.join(root, 'rename-eperm-injected');
+  const preloadPath = path.join(root, 'rename-eperm.cjs');
+  await writeEvidence(evidencePath);
+  await writeFile(preloadPath, String.raw`
+const fs = require('node:fs');
+const fsPromises = require('node:fs/promises');
+const path = require('node:path');
+const { syncBuiltinESMExports } = require('node:module');
+const originalRename = fsPromises.rename.bind(fsPromises);
+let injected = false;
+fsPromises.rename = async (source, destination) => {
+  if (!injected && path.basename(destination) === 'control.md') {
+    injected = true;
+    fs.writeFileSync(process.env.RENAME_EPERM_MARKER, 'injected');
+    const error = new Error('destination temporarily locked');
+    error.code = 'EPERM';
+    throw error;
+  }
+  return originalRename(source, destination);
+};
+syncBuiltinESMExports();
+`);
+  const fakeApp = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const root = path.join(os.tmpdir(), 'mmd-packaged-lifecycle-e2e', process.env.MMD_PACKAGED_LIFECYCLE_E2E_NONCE);
+const workspace = path.join(root, 'workspace');
+fs.mkdirSync(workspace, { recursive: true });
+fs.writeFileSync(path.join(workspace, 'save-stale.md'), 'initial bytes\n');
+fs.writeFileSync(path.join(workspace, 'receipt.md'), '');
+fs.writeFileSync(path.join(workspace, 'control.md'), 'ready\n');
+const timer = setInterval(() => {
+  if (fs.readFileSync(path.join(workspace, 'control.md'), 'utf8') !== 'go\n') return;
+  clearInterval(timer);
+  fs.writeFileSync(path.join(workspace, 'receipt.md'), JSON.stringify({ schema: 2, gate: 'packaged-lifecycle-e2e', status: 'passed' }) + '\n');
+}, 10);
+setInterval(() => {}, 1000);
+`;
+
+  const result = spawnSync(process.execPath, runnerArguments(
+    evidencePath,
+    challengePath,
+    [process.execPath, '-e', fakeApp],
+  ), {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_RUN_ID: '123',
+      GITHUB_RUN_ATTEMPT: '2',
+      GITHUB_SHA: 'a'.repeat(40),
+      MMD_PACKAGED_LIFECYCLE_E2E_STOP_GRACE_MS: '25',
+      MMD_PACKAGED_LIFECYCLE_E2E_STOP_TERM_MS: '250',
+      MMD_PACKAGED_LIFECYCLE_E2E_STOP_KILL_MS: '250',
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${preloadPath}`.trim(),
+      RENAME_EPERM_MARKER: injectedMarker,
+    },
+    timeout: 5_000,
+  });
+
+  if (result.status !== null) await removeChallengeRoot(challengePath);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(await readFile(injectedMarker, 'utf8'), 'injected');
+});
+
 test('uses the challenge temp parent for every packaged child temp variable', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mmd-packaged-runner-temp-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
