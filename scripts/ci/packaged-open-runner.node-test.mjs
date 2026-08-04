@@ -9,6 +9,7 @@ import {
   observePrimaryFocus,
   requireSuccessfulExit,
   runPackagedOpen,
+  stopProcessByPid,
   stopPrimary,
   unicodeDeliveryReady,
   waitUntil,
@@ -303,6 +304,22 @@ test('stopPrimary finds the macOS app by exact binary when no receipt exposed it
   });
 
   assert.deepEqual(stopped, [4200]);
+});
+
+test('stopProcessByPid waits for the receiver to disappear after SIGKILL', async () => {
+  const signals = [];
+  const observations = [true, true, false];
+
+  await stopProcessByPid(4200, {
+    processExists: () => observations.shift() ?? false,
+    kill: (_pid, signal) => { signals.push(signal); },
+    wait: async () => {},
+    termTimeoutMs: 0,
+    killTimeoutMs: 10,
+  });
+
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(observations.length, 0);
 });
 
 test('runPackagedOpen accepts the receiver PID from a LaunchServices primary', async () => {

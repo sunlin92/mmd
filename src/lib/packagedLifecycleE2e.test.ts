@@ -217,6 +217,23 @@ describe('packaged lifecycle E2E runner', () => {
     expect(ports.commitRecentOpen).toHaveBeenCalledTimes(7);
   });
 
+  it('retries a definitively failed control poll open after atomic replacement', async () => {
+    const ports = createPorts();
+    let rejectedReplacement = false;
+    vi.mocked(ports.commitRecentOpen).mockImplementation(async (openReceipt) => {
+      if (!rejectedReplacement && openReceipt === `open-${setup.paths.control}-5`) {
+        rejectedReplacement = true;
+        return { status: 'not_committed', message: 'transient recent-store contention' };
+      }
+      return { status: 'committed', recent_files: { entries: [] } };
+    });
+
+    await expect(runPackagedLifecycleE2e(ports)).resolves.toMatchObject({ status: 'passed' });
+
+    expect(rejectedReplacement).toBe(true);
+    expect(ports.wait).toHaveBeenCalled();
+  });
+
   it('rejects malformed setup identities before they can become evidence', () => {
     expect(() => decodePackagedLifecycleE2eSetup({ ...setup, nonce: '../fixture' })).toThrow(
       'Invalid packaged lifecycle setup: nonce',

@@ -211,16 +211,39 @@ function processExists(pid) {
   }
 }
 
-async function stopProcessByPid(pid) {
+async function waitForProcessExit(pid, timeoutMs, exists, wait) {
+  const deadline = Date.now() + timeoutMs;
+  while (exists(pid)) {
+    if (Date.now() >= deadline) return false;
+    await wait(Math.min(50, deadline - Date.now()));
+  }
+  return true;
+}
+
+export async function stopProcessByPid(pid, dependencies = {}) {
+  const {
+    processExists: exists = processExists,
+    kill = (targetPid, signal) => process.kill(targetPid, signal),
+    wait = sleep,
+    termTimeoutMs = 5_000,
+    killTimeoutMs = 5_000,
+  } = dependencies;
   try {
-    process.kill(pid, 'SIGTERM');
+    kill(pid, 'SIGTERM');
   } catch (error) {
     if (error.code === 'ESRCH') return;
     throw error;
   }
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline && processExists(pid)) await sleep(50);
-  if (processExists(pid)) process.kill(pid, 'SIGKILL');
+  if (await waitForProcessExit(pid, termTimeoutMs, exists, wait)) return;
+  try {
+    kill(pid, 'SIGKILL');
+  } catch (error) {
+    if (error.code === 'ESRCH') return;
+    throw error;
+  }
+  if (!(await waitForProcessExit(pid, killTimeoutMs, exists, wait))) {
+    throw new Error(`packaged receiver process ${pid} did not exit after SIGKILL`);
+  }
 }
 
 async function findMacReceiverPids(binary) {

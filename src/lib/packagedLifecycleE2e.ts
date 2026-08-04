@@ -26,6 +26,7 @@ const SAVE_SUCCESS_CONTENT = 'packaged lifecycle saved\n';
 const STALE_WRITE_CONTENT = 'runner stale write\n';
 const CONTROL_POLL_LIMIT = 240;
 const CONTROL_POLL_DELAY_MS = 250;
+const CONTROL_OPEN_ATTEMPTS = 3;
 
 // Keep the standard PDF asset manifest complete in the reduced CI runner bundle.
 void packagedPdfWorkerUrl;
@@ -232,22 +233,28 @@ async function receiptIdentity(
 async function openCommittedText(
   ports: PackagedLifecycleE2ePorts,
   path: string,
+  attempts = 1,
 ): Promise<PreparedOpenFileResponse & { file: Extract<PreparedOpenFileResponse['file'], { content_mode: 'text' }> }> {
-  const prepared = await ports.openWorkspaceFile(path);
-  const outcome = await resolveOpenCommitOutcome(prepared, {
-    commit: ports.commitRecentOpen,
-    getStatus: ports.getOpenCommitStatus,
-  });
-  if (outcome.status !== 'committed') {
+  for (let attempt = 1; ; attempt += 1) {
+    const prepared = await ports.openWorkspaceFile(path);
+    const outcome = await resolveOpenCommitOutcome(prepared, {
+      commit: ports.commitRecentOpen,
+      getStatus: ports.getOpenCommitStatus,
+    });
+    if (outcome.status === 'committed') {
+      if (prepared.file.content_mode !== 'text' || !('file_version' in prepared.file)) {
+        throw new Error(`Expected text fixture: ${path}`);
+      }
+      return prepared as PreparedOpenFileResponse & {
+        file: Extract<PreparedOpenFileResponse['file'], { content_mode: 'text' }>;
+      };
+    }
     const detail = outcome.status === 'not_committed' ? outcome.message : outcome.status;
-    throw new Error(`Open commit failed for ${path}: ${detail}`);
+    if (outcome.status !== 'not_committed' || attempt >= attempts) {
+      throw new Error(`Open commit failed for ${path}: ${detail}`);
+    }
+    await ports.wait();
   }
-  if (prepared.file.content_mode !== 'text' || !('file_version' in prepared.file)) {
-    throw new Error(`Expected text fixture: ${path}`);
-  }
-  return prepared as PreparedOpenFileResponse & {
-    file: Extract<PreparedOpenFileResponse['file'], { content_mode: 'text' }>;
-  };
 }
 
 function requireCommittedSave(
@@ -330,7 +337,7 @@ async function execute(
 
   let controlGo = false;
   for (let attempt = 0; attempt < CONTROL_POLL_LIMIT; attempt += 1) {
-    const current = await openCommittedText(ports, setup.paths.control);
+    const current = await openCommittedText(ports, setup.paths.control, CONTROL_OPEN_ATTEMPTS);
     if (current.file.content === PACKAGED_LIFECYCLE_CONTROL_GO) {
       controlGo = true;
       break;

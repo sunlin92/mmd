@@ -135,6 +135,28 @@ test('runs challenge-bound packaged native-open acceptance on every installed pa
   assert.match(runner, /platform-active-window-pid/);
 });
 
+test('provides a window manager for Linux active-window evidence', async () => {
+  const platform = await workflow();
+  const release = await readFile(releaseWorkflowPath, 'utf8');
+  const linuxSmoke = await readFile(
+    fileURLToPath(new URL('./smoke-linux.sh', import.meta.url)),
+    'utf8',
+  );
+  const xvfbWrapper = await readFile(
+    fileURLToPath(new URL('./run-xvfb-with-window-manager.sh', import.meta.url)),
+    'utf8',
+  );
+
+  for (const value of [platform, release]) {
+    assert.match(value, /apt-get install -y[^\n]*openbox/);
+    assert.match(value, /apt-get install -y[^\n]*xdotool/);
+  }
+  assert.match(linuxSmoke, /run_with_window_manager/);
+  assert.match(xvfbWrapper, /openbox/);
+  assert.match(xvfbWrapper, /xprop -root _NET_SUPPORTING_WM_CHECK/);
+  assert.doesNotMatch(linuxSmoke, /xvfb-run -a node scripts\/ci\/packaged-open-runner\.mjs/);
+});
+
 test('uses platform-native association launchers and limits the AppImage exception by package type', async () => {
   const runner = await readFile(packagedOpenRunnerPath, 'utf8');
   const evidence = await readFile(
