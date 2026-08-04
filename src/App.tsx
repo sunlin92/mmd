@@ -323,6 +323,7 @@ export default function App() {
     status: 'accepted' | 'cancelled' | 'failed';
   } | null>(null);
   const [packagedSettlementBarrierActive, setPackagedSettlementBarrierActive] = useState(false);
+  const [packagedDirtySeedPending, setPackagedDirtySeedPending] = useState(false);
   const [openIntentPollRevision, setOpenIntentPollRevision] = useState(0);
   const [workspaceEntryOperation, setWorkspaceEntryOperation] = useState<WorkspaceEntryOperation | null>(null);
   const [workspaceMoveOperation, setWorkspaceMoveOperation] = useState<WorkspaceMoveOperation | null>(null);
@@ -602,6 +603,7 @@ export default function App() {
   useEffect(() => {
     const settlement = pendingPackagedSettlement;
     if (!settlement || packagedOpenConfig === undefined) return;
+    let waitForDirtySeed = false;
     setPendingPackagedSettlement(null);
     if (!packagedOpenConfig) {
       setPackagedSettlementBarrierActive(false);
@@ -635,8 +637,10 @@ export default function App() {
       updateContent(currentContent.includes(PACKAGED_DIRTY_SEED)
         ? currentContent
         : `${currentContent}\n\n${PACKAGED_DIRTY_SEED}`);
+      waitForDirtySeed = true;
+      setPackagedDirtySeedPending(true);
     }).catch(reportPackagedEvidenceFailure).finally(() => {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || waitForDirtySeed) return;
       setPackagedSettlementBarrierActive(false);
       setOpenIntentPollRevision((revision) => revision + 1);
     });
@@ -654,6 +658,13 @@ export default function App() {
     workspaceRoot,
     workspaceToken,
   ]);
+
+  useEffect(() => {
+    if (!packagedDirtySeedPending || !dirty) return;
+    setPackagedDirtySeedPending(false);
+    setPackagedSettlementBarrierActive(false);
+    setOpenIntentPollRevision((revision) => revision + 1);
+  }, [dirty, packagedDirtySeedPending]);
 
   useEffect(() => {
     if (
@@ -1481,7 +1492,9 @@ export default function App() {
         }
         settleOpenIntent(intent, 'accepted');
       } else {
-        const outcome = await resolveOpenIntentRequest(intent.id, intent.targetKind);
+        const outcome = !saveBeforeOpen && dirty
+          ? await resolveOpenIntentRequest(intent.id, intent.targetKind, true)
+          : await resolveOpenIntentRequest(intent.id, intent.targetKind);
         if (outcome === 'accepted') {
           await recordPackagedEvidence(intent, 'app_applied', {
             status: 'accepted',
@@ -1502,6 +1515,7 @@ export default function App() {
       settleOpenIntent(intent, 'failed', err);
     }
   }, [
+    dirty,
     locale,
     handleNew,
     handleOpenDirectory,

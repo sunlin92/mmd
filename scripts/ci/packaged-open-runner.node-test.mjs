@@ -322,6 +322,28 @@ test('stopProcessByPid waits for the receiver to disappear after SIGKILL', async
   assert.equal(observations.length, 0);
 });
 
+test('stopPrimary proves a POSIX receiver exited before the next challenge can start', async () => {
+  const primary = new EventEmitter();
+  Object.assign(primary, {
+    pid: 4100,
+    exitCode: null,
+    signalCode: null,
+    kill(signal) {
+      this.signalCode = signal;
+      queueMicrotask(() => this.emit('exit', null, signal));
+    },
+  });
+  const stopped = [];
+
+  await stopPrimary(primary, primary.pid, '/tmp/mmd', {
+    platform: 'linux',
+    stopProcessByPid: async (pid) => { stopped.push(pid); },
+  });
+
+  assert.deepEqual(stopped, [primary.pid]);
+  assert.equal(primary.signalCode, null);
+});
+
 test('runPackagedOpen accepts the receiver PID from a LaunchServices primary', async () => {
   const challenge = {
     profile: 'apply-reobserve',

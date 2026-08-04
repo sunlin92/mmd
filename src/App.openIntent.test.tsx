@@ -29,7 +29,11 @@ const mocks = vi.hoisted(() => ({
   crashOnRecoverDraft: null as null | ((draft: unknown) => Promise<void> | void),
   peekOpenIntent: vi.fn<() => Promise<unknown>>(),
   requestSessionRestore: vi.fn<() => Promise<void>>(),
-  resolveOpenIntentRequest: vi.fn<(id: string, targetKind: string) => Promise<'blocked' | 'accepted' | 'failed'>>(),
+  resolveOpenIntentRequest: vi.fn<(
+    id: string,
+    targetKind: string,
+    discardCurrentCrashDraft?: boolean,
+  ) => Promise<'blocked' | 'accepted' | 'failed'>>(),
   recordPackagedOpenAppEvent: vi.fn<(event: unknown) => Promise<void>>(),
   session: null as unknown as Record<string, unknown>,
   useDocumentSession: vi.fn<() => Record<string, unknown>>(),
@@ -440,6 +444,67 @@ describe('App open intent routing', () => {
     expect(session.updateContent).toHaveBeenCalledOnce();
   });
 
+  it('keeps the packaged settlement barrier until the dirty seed is observable', async () => {
+    vi.stubEnv('VITE_MMD_PACKAGED_OPEN_E2E', '1');
+    const first = {
+      id: 'open-intent-first', source: 'opened_event',
+      displayPath: '/fixtures/association.md', targetKind: 'file',
+    };
+    const next = {
+      id: 'open-intent-restore', source: 'session_restore',
+      displayPath: 'Restore previous workspace', targetKind: 'session_restore',
+    };
+    const config = {
+      profile: 'apply-reobserve' as const,
+      unicodeRenameReady: false,
+      paths: {
+        primaryFile: '/fixtures/primary.md', unicodeFile: '/fixtures/unicode space.md',
+        renamedUnicodeFile: '/fixtures/unicode renamed.md', associationFile: first.displayPath,
+        workspaceDirectory: '/fixtures/workspace', staleFile: '/fixtures/stale.md',
+      },
+    };
+    let backendHead: typeof first | typeof next | null = first;
+    mocks.getPackagedOpenE2eConfig.mockResolvedValue(config);
+    mocks.peekOpenIntent.mockImplementation(async () => backendHead);
+    mocks.resolveOpenIntentRequest.mockImplementation(async (intentId) => {
+      if (intentId === first.id) backendHead = next;
+      else if (intentId === next.id) backendHead = null;
+      return 'accepted';
+    });
+    const session = createSession(false);
+    let markDirty: () => void = () => undefined;
+    mocks.useDocumentSession.mockImplementation(() => {
+      const [dirty, setDirty] = useState(false);
+      markDirty = () => setDirty(true);
+      return { ...session, dirty };
+    });
+
+    await act(async () => root.render(<App />));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(session.updateContent).toHaveBeenCalledOnce();
+    expect(session.resolveOpenIntentRequest).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      markDirty();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const nextEvents = mocks.recordPackagedOpenAppEvent.mock.calls
+      .map(([event]) => event as { fields: Record<string, unknown>; intentId: string; type: string })
+      .filter((event) => event.intentId === next.id);
+    expect(nextEvents[0]).toMatchObject({ type: 'app_activated', fields: { dirty: true } });
+    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(next.id, next.targetKind, true);
+  });
+
   it('records a rejected packaged intent and continues with the queued successor', async () => {
     vi.stubEnv('VITE_MMD_PACKAGED_OPEN_E2E', '1');
     const failed = {
@@ -581,7 +646,7 @@ describe('App open intent routing', () => {
 
     decisionRecorded.resolve();
     await act(async () => { await decisionRecorded.promise; await Promise.resolve(); });
-    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(preview.id, preview.targetKind);
+    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(preview.id, preview.targetKind, true);
   });
 
   it('does not replay a stale pending intent after an accepted resolve clears active ownership', async () => {
@@ -713,6 +778,11 @@ describe('App open intent routing', () => {
       await act(async () => vi.advanceTimersByTimeAsync(50));
       await act(async () => { await Promise.resolve(); await Promise.resolve(); });
       expect(session.resolveOpenIntentRequest).toHaveBeenCalledOnce();
+      expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(
+        'open-intent-3',
+        'file',
+        true,
+      );
       expect(mocks.recordPackagedOpenAppEvent.mock.calls.filter(([event]) => (
         (event as { type: string }).type === 'dirty_decision'
       ))).toHaveLength(1);
@@ -800,7 +870,7 @@ describe('App open intent routing', () => {
     expect(session.resolveOpenIntentRequest).not.toHaveBeenCalled();
     act(() => [...container.querySelectorAll('button')].find((button) => button.textContent === 'Switch Without Saving')?.click());
     await act(async () => Promise.resolve());
-    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(preview.id, preview.targetKind);
+    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(preview.id, preview.targetKind, true);
   });
 
   it('discards a cancelled dirty request without resolving a path', async () => {
@@ -868,7 +938,7 @@ describe('App open intent routing', () => {
     await act(async () => Promise.resolve());
 
     expect(session.resolveOpenIntentRequest).toHaveBeenCalledOnce();
-    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(next.id, next.targetKind);
+    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(next.id, next.targetKind, true);
   });
 
   it('keeps a dirty document behind the shared guard before opening a search result', async () => {
@@ -936,7 +1006,7 @@ describe('App open intent routing', () => {
     act(() => mocks.listeners.get(NATIVE_MENU_EVENT)?.({ payload: 'open-file' }));
     act(() => [...container.querySelectorAll('button')].find((button) => button.textContent === 'Switch Without Saving')?.click());
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(preview.id, preview.targetKind);
+    expect(session.resolveOpenIntentRequest).toHaveBeenCalledWith(preview.id, preview.targetKind, true);
     expect(session.handleOpenFile).not.toHaveBeenCalled();
 
     act(() => [...container.querySelectorAll('button')].find((button) => button.textContent === 'Switch Without Saving')?.click());

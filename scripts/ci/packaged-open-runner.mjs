@@ -272,6 +272,10 @@ export async function stopPrimary(child, receiverPid = child.pid, binary, depend
       ? [receiverPid]
       : binary ? await findReceiverPids(binary) : [];
     for (const pid of receiverPids) await stopPid(pid);
+  } else if (platform !== 'win32') {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await stopPid(receiverPid);
+    return;
   }
   if (child.exitCode !== null || child.signalCode !== null) return;
   if (platform === 'win32') {
@@ -415,7 +419,7 @@ export async function runPackagedOpen({
       const receipt = await operations.readJsonIfComplete(challenge.receiptPath);
       if (receipt?.status === 'failed') throw new Error(receipt.error ?? 'packaged open instrumentation failed');
       return isPrimaryReceiptReady(challenge, receipt) ? receipt : undefined;
-    }, 'the primary packaged process to record its startup intent');
+    }, 'the primary packaged process to settle its startup open intents');
     if (challenge.platform !== 'macos' && collecting.primary?.pid !== primary.pid) {
       throw new Error('instrumented primary PID does not match launched packaged process');
     }

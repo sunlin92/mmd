@@ -502,6 +502,7 @@ export function useDocumentSession({
     prepared: PreparedOpenFileResponse,
     requestedGeneration: number,
     reportFailure = true,
+    discardCurrentCrashDraft = false,
   ): Promise<PreparedOpenApplyResult> => {
     const priorCrashDocumentId = crashDraftDocumentIdRef.current;
     try {
@@ -536,6 +537,7 @@ export function useDocumentSession({
       });
       activeFileVersionRef.current = editableFileVersion(prepared.file);
       advanceCrashDraftIdentity(priorCrashDocumentId);
+      if (discardCurrentCrashDraft) await afterConfirmedSave?.(priorCrashDocumentId);
       return 'committed';
     }
     if (outcome.status === 'not_committed') {
@@ -561,7 +563,7 @@ export function useDocumentSession({
       setError('The file authorization result could not be confirmed. Open another file to continue.');
     }
     return 'indeterminate';
-  }, [advanceCrashDraftIdentity, applyDocumentSessionState, currentDocumentSessionState]);
+  }, [advanceCrashDraftIdentity, afterConfirmedSave, applyDocumentSessionState, currentDocumentSessionState]);
 
   const claimPreparedOpen = useCallback((
     prepared: PreparedOpenFileResponse | null,
@@ -1270,6 +1272,7 @@ export function useDocumentSession({
   const resolveOpenIntentRequest = useCallback(async (
     intentId: string,
     targetKind: OpenIntentTargetKind = 'unknown',
+    discardCurrentCrashDraft = false,
   ): Promise<'blocked' | 'accepted' | 'failed'> => {
     if (openIntentResolutionBlocked()) return 'blocked';
     const requestedDocumentGeneration = documentGenerationRef.current;
@@ -1311,7 +1314,12 @@ export function useDocumentSession({
             requestedDocumentGeneration,
           );
           if (appliedGeneration !== null) {
-            applied = await applyPreparedOpen(resolved.prepared, appliedGeneration) === 'committed';
+            applied = await applyPreparedOpen(
+              resolved.prepared,
+              appliedGeneration,
+              true,
+              discardCurrentCrashDraft,
+            ) === 'committed';
           }
           return;
         }
@@ -1366,7 +1374,12 @@ export function useDocumentSession({
               if (appliedGeneration === null) {
                 await discardOpenReceipt(prepared.open_receipt).catch(() => undefined);
               } else {
-                applied = await applyPreparedOpen(prepared, appliedGeneration, false) === 'committed';
+                applied = await applyPreparedOpen(
+                  prepared,
+                  appliedGeneration,
+                  false,
+                  discardCurrentCrashDraft,
+                ) === 'committed';
               }
             } else {
               applied = true;

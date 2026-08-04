@@ -616,6 +616,48 @@ describe('useDocumentSession prepared-open authority workflow', () => {
     expect(session().activePath).toBe('/workspace/second.md');
   });
 
+  it('discards the flushed crash draft after a confirmed dirty open-intent switch', async () => {
+    const events: string[] = [];
+    const afterConfirmedSave = vi.fn<(documentId: string) => Promise<boolean>>(async () => {
+      events.push('draft:discard');
+      return true;
+    });
+    tauriMocks.openFileDialog.mockResolvedValueOnce(preparedOpen('first'));
+    tauriMocks.resolveOpenIntent.mockResolvedValueOnce({
+      kind: 'file',
+      prepared: preparedOpen('second'),
+    });
+    crashDraftMocks.write.mockImplementation(async (request) => {
+      events.push(`draft:flush:${request.content}`);
+      return {
+        status: 'stored', documentId: request.documentId, draftRevision: request.draftRevision,
+        entryToken: '9'.repeat(64), updatedAtUnixMs: 1, evictedDocumentIds: [],
+      };
+    });
+    tauriMocks.commitRecentOpen.mockImplementation(async () => {
+      events.push('open:commit');
+      return committed();
+    });
+    act(() => root.render(<SessionHarness afterConfirmedSave={afterConfirmedSave} />));
+    await act(async () => session().handleOpenFile());
+    events.length = 0;
+    act(() => session().updateContent('# Discard before switch'));
+
+    let outcome!: Awaited<ReturnType<Session['resolveOpenIntentRequest']>>;
+    await act(async () => {
+      outcome = await session().resolveOpenIntentRequest('open-intent-discard', 'file', true);
+    });
+
+    expect(outcome).toBe('accepted');
+    expect(events).toEqual([
+      'draft:flush:# Discard before switch',
+      'open:commit',
+      'draft:discard',
+    ]);
+    expect(afterConfirmedSave).toHaveBeenCalledWith(expect.stringMatching(/^[0-9a-f]{32}$/));
+    expect(session().activePath).toBe('/workspace/second.md');
+  });
+
   it('retains and reschedules newer edits when an older save commits', async () => {
     vi.useFakeTimers();
     const afterConfirmedSave = vi.fn<(documentId: string) => Promise<boolean>>(async () => true);
@@ -1017,6 +1059,7 @@ describe('useDocumentSession prepared-open authority workflow', () => {
   });
 
   it('does not accept a resolved file whose prepared authorization cannot commit', async () => {
+    const afterConfirmedSave = vi.fn<(documentId: string) => Promise<boolean>>(async () => true);
     const opened = preparedOpen('native-rejected');
     tauriMocks.resolveOpenIntent.mockResolvedValueOnce({ kind: 'file', prepared: opened });
     tauriMocks.commitRecentOpen.mockResolvedValueOnce({
@@ -1024,13 +1067,14 @@ describe('useDocumentSession prepared-open authority workflow', () => {
       message: 'The prepared open was rejected.',
     });
 
-    act(() => root.render(<SessionHarness />));
+    act(() => root.render(<SessionHarness afterConfirmedSave={afterConfirmedSave} />));
     let outcome!: Awaited<ReturnType<Session['resolveOpenIntentRequest']>>;
     await act(async () => {
-      outcome = await session().resolveOpenIntentRequest('open-intent-rejected');
+      outcome = await session().resolveOpenIntentRequest('open-intent-rejected', 'file', true);
     });
 
     expect(outcome).toBe('failed');
+    expect(afterConfirmedSave).not.toHaveBeenCalled();
     expect(session()).toMatchObject({ activePath: null, authorityStatus: 'committed' });
   });
 
