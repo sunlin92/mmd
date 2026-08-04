@@ -138,30 +138,35 @@ export function launchMacPrimary(associationApp, challenge, {
   });
 }
 
-async function launchAssociation(challenge, associationApp) {
+export async function launchNativeAssociation(challenge, associationApp, {
+  spawn: spawnProcess = spawn,
+  requireSuccessfulExit: requireExit = requireSuccessfulExit,
+} = {}) {
   const target = challenge.scenario.paths.associationFile;
   let command;
   let arguments_;
+  let environment = appEnvironment(challenge);
   if (challenge.platform === 'macos') {
     if (!associationApp) throw new Error('--association-app is required for a DMG challenge');
     command = 'open';
     arguments_ = ['-a', associationApp, target];
   } else if (challenge.platform === 'windows') {
     command = 'powershell.exe';
+    environment = { ...environment, MMD_PACKAGED_OPEN_ASSOCIATION_TARGET: target };
     arguments_ = [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-      'Start-Process -FilePath $args[0]', target,
+      'Start-Process -FilePath $env:MMD_PACKAGED_OPEN_ASSOCIATION_TARGET',
     ];
   } else {
     command = 'gio';
     arguments_ = ['open', target];
   }
-  const child = spawn(command, arguments_, {
-    env: appEnvironment(challenge),
+  const child = spawnProcess(command, arguments_, {
+    env: environment,
     stdio: 'inherit',
     shell: false,
   });
-  await requireSuccessfulExit(child, 'native association launcher');
+  await requireExit(child, 'native association launcher');
 }
 
 function activeWindowPid(platform) {
@@ -399,7 +404,7 @@ export async function runPackagedOpen({
     waitUntil,
     readJsonIfComplete,
     requireSuccessfulExit,
-    launchAssociation,
+    launchAssociation: launchNativeAssociation,
     observePrimaryFocus,
     writeJsonAtomic,
     renameTarget: rename,

@@ -41,6 +41,12 @@ async function issueChallenge(t, profile = 'apply-reobserve', packageVariant = '
   return { root, challengePath, challenge };
 }
 
+function issueHostPathChallenge(t, profile = 'apply-reobserve') {
+  if (process.platform === 'win32') return issueChallenge(t, profile, 'nsis', 'windows');
+  if (process.platform === 'darwin') return issueChallenge(t, profile, 'dmg', 'macos');
+  return issueChallenge(t, profile, 'deb', 'linux');
+}
+
 function grant(kind, target, origin) {
   return { kind, path: target, origin, status: 'active', count: 1 };
 }
@@ -356,7 +362,7 @@ function withRestoreReceipts(receipt, challenge, receiptKinds) {
     actor: 'backend', type: 'backend_prepared', intentId: 'open-intent-2', step: 'session-restore',
     receiptKind, receiptDigest: String(index + 5).repeat(64),
     target: receiptKind === 'file'
-      ? challenge.scenario.paths.primaryFile
+      ? path.join(challenge.scenario.paths.workspaceDirectory, 'index.md')
       : challenge.scenario.paths.workspaceDirectory,
     authorizationDelta: delta([]),
   }));
@@ -365,10 +371,14 @@ function withRestoreReceipts(receipt, challenge, receiptKinds) {
     receiptKind, receiptDigest: String(index + 5).repeat(64),
     settlement: receiptKind === 'file' ? 'committed' : 'applied',
     target: receiptKind === 'file'
-      ? challenge.scenario.paths.primaryFile
+      ? path.join(challenge.scenario.paths.workspaceDirectory, 'index.md')
       : challenge.scenario.paths.workspaceDirectory,
     authorizationDelta: delta([]),
   }));
+  const reobserved = receipt.events.find((event) => (
+    event.type === 'backend_reobserved' && event.step === 'session-restore'
+  ));
+  reobserved.target = (prepared.find((event) => event.receiptKind === 'workspace') ?? prepared[0]).target;
   receipt.events.splice(preparedIndex, 0, ...prepared);
   receipt.events.splice(appliedIndex - 1 + prepared.length, 0, ...settlements);
   resequence(receipt);
@@ -538,7 +548,7 @@ test('accepts a Windows apply-reobserve session restore receipt binding', {
   const { challengePath, challenge } = await issueChallenge(
     t, 'apply-reobserve', 'nsis', 'windows',
   );
-  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file']);
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace']);
 
   const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
   assert.equal(result.status, 0, result.stderr);
@@ -550,7 +560,7 @@ test('rejects an identical ambiguous Windows session restore target', {
   const { challengePath, challenge } = await issueChallenge(
     t, 'apply-reobserve', 'nsis', 'windows',
   );
-  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file']);
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace']);
   const invalidTarget = 'C:\\Docs\\..\\secret.md';
   const prepared = receipt.events.find((event) => (
     event.type === 'backend_prepared' && event.step === 'session-restore'
@@ -585,23 +595,51 @@ test('accepts session restore lifecycles with one receipt', async (t) => {
   assert.equal(result.status, 0, result.stderr);
 });
 
-test('accepts a session restore lifecycle with only its file receipt', async (t) => {
+test('rejects a session restore lifecycle with only a file receipt', async (t) => {
   const { challengePath, challenge } = await issueChallenge(t);
   const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file']);
   const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
-  assert.equal(result.status, 0, result.stderr);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /session restore receipt set is invalid/);
 });
 
-test('accepts session restore lifecycles with file and workspace receipts', async (t) => {
-  const { challengePath, challenge } = await issueChallenge(t);
+test('accepts session restore lifecycles with workspace and descendant file receipts', async (t) => {
+  const { challengePath, challenge } = await issueHostPathChallenge(t);
   const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace', 'file']);
   const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('rejects a session restore whose resolved target differs from its workspace receipt', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(t);
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace']);
+  const reobserved = receipt.events.find((event) => (
+    event.type === 'backend_reobserved' && event.step === 'session-restore'
+  ));
+  reobserved.target = challenge.scenario.paths.primaryFile;
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /applied lifecycle binding is invalid/);
+});
+
+test('rejects a restored file outside its restored workspace', async (t) => {
+  const { challengePath, challenge } = await issueHostPathChallenge(t);
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace', 'file']);
+  const fileEvents = receipt.events.filter((event) => (
+    event.step === 'session-restore' && event.receiptKind === 'file'
+  ));
+  for (const event of fileEvents) event.target = challenge.scenario.paths.primaryFile;
+  normalizeAuthorization(receipt);
+
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /restored file is outside its workspace/);
+});
+
 test('rejects a session restore settlement for a different prepared target', async (t) => {
   const { challengePath, challenge } = await issueChallenge(t);
-  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file']);
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace']);
   const prepared = receipt.events.find((event) => (
     event.type === 'backend_prepared' && event.step === 'session-restore'
   ));
@@ -648,7 +686,7 @@ for (const [label, rejectedTarget] of [
 ]) {
   test(`rejects final authorization retained for the rejected ${label} target`, async (t) => {
     const { challengePath, challenge } = await issueChallenge(t);
-    const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file']);
+    const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace']);
     const target = challenge.scenario.paths[rejectedTarget];
     const prepared = receipt.events.find((event) => (
       event.type === 'backend_prepared' && event.step === 'session-restore'
@@ -656,8 +694,12 @@ for (const [label, rejectedTarget] of [
     const settlement = receipt.events.find((event) => (
       event.type === 'backend_receipt_settled' && event.step === 'session-restore'
     ));
+    const reobserved = receipt.events.find((event) => (
+      event.type === 'backend_reobserved' && event.step === 'session-restore'
+    ));
     prepared.target = target;
     settlement.target = target;
+    reobserved.target = target;
     normalizeAuthorization(receipt);
     const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
     assert.notEqual(result.status, 0);
@@ -860,6 +902,14 @@ test('rejects duplicate receipt kinds in a two-receipt session restore', async (
   assert.match(result.stderr, /session restore receipt set is invalid/);
 });
 
+test('rejects a file receipt before the workspace receipt in a session restore', async (t) => {
+  const { challengePath, challenge } = await issueChallenge(t);
+  const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['file', 'workspace']);
+  const { result } = await verifyReceipt(t, challengePath, challenge, receipt);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /session restore receipt set is invalid/);
+});
+
 test('rejects a settlement attached to a zero-receipt session restore', async (t) => {
   const { challengePath, challenge } = await issueChallenge(t);
   const receipt = applyReceipt(challenge);
@@ -957,7 +1007,7 @@ test('rejects authorization grants published during receipt preparation', async 
 });
 
 test('rejects inconsistent producer deltas duplicated across two restore receipts', async (t) => {
-  const { challengePath, challenge } = await issueChallenge(t);
+  const { challengePath, challenge } = await issueHostPathChallenge(t);
   const receipt = withRestoreReceipts(applyReceipt(challenge), challenge, ['workspace', 'file']);
   const prepared = receipt.events.filter((event) => (
     event.type === 'backend_prepared' && event.step === 'session-restore'

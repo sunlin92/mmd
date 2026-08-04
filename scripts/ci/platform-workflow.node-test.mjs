@@ -165,7 +165,8 @@ test('uses platform-native association launchers and limits the AppImage excepti
   );
 
   assert.match(runner, /command = 'open'/);
-  assert.match(runner, /Start-Process -FilePath \$args\[0\]/);
+  assert.match(runner, /MMD_PACKAGED_OPEN_ASSOCIATION_TARGET: target/);
+  assert.match(runner, /Start-Process -FilePath \$env:MMD_PACKAGED_OPEN_ASSOCIATION_TARGET/);
   assert.match(runner, /command = 'gio'/);
   assert.match(evidence, /association\.status !== 'verified'/);
   assert.match(evidence, /appimage-has-no-installed-association/);

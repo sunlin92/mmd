@@ -7,6 +7,7 @@ import {
   isPrimaryReceiptReady,
   launchPackagedTarget,
   launchMacPrimary,
+  launchNativeAssociation,
   observePrimaryFocus,
   requireSuccessfulExit,
   runPackagedOpen,
@@ -289,6 +290,44 @@ test('launchMacPrimary cold-starts through LaunchServices with only the native a
   assert.equal(invocation.arguments_.at(-1), '/tmp/fixtures/association.md');
   assert.equal(invocation.arguments_.includes('--args'), false);
   assert.equal(invocation.options.shell, false);
+});
+
+test('launchNativeAssociation passes a Windows target through the PowerShell environment', async () => {
+  const child = {};
+  let invocation;
+  let completed;
+  const target = 'C:\\fixtures with spaces\\association.md';
+  const challenge = {
+    root: 'C:\\challenge-root',
+    nonce: 'a'.repeat(64),
+    runId: '123',
+    runAttempt: '1',
+    commit: 'b'.repeat(40),
+    target: 'x86_64-pc-windows-msvc',
+    packageVariant: 'nsis',
+    platform: 'windows',
+    profile: 'apply-reobserve',
+    scenario: { paths: { associationFile: target } },
+  };
+
+  await launchNativeAssociation(challenge, undefined, {
+    spawn: (command, arguments_, options) => {
+      invocation = { command, arguments_, options };
+      return child;
+    },
+    requireSuccessfulExit: async (receivedChild, description) => {
+      completed = { receivedChild, description };
+    },
+  });
+
+  assert.equal(invocation.command, 'powershell.exe');
+  assert.deepEqual(invocation.arguments_, [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    'Start-Process -FilePath $env:MMD_PACKAGED_OPEN_ASSOCIATION_TARGET',
+  ]);
+  assert.equal(invocation.options.env.MMD_PACKAGED_OPEN_ASSOCIATION_TARGET, target);
+  assert.equal(invocation.options.shell, false);
+  assert.deepEqual(completed, { receivedChild: child, description: 'native association launcher' });
 });
 
 test('launchPackagedTarget preserves an absolute AppImage target across AppRun cwd changes', () => {

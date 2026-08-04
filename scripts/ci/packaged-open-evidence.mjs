@@ -383,9 +383,9 @@ function validatePreparedReceipts(identity, prepared, settlements, sessionRestor
       }
       return { receiptCount: 0 };
     }
-    if (prepared.length < 1 || prepared.length > 2
-      || kinds.some((kind) => !['file', 'workspace'].includes(kind))
-      || new Set(kinds).size !== kinds.length) {
+    const validKinds = (kinds.length === 1 && kinds[0] === 'workspace')
+      || (kinds.length === 2 && kinds[0] === 'workspace' && kinds[1] === 'file');
+    if (!validKinds) {
       throw new Error(`${identity} session restore receipt set is invalid`);
     }
   } else if (prepared.length !== 1 || settlements.length !== 1) {
@@ -414,7 +414,34 @@ function validatePreparedReceipts(identity, prepared, settlements, sessionRestor
     }
     settledDigests.add(settlement.receiptDigest);
   }
+  if (sessionRestore && prepared.length === 2
+    && !evidenceTargetIsStrictDescendant(prepared[1].target, prepared[0].target, platform)) {
+    throw new Error(`${identity} restored file is outside its workspace`);
+  }
   return { receiptCount: prepared.length };
+}
+
+function evidenceTargetIsStrictDescendant(target, root, platform) {
+  if (typeof target !== 'string' || typeof root !== 'string') return false;
+  if (platform === 'windows') {
+    const normalizedTarget = normalizeWindowsEvidenceTarget(target);
+    const normalizedRoot = normalizeWindowsEvidenceTarget(root);
+    return normalizedTarget !== null && normalizedRoot !== null
+      && normalizedTarget.startsWith(`${normalizedRoot}\\`);
+  }
+  if (!path.posix.isAbsolute(target) || !path.posix.isAbsolute(root)
+    || path.posix.normalize(target) !== target || path.posix.normalize(root) !== root) {
+    return false;
+  }
+  const prefix = root === '/' ? '/' : `${root}/`;
+  return target !== root && target.startsWith(prefix);
+}
+
+function sessionRestoreTargetMatches(reobserved, prepared, platform) {
+  if (prepared.length === 1 && prepared[0].receiptKind === 'none') {
+    return reobserved.target === 'session_restore';
+  }
+  return sameEvidenceTarget(reobserved.target, prepared[0]?.target, platform);
 }
 
 function validateIntentLifecycle(start, events, platform) {
@@ -479,11 +506,7 @@ function validateIntentLifecycle(start, events, platform) {
   const receiptSettlements = eventsOfType(intentEvents, 'backend_receipt_settled');
   const applied = exactlyOne(intentEvents, 'app_applied', identity);
   const expectedTarget = start.target ?? reobserved.target;
-  const targetMatches = sessionRestore
-    ? reobserved.target === 'session_restore'
-    : sameEvidenceTarget(reobserved.target, expectedTarget, platform);
-  if (!targetMatches
-    || (sessionRestore && reobserved.targetKind !== 'session_restore')
+  if ((sessionRestore && reobserved.targetKind !== 'session_restore')
     || (!sessionRestore && reobserved.targetKind === 'session_restore')
     || applied.status !== 'accepted'
     || applied.targetKind !== reobserved.targetKind
@@ -498,6 +521,10 @@ function validateIntentLifecycle(start, events, platform) {
   const receiptFacts = validatePreparedReceipts(
     identity, prepared, receiptSettlements, sessionRestore, platform,
   );
+  const targetMatches = sessionRestore
+    ? sessionRestoreTargetMatches(reobserved, prepared, platform)
+    : sameEvidenceTarget(reobserved.target, expectedTarget, platform);
+  if (!targetMatches) throw new Error(`${identity} applied lifecycle binding is invalid`);
   assertOrder(identity, [...prefix, reobserved, ...prepared, ...receiptSettlements, applied, settled]);
   return {
     kind: 'applied',
