@@ -221,9 +221,11 @@ fn sha256(value: &str) -> String {
 }
 
 #[cfg(any(windows, test))]
+const WINDOWS_VERBATIM_PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+
+#[cfg(any(windows, test))]
 fn windows_verbatim_drive_root_matches(root: &[u16], canonical: &[u16]) -> bool {
     const BACKSLASH: u16 = b'\\' as u16;
-    const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
 
     let absolute_drive = root.first().copied().is_some_and(|value| {
         (b'A' as u16..=b'Z' as u16).contains(&value) || (b'a' as u16..=b'z' as u16).contains(&value)
@@ -231,7 +233,7 @@ fn windows_verbatim_drive_root_matches(root: &[u16], canonical: &[u16]) -> bool 
         && root.get(2) == Some(&BACKSLASH);
     absolute_drive
         && canonical
-            .strip_prefix(&VERBATIM_PREFIX)
+            .strip_prefix(&WINDOWS_VERBATIM_PREFIX)
             .is_some_and(|remainder| remainder == root)
 }
 
@@ -988,15 +990,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn accepts_a_windows_temp_root_after_verbatim_canonicalization() {
+    fn accepts_a_canonical_windows_temp_root_without_the_verbatim_prefix() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
         let directory = tempfile::tempdir().unwrap();
         let canonical = fs::canonicalize(directory.path()).unwrap();
+        let canonical_wide = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
+        let dos_wide = canonical_wide
+            .strip_prefix(&WINDOWS_VERBATIM_PREFIX)
+            .expect("Windows canonicalization must return a verbatim drive path");
+        let dos = PathBuf::from(OsString::from_wide(dos_wide));
 
-        assert_ne!(canonical, directory.path());
-        assert_eq!(
-            canonical_challenge_root(directory.path()).unwrap(),
-            directory.path(),
-        );
+        assert_ne!(canonical, dos);
+        assert_eq!(canonical_challenge_root(&dos).unwrap(), dos);
     }
 
     fn test_observer(root: &Path, package_variant: &str, profile: &str) -> PackagedOpenObserver {
