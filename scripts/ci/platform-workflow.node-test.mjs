@@ -11,6 +11,7 @@ const windowsSmokePath = fileURLToPath(new URL('./smoke-windows.ps1', import.met
 const packagedRunnerPath = fileURLToPath(new URL('./packaged-lifecycle-runner.mjs', import.meta.url));
 const packagedOpenRunnerPath = fileURLToPath(new URL('./packaged-open-runner.mjs', import.meta.url));
 const tauriLibPath = fileURLToPath(new URL('../../src-tauri/src/lib.rs', import.meta.url));
+const tauriConfigPath = fileURLToPath(new URL('../../src-tauri/tauri.conf.json', import.meta.url));
 const nativeTrashPath = fileURLToPath(
   new URL('../../src-tauri/src/workspace_trash_native.rs', import.meta.url),
 );
@@ -33,6 +34,15 @@ test('runs platform CI for main pushes when signed release credentials are unava
 
   assert.match(value, /\n  push:\n/);
   assert.doesNotMatch(value, /branches-ignore:\s*\[main\]/);
+});
+
+test('keeps the updater plugin configuration valid in unsigned CI packages', async () => {
+  const config = JSON.parse(await readFile(tauriConfigPath, 'utf8'));
+
+  assert.deepEqual(config.plugins?.updater, {
+    endpoints: [],
+    pubkey: '',
+  });
 });
 
 test('manages open intents before setup can build webviews', async () => {
