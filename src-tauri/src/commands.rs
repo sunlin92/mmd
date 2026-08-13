@@ -3607,7 +3607,7 @@ mod tests {
     ) -> crate::workspace_index_runtime::WorkspaceIndexLease {
         let lease = state
             .workspace_index()
-            .begin_rebuild(workspace_token, workspace_root, operation_id)
+            .begin_rebuild_without_watch_for_test(workspace_token, workspace_root, operation_id)
             .unwrap();
         let (index, _) = build_index(
             vec![IndexDocument {
