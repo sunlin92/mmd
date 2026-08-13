@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      release-ready: ${{ steps.release-trust.outputs.ready }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -29,6 +30,22 @@ jobs:
       - run: npm ci
       - id: version
         run: npm run check:release-version -- --github-output
+      - id: release-trust
+        name: Detect signed release readiness
+        run: node scripts/ci/check-release-trust.mjs --github-output
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
       - run: npm run test:release-tools
       - run: npm run test:perf
       - run: npm run verify:m3-attestation
@@ -41,6 +58,7 @@ jobs:
   build-macos-arm64:
     name: Build macOS arm64
     needs: source
+    if: needs.source.outputs.release-ready == 'true'
     runs-on: macos-15
     env: &trusted-release-env
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -110,6 +128,7 @@ jobs:
   build-macos-x64:
     name: Build macOS x64
     needs: source
+    if: needs.source.outputs.release-ready == 'true'
     runs-on: macos-15-intel
     env: *trusted-release-env
     outputs:
@@ -167,6 +186,7 @@ jobs:
   build-windows-x64:
     name: Build Windows x64
     needs: source
+    if: needs.source.outputs.release-ready == 'true'
     runs-on: windows-latest
     env: *trusted-release-env
     outputs:
@@ -238,6 +258,7 @@ jobs:
   build-linux-x64:
     name: Build Linux x64
     needs: source
+    if: needs.source.outputs.release-ready == 'true'
     runs-on: ubuntu-22.04
     env: *trusted-release-env
     outputs:

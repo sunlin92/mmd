@@ -27,6 +27,7 @@ export function evaluateReleaseTrust(environment) {
     .filter((name) => invalid(name, environment[name]))
     .map((name) => `${name} must contain a production trust value.`);
   return {
+    ready: errors.length === 0,
     errors,
     config: {
       bundle: {
@@ -47,6 +48,19 @@ function main() {
   const outputIndex = process.argv.indexOf('--output');
   const output = outputIndex >= 0 ? process.argv[outputIndex + 1] : null;
   const result = evaluateReleaseTrust(process.env);
+  if (process.argv.includes('--github-output')) {
+    const githubOutput = process.env.GITHUB_OUTPUT;
+    if (!githubOutput) {
+      console.error('GITHUB_OUTPUT is required with --github-output.');
+      process.exitCode = 1;
+      return;
+    }
+    fs.appendFileSync(githubOutput, `ready=${result.ready}\n`, 'utf8');
+    if (!result.ready) {
+      console.log(`::notice::Signed release is disabled because ${result.errors.length} production trust values are not configured.`);
+    }
+    return;
+  }
   if (result.errors.length) {
     for (const error of result.errors) console.error(error);
     process.exitCode = 1;

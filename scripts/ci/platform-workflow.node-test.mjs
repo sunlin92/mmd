@@ -28,6 +28,13 @@ async function smokes() {
   return (await Promise.all(smokePaths.map((file) => readFile(file, 'utf8')))).join('\n');
 }
 
+test('runs platform CI for main pushes when signed release credentials are unavailable', async () => {
+  const value = await workflow();
+
+  assert.match(value, /\n  push:\n/);
+  assert.doesNotMatch(value, /branches-ignore:\s*\[main\]/);
+});
+
 test('manages open intents before setup can build webviews', async () => {
   const value = await readFile(tauriLibPath, 'utf8');
   const setupIndex = value.indexOf('.setup(move |app|');

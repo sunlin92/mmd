@@ -108,6 +108,9 @@ test('embedded publish transaction is valid Bash', async () => {
 
 test('trusted release builds require updater and platform signing secrets', async () => {
   const workflow = await readFile(workflowPath, 'utf8');
+  assert.match(workflow, /release-ready: \$\{\{ steps\.release-trust\.outputs\.ready \}\}/);
+  assert.match(workflow, /id: release-trust[\s\S]*check-release-trust\.mjs --github-output/);
+  assert.match(workflow, /if: needs\.source\.outputs\.release-ready == 'true'/);
   assert.match(workflow, /node scripts\/ci\/check-release-trust\.mjs --output src-tauri\/tauri\.release\.conf\.json/);
   assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY \}\}/);
   assert.match(workflow, /APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}/);

@@ -39,3 +39,8 @@ test('rejects placeholder, ad-hoc, and incomplete trust configuration', () => {
   assert.ok(result.errors.some((error) => error.includes('APPLE_SIGNING_IDENTITY')));
   assert.ok(result.errors.some((error) => error.includes('WINDOWS_CERTIFICATE_THUMBPRINT')));
 });
+
+test('reports release readiness without weakening strict trust validation', () => {
+  assert.equal(evaluateReleaseTrust(complete).ready, true);
+  assert.equal(evaluateReleaseTrust({}).ready, false);
+});
