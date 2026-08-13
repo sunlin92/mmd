@@ -29,9 +29,14 @@ const lazyModuleMocks = vi.hoisted(() => ({
   ) => Promise<unknown>>(),
 }));
 
+const syncMocks = vi.hoisted(() => ({
+  renderAndSyncExcalidrawAssetPair: vi.fn<() => Promise<{ assets: { svg: SVGSVGElement } }>>(),
+}));
+
 vi.mock('@tauri-apps/api/core', () => tauriMocks);
 vi.mock('mermaid', () => ({ default: mermaidMocks }));
 vi.mock('../lib/lazyModule', () => lazyModuleMocks);
+vi.mock('../lib/excalidrawAssetSync', () => syncMocks);
 vi.mock('@excalidraw/excalidraw', () => ({
   exportToSvg: excalidrawMocks.exportToSvg,
   FONT_FAMILY: { Excalifont: 5 },
@@ -97,6 +102,7 @@ describe('JinxiuMarkdown document transitions', () => {
     lazyModuleMocks.loadLazyModuleWithRetry.mockImplementation(
       async (load: () => Promise<unknown>) => load(),
     );
+    syncMocks.renderAndSyncExcalidrawAssetPair.mockReset();
     container = document.createElement('div');
     document.body.append(container);
     root = createRoot(container);
@@ -332,6 +338,43 @@ describe('JinxiuMarkdown document transitions', () => {
     expect([...container.querySelectorAll('.mmd-excalidraw-embed-viewport')].map((preview) => (
       preview.getAttribute('aria-label')
     ))).toEqual(['Generated', 'Legacy']);
+  });
+
+  it('refreshes a source-linked Excalidraw sidecar while keeping the live preview', async () => {
+    tauriMocks.invoke.mockImplementation(async (command) => {
+      if (command === 'read_markdown_excalidraw') return EXCALIDRAW_SCENE;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    const syncedSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    syncedSvg.setAttribute('width', '320');
+    syncedSvg.setAttribute('height', '180');
+    syncMocks.renderAndSyncExcalidrawAssetPair.mockResolvedValue({ assets: { svg: syncedSvg } });
+
+    await act(async () => root.render(
+      <JinxiuMarkdown
+        currentFilePath="/workspace/docs/guide.md"
+        documentRelativePath="docs/guide.md"
+        excalidrawAssetSync={{
+          resourceDirectory: 'assets',
+          workspaceRoot: '/workspace',
+          workspaceToken: 'workspace-token',
+        }}
+        workspaceRoot="/workspace"
+      >
+        {'[![System](../assets/system.svg?mmdSource=abc)](../diagrams/system.excalidraw "mmd:source")'}
+      </JinxiuMarkdown>,
+    ));
+    await act(async () => {
+      await vi.waitFor(() => expect(syncMocks.renderAndSyncExcalidrawAssetPair).toHaveBeenCalledOnce());
+    });
+
+    expect(syncMocks.renderAndSyncExcalidrawAssetPair).toHaveBeenCalledWith(expect.objectContaining({
+      documentPath: '/workspace/docs/guide.md',
+      sourceRelativePath: 'diagrams/system.excalidraw',
+      sourceContent: EXCALIDRAW_SCENE,
+      workspaceToken: 'workspace-token',
+    }));
+    expect(container.querySelector('.mmd-excalidraw-embed-viewport > svg')).toBe(syncedSvg);
   });
 
   it('keeps unsafe Excalidraw sources as ordinary links', async () => {

@@ -117,6 +117,16 @@ pub(crate) fn update_settings(
     state: State<'_, AppState>,
 ) -> Result<SettingsEnvelope, SettingsError> {
     let envelope = update_settings_inner(&state, expected_revision, settings)?;
+    state.set_native_shortcuts(envelope.settings.shortcuts.clone());
+    native_menu::refresh_app_menu(&app, &state.native_menu_state()).map_err(|error| {
+        SettingsError {
+            code: crate::models::SettingsErrorCode::Persistence,
+            message: format!(
+                "Settings were saved, but native shortcuts could not be updated: {error}"
+            ),
+            can_reset: false,
+        }
+    })?;
     app.emit(SETTINGS_CHANGED_EVENT, &envelope)
         .map_err(|error| SettingsError {
             code: crate::models::SettingsErrorCode::Persistence,
@@ -133,6 +143,16 @@ pub(crate) fn reset_settings(
     state: State<'_, AppState>,
 ) -> Result<SettingsEnvelope, SettingsError> {
     let envelope = reset_settings_inner(&state, expected_revision)?;
+    state.set_native_shortcuts(envelope.settings.shortcuts.clone());
+    native_menu::refresh_app_menu(&app, &state.native_menu_state()).map_err(|error| {
+        SettingsError {
+            code: crate::models::SettingsErrorCode::Persistence,
+            message: format!(
+                "Settings were reset, but native shortcuts could not be updated: {error}"
+            ),
+            can_reset: false,
+        }
+    })?;
     app.emit(SETTINGS_CHANGED_EVENT, &envelope)
         .map_err(|error| SettingsError {
             code: crate::models::SettingsErrorCode::Persistence,

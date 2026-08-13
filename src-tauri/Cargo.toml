@@ -30,6 +30,7 @@ fs2 = "=0.4.3"
 getrandom = "=0.4.3"
 mime_guess = "2.0.5"
 libc = "=0.2.186"
+md-5 = "=0.10.6"
 notify = "=8.2.0"
 notify-debouncer-full = "=0.7.0"
 percent-encoding = "2.3.2"
@@ -42,6 +43,8 @@ tauri-plugin-single-instance = "=2.4.3"
 tiny_http = "0.12.0"
 walkdir = "2.5.0"
 zip = { version = "=8.6.0", default-features = false }
+tauri-plugin-updater = "=2.10.1"
+tauri-plugin-process = "=2.3.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.61.3", features = [

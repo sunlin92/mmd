@@ -73,5 +73,6 @@
   .settings-field { align-items: flex-start; flex-direction: column; gap: 6px; }
   .settings-field > input,
   .settings-field select,
-  .settings-number { width: 100%; }
+  .settings-number,
+  .settings-path-control { width: 100%; }
 }

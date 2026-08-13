@@ -1,4 +1,4 @@
-import { Check, CircleAlert, FileText, Files, LoaderCircle, Search } from 'lucide-react';
+import { Check, CircleAlert, Download, FileText, Files, LoaderCircle, Search } from 'lucide-react';
 import { displayName } from '../lib/documentNames';
 import { useI18n } from '../lib/i18n';
 
@@ -9,6 +9,7 @@ interface AppToolbarProps {
   dirty: boolean;
   onQuickOpen: () => void;
   onWorkspaceSearch: () => void;
+  onExport?: () => void;
 }
 
 export function AppToolbar({
@@ -18,6 +19,7 @@ export function AppToolbar({
   dirty,
   onQuickOpen,
   onWorkspaceSearch,
+  onExport,
 }: AppToolbarProps) {
   const { t } = useI18n();
   const status = busy
@@ -35,6 +37,7 @@ export function AppToolbar({
           <small>Markdown</small>
         </div>
         <div className="toolbar-search-actions">
+          <button type="button" aria-label={t('exportDocument')} className="toolbar-icon-button" disabled={!onExport} title={t('exportDocument')} onClick={onExport}><Download size={16} aria-hidden="true" /></button>
           <button
             type="button"
             aria-label={t('quickOpen')}

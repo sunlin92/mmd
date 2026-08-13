@@ -7,7 +7,17 @@ export const MARKDOWN_MEDIA_INSERTION_HANDSHAKE_EVENT = 'mmd-markdown-media-inse
 export const MARKDOWN_MEDIA_INSERTION_HANDSHAKE_ACK_EVENT = 'mmd-markdown-media-insertion-handshake-ack';
 
 export type MarkdownMediaAsset = Pick<WorkspaceFileEntry, 'kind' | 'name' | 'relative_path'>;
-type MarkdownMediaDocument = Pick<WorkspaceFileEntry, 'relative_path'>;
+export type MarkdownMediaDocument = Pick<WorkspaceFileEntry, 'relative_path'>;
+
+export interface MarkdownExcalidrawAssetReferenceInput {
+  document: MarkdownMediaDocument;
+  name: string;
+  pngMarkdownPath: string;
+  scale: 1 | 2 | 3;
+  sourceRelativePath: string;
+  sourceSha256: string;
+  svgMarkdownPath: string;
+}
 
 export type MarkdownMediaInsertionTarget =
   | { kind: 'cursor' }
@@ -194,8 +204,26 @@ function encodeMarkdownDestination(segments: string[]): string {
   )).join('/');
 }
 
+function normalizeMarkdownDestination(path: string): string | null {
+  const normalized = path.replace(/\\/gu, '/');
+  if (
+    !normalized
+    || normalized.startsWith('/')
+    || normalized.length > 4096
+    || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(normalized)
+  ) return null;
+  const segments = normalized.split('/');
+  if (segments.some((segment) => !segment || segment === '.')) return null;
+  return encodeMarkdownDestination(segments);
+}
+
 function escapeMarkdownLabel(label: string): string {
   return label.replace(/[\\[\]]/g, '\\$&');
+}
+
+export function createMarkdownImageReference(name: string, documentRelativePath: string): string | null {
+  const destination = normalizeMarkdownDestination(documentRelativePath);
+  return destination ? `![${escapeMarkdownLabel(name)}](${destination})` : null;
 }
 
 function relativeAssetPath(
@@ -220,12 +248,86 @@ function relativeAssetPath(
   ]);
 }
 
+export function createMarkdownMediaDestination(
+  asset: MarkdownMediaAsset,
+  document: MarkdownMediaDocument,
+): string | null {
+  if (!isMarkdownWorkspaceReferenceKind(asset.kind)) return null;
+  return relativeAssetPath(document, asset);
+}
+
+export function resolveWorkspaceRelativeMediaPath(
+  documentRelativePath: string,
+  documentDestination: string,
+): string | null {
+  const documentSegments = splitWorkspaceRelativePath(documentRelativePath);
+  if (!documentSegments) return null;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(documentDestination.replace(/\\/gu, '/'));
+  } catch {
+    return null;
+  }
+  if (
+    !decoded
+    || decoded.startsWith('/')
+    || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(decoded)
+    || decoded.includes('?')
+    || decoded.includes('#')
+  ) return null;
+  const segments = decoded.split('/');
+  const resolved = documentSegments.slice(0, -1);
+  for (const segment of segments) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') {
+      if (resolved.length === 0) return null;
+      resolved.pop();
+    } else {
+      resolved.push(segment);
+    }
+  }
+  return resolved.length > 0 ? resolved.join('/') : null;
+}
+
+function encodeMetadata(value: unknown): string {
+  // URI encoding keeps the metadata safe inside an HTML comment, including
+  // filenames containing comment terminators or non-ASCII characters.
+  return encodeURIComponent(JSON.stringify(value)).replace(/-/gu, '%2D');
+}
+
+export function createMarkdownExcalidrawAssetReference(
+  input: MarkdownExcalidrawAssetReferenceInput,
+): string | null {
+  if (!/^[a-f0-9]{64}$/u.test(input.sourceSha256)) return null;
+  const sourceDestination = relativeAssetPath(input.document, {
+    kind: 'excalidraw',
+    name: 'source.excalidraw',
+    relative_path: input.sourceRelativePath,
+  });
+  const svgDestination = normalizeMarkdownDestination(input.svgMarkdownPath);
+  const pngDestination = normalizeMarkdownDestination(input.pngMarkdownPath);
+  if (!sourceDestination || !svgDestination || !pngDestination) return null;
+  const metadata = encodeMetadata({
+    png: pngDestination,
+    scale: input.scale,
+    source: sourceDestination,
+    sourceRelativePath: input.sourceRelativePath,
+    sourceSha256: input.sourceSha256,
+    version: 1,
+  });
+  const cacheKey = encodeURIComponent(input.sourceSha256);
+  return [
+    `<!-- mmd:excalidraw ${metadata} -->`,
+    `[![${escapeMarkdownLabel(input.name)}](${svgDestination}?mmdSource=${cacheKey})](${sourceDestination} "mmd:source")`,
+  ].join('\n');
+}
+
 export function createMarkdownMediaReference(
   asset: MarkdownMediaAsset,
   document: MarkdownMediaDocument,
 ): string | null {
   if (!isMarkdownWorkspaceReferenceKind(asset.kind)) return null;
-  const destination = relativeAssetPath(document, asset);
+  const destination = createMarkdownMediaDestination(asset, document);
   if (!destination) return null;
   const label = escapeMarkdownLabel(asset.name);
   if (asset.kind === 'image') return `![${label}](${destination})`;

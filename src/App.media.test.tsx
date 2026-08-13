@@ -15,6 +15,7 @@ import { getPanePopoutLabel } from './lib/paneLayout';
 import type { PanePopoutOpenOutcome } from './lib/paneWindow';
 
 const appMocks = vi.hoisted(() => ({
+  authorizeResourceDirectory: vi.fn<() => Promise<Record<string, unknown> | null>>(),
   docxPreview: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   editorPane: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   editorPopoutButton: undefined as Record<string, unknown> | undefined,
@@ -22,6 +23,7 @@ const appMocks = vi.hoisted(() => ({
   emit: vi.fn<(event: string, payload: unknown) => Promise<void>>(),
   emitTo: vi.fn<(target: string, event: string, payload: unknown) => Promise<void>>(),
   fileSidebar: vi.fn<(props: Record<string, unknown>) => null>(() => null),
+  renderAndSyncExcalidrawAssetPair: vi.fn<() => Promise<Record<string, unknown>>>(),
   jinxiuMarkdown: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   listen: vi.fn<(event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>>(),
   openPanePopout: vi.fn<(pane: 'editor' | 'preview', instanceId?: string) => Promise<PanePopoutOpenOutcome>>(),
@@ -29,7 +31,10 @@ const appMocks = vi.hoisted(() => ({
   pdfPreview: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   previewPane: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   setNativeSaveMenuEnabled: vi.fn<(enabled: boolean) => Promise<void>>(),
+  settings: null as null | Record<string, unknown>,
+  settingsDialog: vi.fn<(props: Record<string, unknown>) => null>(() => null),
   useDocumentSession: vi.fn<(input: Record<string, unknown>) => Record<string, unknown>>(),
+  writeWorkspaceResource: vi.fn<(input: Record<string, unknown>) => Promise<Record<string, unknown>>>(),
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
@@ -45,6 +50,7 @@ vi.mock('./components/JinxiuMarkdown', () => ({ default: appMocks.jinxiuMarkdown
 vi.mock('./components/PaneResizer', () => ({ PaneResizer: appMocks.paneResizer }));
 vi.mock('./components/PdfPreview', () => ({ PdfPreview: appMocks.pdfPreview }));
 vi.mock('./components/PreviewPane', () => ({ PreviewPane: appMocks.previewPane }));
+vi.mock('./components/SettingsDialog', () => ({ SettingsDialog: appMocks.settingsDialog }));
 vi.mock('./hooks/useDocumentSession', () => ({
   useDocumentSession: appMocks.useDocumentSession,
 }));
@@ -83,12 +89,17 @@ vi.mock('./hooks/useSettings', () => ({
     recovery: null,
     reset: vi.fn<() => Promise<void>>(async () => undefined),
     retry: vi.fn<() => Promise<void>>(async () => undefined),
-    settings: null,
+    settings: appMocks.settings,
     updateSettings: vi.fn<(settings: unknown) => Promise<void>>(async () => undefined),
   }),
 }));
 vi.mock('./lib/tauriCommands', () => ({
+  authorizeResourceDirectory: appMocks.authorizeResourceDirectory,
   setNativeSaveMenuEnabled: appMocks.setNativeSaveMenuEnabled,
+  writeWorkspaceResource: appMocks.writeWorkspaceResource,
+}));
+vi.mock('./lib/excalidrawAssetSync', () => ({
+  renderAndSyncExcalidrawAssetPair: appMocks.renderAndSyncExcalidrawAssetPair,
 }));
 
 function createMarkdownSession() {
@@ -143,6 +154,7 @@ function createMarkdownSession() {
     setNotice: vi.fn<(message: string | null) => void>(),
     updateContent: vi.fn<(content: string) => void>(),
     workspaceRoot: '/workspace',
+    workspaceToken: 'workspace-token',
   };
 }
 
@@ -211,12 +223,14 @@ describe('App workspace media insertion', () => {
     document.body.append(container);
     root = createRoot(container);
     appMocks.editorPane.mockClear();
+    appMocks.authorizeResourceDirectory.mockReset();
     appMocks.editorPopoutButton = undefined;
     appMocks.emit.mockReset();
     appMocks.emit.mockResolvedValue(undefined);
     appMocks.emitTo.mockReset();
     appMocks.emitTo.mockResolvedValue(undefined);
     appMocks.fileSidebar.mockClear();
+    appMocks.renderAndSyncExcalidrawAssetPair.mockReset();
     appMocks.jinxiuMarkdown.mockClear();
     appMocks.listen.mockReset();
     appMocks.listen.mockResolvedValue(() => undefined);
@@ -226,7 +240,10 @@ describe('App workspace media insertion', () => {
     appMocks.previewPane.mockClear();
     appMocks.setNativeSaveMenuEnabled.mockReset();
     appMocks.setNativeSaveMenuEnabled.mockResolvedValue(undefined);
+    appMocks.settings = null;
+    appMocks.settingsDialog.mockClear();
     appMocks.useDocumentSession.mockReset();
+    appMocks.writeWorkspaceResource.mockReset();
   });
 
   afterEach(() => {
@@ -258,6 +275,225 @@ describe('App workspace media insertion', () => {
       requestId: 1,
       target: { kind: 'coordinates', clientX: 240, clientY: 160 },
     });
+  });
+
+  it('exports an Excalidraw sidecar pair before inserting its source-linked Markdown', async () => {
+    appMocks.settings = {
+      autosaveDelayMs: 1500,
+      autosaveEnabled: false,
+      editorPaneRatio: 0.5,
+      resourceDirectory: 'assets',
+      spellcheckEnabled: true,
+    };
+    appMocks.renderAndSyncExcalidrawAssetPair.mockResolvedValue({
+      markdown: '<!-- mmd:excalidraw -->\n[![system](../assets/excalidraw-assets/system.svg)](../diagrams/system.excalidraw "mmd:source")',
+    });
+    appMocks.useDocumentSession.mockReturnValue(createMarkdownSession());
+    await act(async () => root.render(<App />));
+
+    const onInsertWorkspaceAsset = appMocks.fileSidebar.mock.lastCall?.[0].onInsertWorkspaceAsset as
+      | ((asset: Record<string, unknown>, target: { kind: 'cursor' }) => Promise<void>)
+      | undefined;
+    await act(async () => {
+      await onInsertWorkspaceAsset?.({
+        kind: 'excalidraw',
+        name: 'system.excalidraw',
+        path: '/workspace/diagrams/system.excalidraw',
+        relative_path: 'diagrams/system.excalidraw',
+      }, { kind: 'cursor' });
+    });
+
+    expect(appMocks.renderAndSyncExcalidrawAssetPair).toHaveBeenCalledWith(expect.objectContaining({
+      documentPath: '/workspace/docs/guide.md',
+      sourceRelativePath: 'diagrams/system.excalidraw',
+      resourceDirectory: 'assets',
+      workspaceRoot: '/workspace',
+      workspaceToken: 'workspace-token',
+    }));
+    expect(appMocks.editorPane.mock.lastCall?.[0].mediaInsertion).toEqual(expect.objectContaining({
+      documentEpoch: 1,
+      documentId: 'document-guide',
+      markdown: expect.stringContaining('mmd:source'),
+      target: { kind: 'cursor' },
+    }));
+  });
+
+  it('writes a clipboard image to the configured resource directory and returns a document-relative reference', async () => {
+    appMocks.settings = {
+      autosaveDelayMs: 1500,
+      autosaveEnabled: false,
+      editorPaneRatio: 0.5,
+      resourceDirectory: 'assets',
+      spellcheckEnabled: true,
+    };
+    appMocks.writeWorkspaceResource.mockResolvedValue({
+      created: true,
+      digestMd5: '0123456789abcdef0123456789abcdef',
+      fileName: '0123456789abcdef0123456789abcdef.png',
+      markdownPath: '../assets/0123456789abcdef0123456789abcdef.png',
+      relativePath: 'assets/0123456789abcdef0123456789abcdef.png',
+    });
+    appMocks.useDocumentSession.mockReturnValue(createMarkdownSession());
+    await act(async () => root.render(<App />));
+    const onPasteImage = appMocks.editorPane.mock.lastCall?.[0].onPasteImage as
+      | ((request: Record<string, unknown>) => Promise<string | null>)
+      | undefined;
+
+    let markdown: string | null | undefined;
+    await act(async () => {
+      markdown = await onPasteImage?.({
+        blob: new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }),
+        documentEpoch: 1,
+        documentId: 'document-guide',
+        mimeType: 'image/png',
+        suggestedName: 'clipboard.png',
+      });
+    });
+
+    expect(appMocks.writeWorkspaceResource).toHaveBeenCalledWith({
+      bytesBase64: 'AQID',
+      documentPath: '/workspace/docs/guide.md',
+      mimeType: 'image/png',
+      resourceDirectory: 'assets',
+      suggestedName: 'clipboard.png',
+      workspaceRoot: '/workspace',
+      workspaceToken: 'workspace-token',
+    });
+    expect(markdown).toBe('![clipboard.png](../assets/0123456789abcdef0123456789abcdef.png)');
+  });
+
+  it('uses a live folder-picker authorization for an absolute resource directory', async () => {
+    appMocks.settings = {
+      autosaveDelayMs: 1500,
+      autosaveEnabled: false,
+      editorPaneRatio: 0.5,
+      resourceDirectory: '/shared/mmd assets',
+      spellcheckEnabled: true,
+    };
+    appMocks.authorizeResourceDirectory.mockResolvedValue({
+      path: '/shared/mmd assets',
+      token: 'workspace-resource-9',
+    });
+    appMocks.writeWorkspaceResource.mockResolvedValue({
+      created: true,
+      digestMd5: '0123456789abcdef0123456789abcdef',
+      fileName: '0123456789abcdef0123456789abcdef.png',
+      markdownPath: '../../shared/mmd assets/0123456789abcdef0123456789abcdef.png',
+      relativePath: '../../shared/mmd assets/0123456789abcdef0123456789abcdef.png',
+    });
+    appMocks.useDocumentSession.mockReturnValue(createMarkdownSession());
+    await act(async () => root.render(<App />));
+
+    await act(async () => container.querySelector<HTMLButtonElement>('[title="Settings"]')?.click());
+    const onAuthorizeResourceDirectory = appMocks.settingsDialog.mock.lastCall?.[0]
+      .onAuthorizeResourceDirectory as (() => Promise<string | null>) | undefined;
+    await act(async () => {
+      await expect(onAuthorizeResourceDirectory?.()).resolves.toBe('/shared/mmd assets');
+    });
+
+    const onPasteImage = appMocks.editorPane.mock.lastCall?.[0].onPasteImage as
+      (request: Record<string, unknown>) => Promise<string | null>;
+    let markdown: string | null = null;
+    await act(async () => {
+      markdown = await onPasteImage({
+        blob: new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }),
+        documentEpoch: 1,
+        documentId: 'document-guide',
+        mimeType: 'image/png',
+        suggestedName: 'clipboard [final].png',
+      });
+    });
+
+    expect(appMocks.writeWorkspaceResource).toHaveBeenCalledWith(expect.objectContaining({
+      resourceDirectory: '/shared/mmd assets',
+      resourceDirectoryToken: 'workspace-resource-9',
+    }));
+    expect(markdown).toBe(
+      '![clipboard \\[final\\].png](../../shared/mmd%20assets/0123456789abcdef0123456789abcdef.png)',
+    );
+  });
+
+  it('drops a clipboard image result when the active document changes during the write', async () => {
+    appMocks.settings = {
+      autosaveDelayMs: 1500,
+      autosaveEnabled: false,
+      editorPaneRatio: 0.5,
+      resourceDirectory: 'assets',
+      spellcheckEnabled: true,
+    };
+    let finishWrite: ((value: Record<string, unknown>) => void) | undefined;
+    appMocks.writeWorkspaceResource.mockImplementation(() => new Promise((resolve) => {
+      finishWrite = resolve;
+    }));
+    appMocks.useDocumentSession.mockReturnValue(createMarkdownSession());
+    await act(async () => root.render(<App />));
+    const onPasteImage = appMocks.editorPane.mock.lastCall?.[0].onPasteImage as
+      (request: Record<string, unknown>) => Promise<string | null>;
+    const pending = onPasteImage({
+      blob: new Blob([new Uint8Array([1])], { type: 'image/png' }),
+      documentEpoch: 1,
+      documentId: 'document-guide',
+      mimeType: 'image/png',
+      suggestedName: 'clipboard.png',
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    appMocks.useDocumentSession.mockReturnValue({
+      ...createMarkdownSession(),
+      activePath: '/workspace/docs/next.md',
+      documentEpoch: 2,
+      documentId: 'document-next',
+      files: [{
+        kind: 'markdown',
+        name: 'next.md',
+        path: '/workspace/docs/next.md',
+        relative_path: 'docs/next.md',
+      }],
+    });
+    await act(async () => root.render(<App />));
+    let markdown: string | null | undefined;
+    await act(async () => {
+      finishWrite?.({
+        created: true,
+        digestMd5: '0123456789abcdef0123456789abcdef',
+        fileName: 'image.png',
+        markdownPath: '../assets/image.png',
+        relativePath: 'assets/image.png',
+      });
+      markdown = await pending;
+    });
+
+    expect(markdown).toBeNull();
+  });
+
+  it('routes clipboard resource write failures through modal feedback state', async () => {
+    appMocks.settings = {
+      autosaveDelayMs: 1500,
+      autosaveEnabled: false,
+      editorPaneRatio: 0.5,
+      resourceDirectory: 'assets',
+      spellcheckEnabled: true,
+    };
+    appMocks.writeWorkspaceResource.mockRejectedValue(new Error('resource write failed'));
+    const session = createMarkdownSession();
+    appMocks.useDocumentSession.mockReturnValue(session);
+    await act(async () => root.render(<App />));
+    const onPasteImage = appMocks.editorPane.mock.lastCall?.[0].onPasteImage as
+      (request: Record<string, unknown>) => Promise<string | null>;
+
+    await act(async () => {
+      await expect(onPasteImage({
+        blob: new Blob([new Uint8Array([1])], { type: 'image/png' }),
+        documentEpoch: 1,
+        documentId: 'document-guide',
+        mimeType: 'image/png',
+        suggestedName: 'clipboard.png',
+      })).resolves.toBeNull();
+    });
+
+    expect(session.setError).toHaveBeenCalledWith(expect.any(String));
+    expect(session.setNotice).toHaveBeenCalledWith(null);
   });
 
   it('routes a dropped workspace audio file as a Markdown link', async () => {

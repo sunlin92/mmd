@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use tauri::{
     menu::{CheckMenuItemBuilder, Menu, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
     AppHandle, Runtime,
@@ -47,6 +48,7 @@ pub struct NativeMenuState {
     follow_system: bool,
     locale_mode: String,
     effective_locale: String,
+    shortcuts: BTreeMap<String, String>,
 }
 
 impl Default for NativeMenuState {
@@ -60,6 +62,7 @@ impl Default for NativeMenuState {
             follow_system: false,
             locale_mode: "system".to_string(),
             effective_locale: "en".to_string(),
+            shortcuts: BTreeMap::new(),
         }
     }
 }
@@ -89,8 +92,19 @@ impl NativeMenuState {
         &self.effective_locale
     }
 
+    pub fn shortcut(&self, action: &str, default: &'static str) -> String {
+        self.shortcuts
+            .get(action)
+            .map(|value| value.replace("Mod+", "CmdOrCtrl+"))
+            .unwrap_or_else(|| default.to_string())
+    }
+
     pub fn set_recent_files(&mut self, recent_files: RecentFilesSnapshot) {
         self.recent_files = recent_files;
+    }
+
+    pub fn set_shortcuts(&mut self, shortcuts: BTreeMap<String, String>) {
+        self.shortcuts = shortcuts;
     }
 
     pub fn set_save_enabled(&mut self, enabled: bool) {
@@ -254,6 +268,7 @@ pub fn build_app_menu<R: Runtime>(
         state.recent_files(),
         state.save_enabled(),
         state.effective_locale() == "zh-CN",
+        state,
     )?;
     let view_menu = build_view_menu(app, state)?;
 
@@ -354,6 +369,7 @@ fn build_file_menu_with_locale<R: Runtime>(
     recent_files: &RecentFilesSnapshot,
     save_enabled: bool,
     chinese: bool,
+    state: &NativeMenuState,
 ) -> tauri::Result<tauri::menu::Submenu<R>> {
     let new = MenuItemBuilder::with_id(MENU_NEW_ID, if chinese { "新建" } else { "New" })
         .accelerator("CmdOrCtrl+N")
@@ -386,7 +402,7 @@ fn build_file_menu_with_locale<R: Runtime>(
             "Quick Open…"
         },
     )
-    .accelerator("CmdOrCtrl+P")
+    .accelerator(state.shortcut("quickOpen", "CmdOrCtrl+P"))
     .build(app)?;
     let workspace_search = MenuItemBuilder::with_id(
         MENU_WORKSPACE_SEARCH_ID,
@@ -396,11 +412,11 @@ fn build_file_menu_with_locale<R: Runtime>(
             "Search Workspace…"
         },
     )
-    .accelerator("CmdOrCtrl+Shift+F")
+    .accelerator(state.shortcut("workspaceSearch", "CmdOrCtrl+Shift+F"))
     .build(app)?;
     let open_recent = build_open_recent_menu(app, recent_files, chinese)?;
     let save = MenuItemBuilder::with_id(MENU_SAVE_ID, if chinese { "保存" } else { "Save" })
-        .accelerator("CmdOrCtrl+S")
+        .accelerator(state.shortcut("save", "CmdOrCtrl+S"))
         .enabled(save_enabled)
         .build(app)?;
     let save_as = MenuItemBuilder::with_id(
@@ -411,7 +427,7 @@ fn build_file_menu_with_locale<R: Runtime>(
             "Save As…"
         },
     )
-    .accelerator("CmdOrCtrl+Shift+S")
+    .accelerator(state.shortcut("saveAs", "CmdOrCtrl+Shift+S"))
     .enabled(save_enabled)
     .build(app)?;
     let close_window = PredefinedMenuItem::close_window(app, None)?;
@@ -592,6 +608,22 @@ mod tests {
         assert!(state.set_theme_preference("not-a-skin", false).is_err());
         assert_eq!(state.selected_skin(), "qinghua-jilan");
         assert!(state.follow_system());
+    }
+
+    #[test]
+    fn native_menu_state_projects_custom_primary_modifier_shortcuts() {
+        let mut state = NativeMenuState::default();
+        assert_eq!(state.shortcut("save", "CmdOrCtrl+S"), "CmdOrCtrl+S");
+        state.set_shortcuts(BTreeMap::from([
+            ("save".to_string(), "Mod+Shift+P".to_string()),
+            ("quickOpen".to_string(), "Ctrl+Alt+Q".to_string()),
+        ]));
+        assert_eq!(state.shortcut("save", "CmdOrCtrl+S"), "CmdOrCtrl+Shift+P");
+        assert_eq!(state.shortcut("quickOpen", "CmdOrCtrl+P"), "Ctrl+Alt+Q");
+        assert_eq!(
+            state.shortcut("saveAs", "CmdOrCtrl+Shift+S"),
+            "CmdOrCtrl+Shift+S"
+        );
     }
 
     #[test]

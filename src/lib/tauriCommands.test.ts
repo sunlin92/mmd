@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  authorizeResourceDirectory,
   createWorkspaceDirectory,
   createWorkspaceFile,
   deleteWorkspaceEntry,
@@ -34,11 +35,15 @@ import {
   recordPackagedOpenAppEvent,
   requestSessionRestore,
   saveAsDialog,
+  saveExport,
+  saveExcalidrawBundle,
   setNativeSaveMenuEnabled,
   setNativeLocalePreference,
   setNativeThemePreference,
   updateSettings,
   writeFile,
+  writeExcalidrawAssetPair,
+  writeWorkspaceResource,
 } from './tauriCommands';
 
 const invokeMock = vi.hoisted(() => vi.fn<(command: string, payload?: unknown) => Promise<unknown>>());
@@ -696,6 +701,145 @@ describe('Tauri command wrappers', () => {
     });
   });
 
+  it('writes a workspace resource through a strictly decoded Tauri command', async () => {
+    invokeMock.mockResolvedValue({
+      relativePath: 'assets/0123456789abcdef0123456789abcdef.png',
+      markdownPath: 'assets/0123456789abcdef0123456789abcdef.png',
+      fileName: '0123456789abcdef0123456789abcdef.png',
+      digestMd5: '0123456789abcdef0123456789abcdef',
+      created: true,
+    });
+
+    await expect(writeWorkspaceResource({
+      workspaceToken: 'workspace-7',
+      workspaceRoot: '/workspace',
+      documentPath: '/workspace/draft.md',
+      resourceDirectory: 'assets',
+      bytesBase64: 'iVBORw==',
+      mimeType: 'image/png',
+      suggestedName: 'cover.png',
+      trustedGenerated: true,
+      resourceDirectoryToken: 'workspace-9',
+    })).resolves.toEqual({
+      relativePath: 'assets/0123456789abcdef0123456789abcdef.png',
+      markdownPath: 'assets/0123456789abcdef0123456789abcdef.png',
+      fileName: '0123456789abcdef0123456789abcdef.png',
+      digestMd5: '0123456789abcdef0123456789abcdef',
+      created: true,
+    });
+    expect(invokeMock).toHaveBeenCalledWith('write_workspace_resource', {
+      input: {
+        workspaceToken: 'workspace-7',
+        workspaceRoot: '/workspace',
+        documentPath: '/workspace/draft.md',
+        resourceDirectory: 'assets',
+        bytesBase64: 'iVBORw==',
+        mimeType: 'image/png',
+        suggestedName: 'cover.png',
+        trustedGenerated: true,
+        resourceDirectoryToken: 'workspace-9',
+      },
+    });
+  });
+
+  it('authorizes an absolute resource directory through the native folder picker', async () => {
+    invokeMock.mockResolvedValue({
+      path: '/shared/mmd-assets',
+      token: 'workspace-9',
+    });
+
+    await expect(authorizeResourceDirectory()).resolves.toEqual({
+      path: '/shared/mmd-assets',
+      token: 'workspace-9',
+    });
+    expect(invokeMock).toHaveBeenCalledWith('authorize_resource_directory_dialog');
+
+    invokeMock.mockResolvedValueOnce(null);
+    await expect(authorizeResourceDirectory()).resolves.toBeNull();
+  });
+
+  it('writes a generated Excalidraw SVG/PNG pair through a strict decoder', async () => {
+    invokeMock.mockResolvedValue({
+      svgMarkdownPath: '../assets/excalidraw-assets/system-abc.svg',
+      pngMarkdownPath: '../assets/excalidraw-assets/system-abc.png',
+      svgFileName: 'system-abc.svg',
+      pngFileName: 'system-abc.png',
+      sourceSha256: 'a'.repeat(64),
+      updated: true,
+    });
+
+    await expect(writeExcalidrawAssetPair({
+      workspaceToken: 'workspace-7',
+      workspaceRoot: '/workspace',
+      documentPath: '/workspace/docs/guide.md',
+      sourceRelativePath: 'diagrams/system.excalidraw',
+      sourceContent: '{"type":"excalidraw","version":2}',
+      resourceDirectory: 'assets',
+      svgBase64: 'PHN2Zy8+',
+      pngBase64: 'iVBORw==',
+    })).resolves.toEqual({
+      svgMarkdownPath: '../assets/excalidraw-assets/system-abc.svg',
+      pngMarkdownPath: '../assets/excalidraw-assets/system-abc.png',
+      svgFileName: 'system-abc.svg',
+      pngFileName: 'system-abc.png',
+      sourceSha256: 'a'.repeat(64),
+      updated: true,
+    });
+    expect(invokeMock).toHaveBeenCalledWith('write_excalidraw_asset_pair', {
+      input: {
+        workspaceToken: 'workspace-7',
+        workspaceRoot: '/workspace',
+        documentPath: '/workspace/docs/guide.md',
+        sourceRelativePath: 'diagrams/system.excalidraw',
+        sourceContent: '{"type":"excalidraw","version":2}',
+        resourceDirectory: 'assets',
+        svgBase64: 'PHN2Zy8+',
+        pngBase64: 'iVBORw==',
+      },
+    });
+  });
+
+  it('rejects malformed Excalidraw asset pair responses', async () => {
+    invokeMock.mockResolvedValue({
+      svgMarkdownPath: '../assets/system.svg',
+      pngMarkdownPath: '../assets/system.png',
+      svgFileName: 'system.svg',
+      pngFileName: 'system.png',
+      sourceSha256: 'not-a-sha256',
+      updated: false,
+    });
+
+    await expect(writeExcalidrawAssetPair({
+      workspaceToken: 'workspace-7',
+      workspaceRoot: '/workspace',
+      documentPath: '/workspace/docs/guide.md',
+      sourceRelativePath: 'diagrams/system.excalidraw',
+      sourceContent: '{}',
+      resourceDirectory: 'assets',
+      svgBase64: 'PHN2Zy8+',
+      pngBase64: 'iVBORw==',
+    })).rejects.toThrow('Invalid Excalidraw asset pair response');
+  });
+
+  it('rejects malformed workspace resource responses', async () => {
+    invokeMock.mockResolvedValue({
+      relativePath: 'assets/image.png',
+      markdownPath: 'assets/image.png',
+      fileName: 'image.png',
+      digestMd5: 'not-md5',
+      created: true,
+    });
+
+    await expect(writeWorkspaceResource({
+      workspaceToken: 'workspace-7',
+      workspaceRoot: '/workspace',
+      documentPath: '/workspace/draft.md',
+      resourceDirectory: 'assets',
+      bytesBase64: 'iVBORw==',
+      mimeType: 'image/png',
+    })).rejects.toThrow('Invalid workspace resource response');
+  });
+
   it('resolves authorized media before creating an asset URL', async () => {
     invokeMock.mockResolvedValue('/workspace/media/clip.mp4');
 
@@ -759,6 +903,42 @@ describe('Tauri command wrappers', () => {
     expect(invokeMock).toHaveBeenCalledWith('release_markdown_html_embed', {
       ownerId: 41,
     });
+  });
+
+  it('saves validated export bytes and preserves dialog cancellation', async () => {
+    invokeMock.mockResolvedValueOnce({ path: '/exports/guide.html', bytesWritten: 42 });
+    await expect(saveExport({ kind: 'html', defaultName: 'guide.html', bytesBase64: 'PGgxLz4=' }))
+      .resolves.toEqual({ path: '/exports/guide.html', bytesWritten: 42 });
+    expect(invokeMock).toHaveBeenCalledWith('save_export_dialog', {
+      input: { kind: 'html', defaultName: 'guide.html', bytesBase64: 'PGgxLz4=' },
+    });
+
+    invokeMock.mockResolvedValueOnce(null);
+    await expect(saveExport({ kind: 'png', defaultName: 'guide.png', bytesBase64: 'iVBORw==' }))
+      .resolves.toBeNull();
+  });
+
+  it('rejects malformed export responses', async () => {
+    invokeMock.mockResolvedValue({ path: '', bytesWritten: -1 });
+    await expect(saveExport({ kind: 'html', defaultName: 'guide.html', bytesBase64: 'PGgxLz4=' }))
+      .rejects.toThrow('Invalid export response');
+  });
+
+  it('saves exactly five Excalidraw bundle files and rejects partial responses', async () => {
+    const paths = [
+      '/exports/scene.excalidraw', '/exports/scene.svg', '/exports/scene@1x.png',
+      '/exports/scene@2x.png', '/exports/scene@3x.png',
+    ];
+    const input = {
+      baseName: 'scene', source: '{}', svgBase64: 'PHN2Zy8+',
+      png1xBase64: 'MQ==', png2xBase64: 'Mg==', png3xBase64: 'Mw==',
+    };
+    invokeMock.mockResolvedValueOnce(paths);
+    await expect(saveExcalidrawBundle(input)).resolves.toEqual(paths);
+    expect(invokeMock).toHaveBeenCalledWith('save_excalidraw_bundle_dialog', { input });
+
+    invokeMock.mockResolvedValueOnce(paths.slice(0, 4));
+    await expect(saveExcalidrawBundle(input)).rejects.toThrow('Invalid Excalidraw bundle response');
   });
 
 });

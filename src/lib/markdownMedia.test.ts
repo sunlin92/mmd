@@ -1,15 +1,28 @@
 import { describe, expect, it } from 'vitest';
 import {
+  createMarkdownImageReference,
+  createMarkdownExcalidrawAssetReference,
+  createMarkdownMediaDestination,
   createMarkdownMediaReference,
   decodeMarkdownMediaCursorInsertion,
   decodeMarkdownMediaInsertionHandshake,
   decodeMarkdownMediaInsertionReady,
   decodeMarkdownMediaInsertionReadyRequest,
+  resolveWorkspaceRelativeMediaPath,
 } from './markdownMedia';
 
 const markdownDocument = { relative_path: 'guide.md' };
 
 describe('Markdown media references', () => {
+  it('creates an image reference from a backend-authorized document-relative path', () => {
+    expect(createMarkdownImageReference(
+      'clipboard [final].png',
+      '../../shared assets/clipboard (final).png',
+    )).toBe('![clipboard \\[final\\].png](../../shared%20assets/clipboard%20%28final%29.png)');
+    expect(createMarkdownImageReference('private.png', '/tmp/private.png')).toBeNull();
+    expect(createMarkdownImageReference('private.png', 'file:///tmp/private.png')).toBeNull();
+  });
+
   it('creates an image reference from a workspace-relative asset path', () => {
     expect(createMarkdownMediaReference({
       kind: 'image',
@@ -70,6 +83,39 @@ describe('Markdown media references', () => {
     }, {
       relative_path: 'docs/guide.md',
     })).toBe('[system diagram.excalidraw](../diagrams/system%20diagram.excalidraw "mmd:embed")');
+  });
+
+  it('creates a source-linked Excalidraw SVG reference with a PNG sidecar manifest', () => {
+    const reference = createMarkdownExcalidrawAssetReference({
+      document: { relative_path: 'docs/guide.md' },
+      name: 'system diagram',
+      pngMarkdownPath: '../assets/excalidraw-assets/system.png',
+      scale: 2,
+      sourceRelativePath: 'diagrams/system.excalidraw',
+      sourceSha256: 'a'.repeat(64),
+      svgMarkdownPath: '../assets/excalidraw-assets/system.svg',
+    });
+
+    expect(reference).toContain('<!-- mmd:excalidraw ');
+    expect(reference).toContain('../assets/excalidraw-assets/system.svg?mmdSource=' + 'a'.repeat(64));
+    expect(reference).toContain('](../diagrams/system.excalidraw "mmd:source")');
+    expect(reference).toContain('%22sourceRelativePath%22%3A%22diagrams%2Fsystem.excalidraw%22');
+    expect(reference).not.toContain('%2D%2D');
+  });
+
+  it('exposes the encoded source destination for sidecar synchronization', () => {
+    expect(createMarkdownMediaDestination({
+      kind: 'excalidraw',
+      name: 'system.excalidraw',
+      relative_path: 'diagrams/system.excalidraw',
+    }, { relative_path: 'docs/guide.md' })).toBe('../diagrams/system.excalidraw');
+  });
+
+  it('resolves a generated source link back to a workspace-relative path', () => {
+    expect(resolveWorkspaceRelativeMediaPath('docs/guide.md', '../diagrams/system%20diagram.excalidraw'))
+      .toBe('diagrams/system diagram.excalidraw');
+    expect(resolveWorkspaceRelativeMediaPath('guide.md', '../../outside.excalidraw')).toBeNull();
+    expect(resolveWorkspaceRelativeMediaPath('guide.md', 'file:///tmp/diagram.excalidraw')).toBeNull();
   });
 
   it('rejects unsupported assets and unsafe workspace paths', () => {

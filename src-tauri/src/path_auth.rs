@@ -1143,6 +1143,10 @@ impl AuthorizedWorkspace {
         &self.root
     }
 
+    pub(crate) fn clone_root_handle(&self) -> std::io::Result<fs::File> {
+        self.root_binding.handle.try_clone()
+    }
+
     pub(crate) fn open_regular_file(&self, path: &Path) -> std::io::Result<fs::File> {
         let relative = path.strip_prefix(&self.root).map_err(|_| {
             std::io::Error::new(
@@ -1176,6 +1180,18 @@ impl AuthorizedReadFile {
 impl WorkspaceReadAuthorization {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn wire_token(&self) -> String {
+        self.token.to_wire()
+    }
+
+    pub(crate) fn retained_file_binding(&self) -> Arc<fs::File> {
+        self.file_binding.clone()
     }
 }
 
@@ -2289,6 +2305,15 @@ impl FileAuthorizationSession {
         Ok((workspace, snapshot))
     }
 
+    pub(crate) fn open_resource_directory(
+        &self,
+        root: impl AsRef<Path>,
+        transport: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<AuthorizedWorkspace, String> {
+        self.open_workspace(root, |_| Ok(()), transport)
+            .map(|(authorization, ())| authorization)
+    }
+
     pub(crate) fn open_workspace_at_canonical_root<S>(
         &self,
         root: impl AsRef<Path>,
@@ -2881,6 +2906,103 @@ impl FileAuthorizationSession {
 
     fn open_file_for_read(&self, path: impl AsRef<Path>) -> Result<AuthorizedReadFile, String> {
         self.open_file_for_read_with_before_open(path, || {})
+    }
+
+    fn open_exact_workspace_file_for_read(
+        &self,
+        workspace_token: &str,
+        workspace_root: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+    ) -> Result<AuthorizedReadFile, String> {
+        let token = WorkspaceToken::from_wire(workspace_token)?;
+        let canonical_root = normalize_existing_path(workspace_root)?;
+        if !canonical_root.is_dir() {
+            return Err("Path is not a directory".into());
+        }
+        let canonical = normalize_existing_path(path)?;
+        if !canonical.is_file() {
+            return Err("Path is not a file".into());
+        }
+        enum ExactAuthority {
+            Path,
+            Identity(String),
+        }
+        let (workspace, exact) = {
+            let state = self.lock()?;
+            let workspace = Self::workspace_for_token(&state, &token)
+                .ok_or_else(|| "Workspace authorization is no longer active".to_string())?;
+            if workspace.root != canonical_root {
+                return Err("Directory does not match the selected workspace".into());
+            }
+            if !path_is_under(&canonical, &workspace.root) {
+                return Err("Document path is outside the authorized workspace".to_string());
+            }
+            let exact = state
+                .grants
+                .iter()
+                .find_map(|(key, ledger)| {
+                    let GrantKey::ExactReadWrite(file) = key else {
+                        return None;
+                    };
+                    (file == &canonical)
+                        .then(|| exact_read_authority(&state, file, ledger))
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    "Document has not been explicitly opened or saved in this session".to_string()
+                })?;
+            let exact = match exact {
+                ExactReadAuthority::Path => ExactAuthority::Path,
+                ExactReadAuthority::Identity(identity) => ExactAuthority::Identity(identity),
+            };
+            (workspace, exact)
+        };
+        if !workspace.root_binding.is_current(&workspace.root) {
+            return Err("Workspace root changed after authorization".into());
+        }
+        let relative = canonical
+            .strip_prefix(&workspace.root)
+            .map_err(|_| "Document path is outside the authorized workspace".to_string())?
+            .to_path_buf();
+        let file = workspace
+            .root_binding
+            .open_regular_file(&relative)
+            .map_err(|error| {
+                format!(
+                    "Failed to securely open file {}: {error}",
+                    canonical.display()
+                )
+            })?;
+        let file_identity = opened_file_platform_identity(&file).map_err(|error| {
+            format!(
+                "Failed to identify securely opened file {}: {error}",
+                canonical.display()
+            )
+        })?;
+        if let ExactAuthority::Identity(expected) = exact {
+            if file_identity != expected {
+                return Err("Securely opened file identity changed after authorization".to_string());
+            }
+        }
+        let file_binding = Arc::new(file.try_clone().map_err(|error| {
+            format!(
+                "Failed to retain securely opened file {}: {error}",
+                canonical.display()
+            )
+        })?);
+        Ok(AuthorizedReadFile {
+            path: canonical.clone(),
+            file,
+            workspace_authorization: Some(WorkspaceReadAuthorization {
+                path: canonical,
+                root: workspace.root,
+                relative,
+                token,
+                root_binding: workspace.root_binding,
+                file_binding,
+                file_identity,
+            }),
+        })
     }
 
     fn file_for_watch(&self, path: impl AsRef<Path>) -> Result<PathBuf, String> {
@@ -4290,6 +4412,17 @@ pub(crate) fn open_authorized_existing_file_inner(
     state.file_authorization().open_file_for_read(path)
 }
 
+pub(crate) fn open_exact_workspace_file_for_read_inner(
+    state: &AppState,
+    workspace_token: &str,
+    workspace_root: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+) -> Result<AuthorizedReadFile, String> {
+    state
+        .file_authorization()
+        .open_exact_workspace_file_for_read(workspace_token, workspace_root, path)
+}
+
 pub(crate) fn open_authorized_existing_file_with_before_open_inner(
     state: &AppState,
     path: impl AsRef<Path>,
@@ -4340,6 +4473,16 @@ pub(crate) fn resolve_authorized_workspace_root_for_token_inner(
     state
         .file_authorization()
         .authorized_workspace_root_for_token(workspace_token, root)
+}
+
+pub(crate) fn authorize_resource_directory_inner(
+    state: &AppState,
+    root: impl AsRef<Path>,
+    transport: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<AuthorizedWorkspace, String> {
+    state
+        .file_authorization()
+        .open_resource_directory(root, transport)
 }
 
 /// Resolves an index result relative to one exact authorized workspace. Cached

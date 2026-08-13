@@ -7,6 +7,7 @@ mod document_save;
 mod docx_preflight;
 mod durable_write;
 mod excalidraw_scene;
+mod export_store;
 mod html_preview_server;
 mod image_resolver;
 mod markdown_files;
@@ -20,6 +21,7 @@ mod packaged_lifecycle_e2e;
 mod packaged_open_e2e;
 mod path_auth;
 mod recent_files;
+mod resource_store;
 mod settings;
 mod state;
 mod workspace_file_kind;
@@ -53,6 +55,7 @@ use crash_draft_commands::{
     discard_crash_draft, list_crash_drafts, recover_crash_draft, reset_crash_draft_overflow_batch,
     reset_crash_drafts, write_crash_draft,
 };
+use export_store::{save_excalidraw_bundle_dialog, save_export_dialog};
 use html_preview_server::{
     prepare_html_preview, prepare_markdown_html_embed, release_markdown_html_embed,
     release_markdown_html_embed_window_inner,
@@ -70,6 +73,9 @@ use open_intent_commands::{
 use packaged_lifecycle_e2e::setup_packaged_lifecycle_e2e;
 #[cfg(feature = "packaged-lifecycle-e2e")]
 use packaged_open_e2e::{get_packaged_open_e2e_config, record_packaged_open_app_event};
+use resource_store::{
+    authorize_resource_directory_dialog, write_excalidraw_asset_pair, write_workspace_resource,
+};
 use state::AppState;
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use workspace_index_commands::{
@@ -136,7 +142,12 @@ macro_rules! app_invoke_handler {
             query_workspace_index,
             discard_workspace_index,
             cancel_workspace_index_operation,
-            open_workspace_index_result
+            open_workspace_index_result,
+            authorize_resource_directory_dialog,
+            write_excalidraw_asset_pair,
+            write_workspace_resource
+            ,save_export_dialog
+            ,save_excalidraw_bundle_dialog
             $(, $extra)*
         ]
     };
@@ -278,6 +289,8 @@ pub fn run() {
             );
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             let state = AppState::default();
             let app_data_dir = app
@@ -296,6 +309,15 @@ pub fn run() {
             state
                 .initialize_crash_drafts(app_data_dir)
                 .map_err(|error| format!("Cannot initialize crash recovery: {error}"))?;
+            let settings_store = state.settings().map_err(|error| {
+                format!(
+                    "Cannot access settings for native shortcuts: {}",
+                    error.message
+                )
+            })?;
+            if let Ok(settings) = settings_store.load_or_create() {
+                state.set_native_shortcuts(settings.settings.shortcuts);
+            }
             app.manage(state);
             if let Some(result) = startup_open_intent {
                 deliver_open_intent_result(app.handle(), result);

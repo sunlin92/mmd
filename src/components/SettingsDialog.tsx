@@ -1,8 +1,15 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { RotateCcw, Settings2, X } from 'lucide-react';
+import { FolderOpen, RotateCcw, Settings2, X } from 'lucide-react';
 import type { AppSettings } from '../types';
 import type { EffectiveLocale } from '../lib/locale';
 import type { SettingsRecovery } from '../hooks/useSettings';
+import {
+  DEFAULT_SHORTCUTS,
+  findShortcutConflicts,
+  resolveShortcutProfile,
+  SHORTCUT_ACTIONS,
+  type ShortcutAction,
+} from '../lib/shortcutProfiles';
 
 interface SettingsDialogProps {
   busy: boolean;
@@ -13,6 +20,7 @@ interface SettingsDialogProps {
   onReset: () => Promise<void>;
   onRetry?: () => Promise<void>;
   onSave?: (settings: AppSettings) => Promise<void>;
+  onAuthorizeResourceDirectory?: () => Promise<string | null>;
   workspaceAvailable?: boolean;
   onDiscardWorkspaceIndex?: () => Promise<void>;
   onRebuildWorkspaceIndex?: () => Promise<void>;
@@ -36,6 +44,10 @@ const copy = {
     workspaceIndexUnavailable: 'Open a workspace to manage its index.',
     discardIndex: 'Discard index',
     rebuildIndex: 'Rebuild index',
+    chooseResources: 'Choose resource folder',
+    shortcuts: 'Keyboard Shortcuts', resetShortcuts: 'Restore shortcut defaults',
+    shortcutConflict: 'Shortcut conflict', shortcutInvalid: 'Enter a supported shortcut.',
+    shortcutLabels: { save: 'Save', saveAs: 'Save as', quickOpen: 'Quick open', workspaceSearch: 'Workspace search', export: 'Export', settings: 'Settings' },
   },
   'zh-CN': {
     title: '设置', autosave: '自动保存', autosaveDelay: '保存延迟', milliseconds: '毫秒',
@@ -54,6 +66,10 @@ const copy = {
     workspaceIndexUnavailable: '请先打开工作区，再管理其索引。',
     discardIndex: '丢弃索引',
     rebuildIndex: '重建索引',
+    chooseResources: '选择资源文件夹',
+    shortcuts: '键盘快捷键', resetShortcuts: '恢复默认快捷键',
+    shortcutConflict: '快捷键冲突', shortcutInvalid: '请输入受支持的快捷键。',
+    shortcutLabels: { save: '保存', saveAs: '另存为', quickOpen: '快速打开', workspaceSearch: '工作区搜索', export: '导出', settings: '设置' },
   },
 };
 
@@ -66,13 +82,17 @@ export function SettingsDialog({
   onReset,
   onRetry,
   onSave,
+  onAuthorizeResourceDirectory,
   workspaceAvailable = false,
   onDiscardWorkspaceIndex,
   onRebuildWorkspaceIndex,
 }: SettingsDialogProps) {
   const text = copy[locale];
-  const [draft, setDraft] = useState<AppSettings | null>(settings ?? null);
-  useEffect(() => setDraft(settings ?? null), [settings]);
+  const withResolvedShortcuts = (value: AppSettings | null | undefined) => value
+    ? { ...value, shortcuts: resolveShortcutProfile(value.shortcuts) }
+    : null;
+  const [draft, setDraft] = useState<AppSettings | null>(() => withResolvedShortcuts(settings));
+  useEffect(() => setDraft(withResolvedShortcuts(settings)), [settings]);
 
   if (recovery) {
     const isFuture = recovery.kind === 'future';
@@ -98,9 +118,22 @@ export function SettingsDialog({
 
   if (!draft || !onSave || !onClose) return null;
 
+  let shortcutConflicts = [] as ReturnType<typeof findShortcutConflicts>;
+  let shortcutsValid = true;
+  try {
+    shortcutConflicts = findShortcutConflicts(draft.shortcuts);
+  } catch {
+    shortcutsValid = false;
+  }
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    void onSave(draft);
+    void onSave({ ...draft, shortcuts: resolveShortcutProfile(draft.shortcuts) });
+  };
+
+  const authorizeResourceDirectory = async () => {
+    const path = await onAuthorizeResourceDirectory?.();
+    if (path) setDraft((current) => current ? { ...current, resourceDirectory: path } : current);
   };
 
   return (
@@ -119,8 +152,39 @@ export function SettingsDialog({
             <label className="settings-toggle"><span>{text.wikilinks}</span><input name="wikilinksEnabled" type="checkbox" checked={draft.wikilinksEnabled} onChange={(event) => setDraft({ ...draft, wikilinksEnabled: event.target.checked })} /></label>
           </section>
 
+          <section className="settings-section" aria-labelledby="settings-shortcuts-heading">
+            <div className="settings-section-heading">
+              <h3 id="settings-shortcuts-heading">{text.shortcuts}</h3>
+              <button type="button" name="resetShortcuts" className="settings-icon-button" title={text.resetShortcuts} aria-label={text.resetShortcuts} onClick={() => setDraft({ ...draft, shortcuts: { ...DEFAULT_SHORTCUTS } })}><RotateCcw size={15} aria-hidden="true" /></button>
+            </div>
+            {SHORTCUT_ACTIONS.map((action) => (
+              <label className="settings-field" key={action}>
+                <span>{text.shortcutLabels[action as ShortcutAction]}</span>
+                <input name={`shortcut-${action}`} type="text" value={draft.shortcuts[action] ?? ''} onChange={(event) => setDraft({ ...draft, shortcuts: { ...draft.shortcuts, [action]: event.target.value } })} />
+              </label>
+            ))}
+            {!shortcutsValid && <p className="settings-validation" role="alert">{text.shortcutInvalid}</p>}
+            {shortcutConflicts.map((conflict) => <p className="settings-validation" role="alert" key={conflict.shortcut}>{text.shortcutConflict}: {conflict.shortcut}</p>)}
+          </section>
+
           <section className="settings-section">
-            <label className="settings-field"><span>{text.resources}</span><input name="resourceDirectory" type="text" value={draft.resourceDirectory} onChange={(event) => setDraft({ ...draft, resourceDirectory: event.target.value })} /></label>
+            <label className="settings-field">
+              <span>{text.resources}</span>
+              <span className="settings-path-control">
+                <input name="resourceDirectory" type="text" value={draft.resourceDirectory} onChange={(event) => setDraft({ ...draft, resourceDirectory: event.target.value })} />
+                <button
+                  type="button"
+                  name="authorizeResourceDirectory"
+                  className="settings-icon-button"
+                  disabled={busy || !onAuthorizeResourceDirectory}
+                  aria-label={text.chooseResources}
+                  title={text.chooseResources}
+                  onClick={() => void authorizeResourceDirectory()}
+                >
+                  <FolderOpen size={16} aria-hidden="true" />
+                </button>
+              </span>
+            </label>
             <label className="settings-field"><span>{text.layout}</span><input name="editorPaneRatio" type="range" min="0.25" max="0.75" step="0.01" value={draft.editorPaneRatio} onChange={(event) => setDraft({ ...draft, editorPaneRatio: Number(event.target.value) })} /></label>
           </section>
 
@@ -143,7 +207,7 @@ export function SettingsDialog({
           <div className="settings-dialog-actions">
             <button type="button" className="dialog-button ghost" disabled={busy} onClick={() => void onReset()}><RotateCcw size={14} aria-hidden="true" />{text.reset}</button>
             <button type="button" className="dialog-button ghost" disabled={busy} onClick={onClose}>{text.cancel}</button>
-            <button type="submit" className="dialog-button secondary" disabled={busy}>{text.save}</button>
+            <button type="submit" className="dialog-button secondary" disabled={busy || !shortcutsValid || shortcutConflicts.length > 0}>{text.save}</button>
           </div>
         </form>
       </dialog>

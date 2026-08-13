@@ -2,13 +2,17 @@ import { useEffect, useRef, useState } from 'react';
 import { emitAppFeedbackError } from '../lib/appFeedback';
 import { useI18n } from '../lib/i18n';
 import { loadLazyModuleWithRetry } from '../lib/lazyModule';
+import type { ExcalidrawAssetSyncOptions } from '../lib/excalidrawAssetSync';
 import { readMarkdownExcalidraw } from '../lib/tauriCommands';
+import { resolveWorkspaceRelativeMediaPath } from '../lib/markdownMedia';
 import { useObservedEffectiveTheme } from '../lib/themeObservation';
 
 interface MarkdownExcalidrawPreviewProps {
   currentFilePath: string | null;
+  documentRelativePath?: string | null;
   enabled: boolean;
   excalidrawSrc: string;
+  sync?: ExcalidrawAssetSyncOptions | null;
   title?: string;
   workspaceRoot?: string | null;
 }
@@ -20,8 +24,10 @@ type ExcalidrawPreviewState =
 
 export function MarkdownExcalidrawPreview({
   currentFilePath,
+  documentRelativePath = null,
   enabled,
   excalidrawSrc,
+  sync = null,
   title,
   workspaceRoot = null,
 }: MarkdownExcalidrawPreviewProps) {
@@ -52,6 +58,32 @@ export function MarkdownExcalidrawPreview({
         }
         if (!active) return null;
         try {
+          if (sync && documentRelativePath && workspaceRoot) {
+            const sourceRelativePath = resolveWorkspaceRelativeMediaPath(documentRelativePath, excalidrawSrc);
+            if (!sourceRelativePath) throw new Error('Excalidraw source path is outside the authorized workspace.');
+            try {
+              const syncRuntime = await loadLazyModuleWithRetry(
+                () => import('../lib/excalidrawAssetSync'),
+              );
+              return (await syncRuntime.renderAndSyncExcalidrawAssetPair({
+                appearance,
+                document: { relative_path: documentRelativePath },
+                documentPath: currentFilePath,
+                name: title || 'Excalidraw diagram',
+                resourceDirectory: sync.resourceDirectory,
+                ...(sync.resourceDirectoryToken
+                  ? { resourceDirectoryToken: sync.resourceDirectoryToken }
+                  : {}),
+                sourceRelativePath,
+                sourceContent: content,
+                workspaceRoot,
+                workspaceToken: sync.workspaceToken,
+              })).assets.svg;
+            } catch (syncCause) {
+              emitAppFeedbackError(syncCause);
+              throw syncCause;
+            }
+          }
           return await runtime.exportExcalidrawSceneSvg(content, appearance);
         } catch (cause) {
           if (cause instanceof Error && cause.message.toLowerCase().includes('excalidraw scene')) {
@@ -77,7 +109,7 @@ export function MarkdownExcalidrawPreview({
     return () => {
       active = false;
     };
-  }, [appearance, currentFilePath, excalidrawSrc, requestKey, workspaceRoot]);
+  }, [appearance, currentFilePath, documentRelativePath, excalidrawSrc, requestKey, sync, title, workspaceRoot]);
 
   const currentState = previewState?.key === requestKey ? previewState : null;
   const readySvg = currentState?.status === 'ready' ? currentState.svg : null;

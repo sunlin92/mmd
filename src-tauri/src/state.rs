@@ -94,6 +94,16 @@ impl AppState {
             .set_recent_files(recent_files);
     }
 
+    pub(crate) fn set_native_shortcuts(
+        &self,
+        shortcuts: std::collections::BTreeMap<String, String>,
+    ) {
+        self.native_menu
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_shortcuts(shortcuts);
+    }
+
     pub(crate) fn set_native_theme_preference(
         &self,
         selected_skin: &str,

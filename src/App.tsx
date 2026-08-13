@@ -12,12 +12,13 @@ import { Settings } from 'lucide-react';
 import { emit, emitTo, listen } from '@tauri-apps/api/event';
 import { AppToolbar } from './components/AppToolbar';
 import type { DocxPreviewFeedback } from './components/DocxPreview';
-import { EditorPane } from './components/EditorPane';
+import { EditorPane, type ClipboardImagePasteRequest } from './components/EditorPane';
 import { ExternalFileChangeDialog } from './components/ExternalFileChangeDialog';
 import { DocumentSaveConflictDialog } from './components/DocumentSaveConflictDialog';
 import { CrashDraftRecoveryDialog } from './components/CrashDraftRecoveryDialog';
 import { CrashDraftStoreRepairDialog } from './components/CrashDraftStoreRepairDialog';
 import { FeedbackDialog } from './components/FeedbackDialog';
+import { ExportDialog, type ExportDialogValue } from './components/ExportDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { QuickOpenDialog } from './components/QuickOpenDialog';
 import {
@@ -33,6 +34,7 @@ import type { PdfPreviewFeedback } from './components/PdfPreview';
 import { PopoutPaneShell } from './components/PopoutPaneShell';
 import { PreviewPane } from './components/PreviewPane';
 import { UnsavedExitDialog } from './components/UnsavedExitDialog';
+import { UpdateAvailableDialog } from './components/UpdateAvailableDialog';
 import { WorkspaceEntryDialog, type WorkspaceEntryOperation } from './components/WorkspaceEntryDialog';
 import { WorkspaceImagePreview } from './components/WorkspaceImagePreview';
 import { WorkspaceHtmlPreview } from './components/WorkspaceHtmlPreview';
@@ -45,6 +47,7 @@ import { usePanePopouts } from './hooks/usePanePopouts';
 import { usePaneResize } from './hooks/usePaneResize';
 import { useProgramCloseGuard } from './hooks/useProgramCloseGuard';
 import { useSettings } from './hooks/useSettings';
+import { useAppUpdater } from './hooks/useAppUpdater';
 import { useI18n } from './lib/i18n';
 import { isTauriRuntime } from './lib/activeDocumentWatch';
 import type { EffectiveLocale } from './lib/locale';
@@ -63,6 +66,8 @@ import {
   parsePopoutPane,
 } from './lib/paneLayout';
 import { loadLazyModuleWithRetry } from './lib/lazyModule';
+import { resolveShortcutProfile, shortcutMatchesEvent, type ShortcutAction } from './lib/shortcutProfiles';
+import { useObservedEffectiveTheme } from './lib/themeObservation';
 import {
   decodeMarkdownOutlineJump,
   extractMarkdownOutline,
@@ -71,6 +76,7 @@ import {
   type MarkdownOutlineJump,
 } from './lib/markdownOutline';
 import {
+  createMarkdownImageReference,
   createMarkdownMediaReference,
   decodeMarkdownMediaCursorInsertion,
   decodeMarkdownMediaInsertionHandshake,
@@ -94,6 +100,7 @@ import {
   getWorkspaceSidebarLayoutStyle,
 } from './lib/sidebarLayout';
 import {
+  authorizeResourceDirectory,
   discardWorkspaceIndex,
   discardOpenIntent,
   focusMainWindow,
@@ -102,10 +109,15 @@ import {
   recordPackagedOpenAppEvent,
   rebuildWorkspaceIndex,
   requestSessionRestore,
+  saveExcalidrawBundle,
+  saveExport,
   setNativeSaveMenuEnabled,
+  writeWorkspaceResource,
+  type ResourceDirectoryAuthorization,
   type PackagedOpenAppEventType,
   type PackagedOpenE2eConfig,
 } from './lib/tauriCommands';
+import { collectExportPreflightIssues, type ExportPreflightIssue } from './lib/exportPreflight';
 import {
   adaptBackendOpenIntent,
   createLocalOpenIntent,
@@ -158,6 +170,16 @@ interface MarkdownMediaRetryController {
 const MEDIA_EVENT_RETRY_DELAYS_MS = [0, 100, 250] as const;
 const MEDIA_INSERTION_HANDSHAKE_ATTEMPTS = 3;
 const MEDIA_INSERTION_HANDSHAKE_ACK_TIMEOUT_MS = 250;
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = '';
+  const chunkSize = 32_768;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
 
 function createMarkdownMediaRetryController(): MarkdownMediaRetryController {
   return { cancelled: false, pendingTimers: new Map() };
@@ -302,6 +324,12 @@ const PACKAGED_UNICODE_READY_POLL_INTERVAL_MS = 50;
 const PACKAGED_UNICODE_READY_MAX_ATTEMPTS = 200;
 const PACKAGED_DIRTY_SEED = '<!-- mmd-packaged-open-dirty -->';
 
+function isAbsoluteResourceDirectory(value: string): boolean {
+  return value.startsWith('/')
+    || value.startsWith('\\\\')
+    || /^[A-Za-z]:[\\/]/u.test(value);
+}
+
 interface MutableBooleanRef {
   current: boolean;
 }
@@ -325,9 +353,11 @@ export function syncOpenIntentCoordinatorModalState(
 
 export default function App() {
   const { locale, t } = useI18n();
+  const { appearance, skin } = useObservedEffectiveTheme();
   const packagedOpenEvidenceEnabled = import.meta.env.VITE_MMD_PACKAGED_OPEN_E2E === '1';
   const popoutPane = useMemo(() => currentPopoutPane(), []);
   const isPopout = popoutPane !== 'main';
+  const appUpdater = useAppUpdater(isTauriRuntime() && !isPopout);
   const [editorPopoutInstanceId] = useState(() => (
     popoutPane === 'editor'
       ? currentEditorPopoutInstanceId() ?? createPaneProtocolId('markdown-media-popout')
@@ -425,6 +455,9 @@ export default function App() {
   }, [openIntentCoordinator]);
   const paneLayoutStyle = useMemo(() => getPaneLayoutStyle(editorPaneRatio), [editorPaneRatio]);
   const settingsState = useSettings();
+  const [resourceDirectoryAuthorization, setResourceDirectoryAuthorization] = useState<
+    ResourceDirectoryAuthorization | null
+  >(null);
   const afterConfirmedCrashDraftSaveRef = useRef<((documentId: string) => Promise<boolean>) | null>(null);
   const afterConfirmedCrashDraftSave = useCallback((documentId: string) => (
     afterConfirmedCrashDraftSaveRef.current?.(documentId) ?? Promise.resolve(true)
@@ -497,6 +530,10 @@ export default function App() {
   });
   const currentContentRef = useRef(content);
   currentContentRef.current = content;
+  const [showExport, setShowExport] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportValue, setExportValue] = useState<ExportDialogValue>({ format: 'html', scale: 2, theme: 'current' });
+  const [exportIssues, setExportIssues] = useState<ExportPreflightIssue[]>([]);
 
   const requestCrashDraftRecovery = useCallback((draft: Parameters<typeof recoverCrashDraft>[0]) => {
     enqueueLocalOpenIntent(
@@ -546,6 +583,118 @@ export default function App() {
       ? files.find((file) => file.path === activePath && file.kind === 'markdown') ?? null
       : null
   ), [activeFileKind, activePath, files]);
+  const excalidrawAssetSync = useMemo(() => {
+    const resourceDirectory = settingsState.settings?.resourceDirectory;
+    if (!workspaceRoot || !workspaceToken || !resourceDirectory) return null;
+    const absolute = isAbsoluteResourceDirectory(resourceDirectory);
+    if (absolute && resourceDirectoryAuthorization?.path !== resourceDirectory) return null;
+    return {
+      resourceDirectory,
+      ...(resourceDirectoryAuthorization?.path === resourceDirectory
+        ? { resourceDirectoryToken: resourceDirectoryAuthorization.token }
+        : {}),
+      workspaceRoot,
+      workspaceToken,
+    };
+  }, [
+    resourceDirectoryAuthorization,
+    settingsState.settings?.resourceDirectory,
+    workspaceRoot,
+    workspaceToken,
+  ]);
+  const editorPasteContextRef = useRef({
+    activeFileKind,
+    activePath,
+    activeWorkspaceMarkdownFile,
+    authorityStatus,
+    documentEpoch,
+    documentId,
+    resourceDirectory: settingsState.settings?.resourceDirectory ?? null,
+    resourceDirectoryAuthorization,
+    workspaceRoot,
+    workspaceToken,
+  });
+  editorPasteContextRef.current = {
+    activeFileKind,
+    activePath,
+    activeWorkspaceMarkdownFile,
+    authorityStatus,
+    documentEpoch,
+    documentId,
+    resourceDirectory: settingsState.settings?.resourceDirectory ?? null,
+    resourceDirectoryAuthorization,
+    workspaceRoot,
+    workspaceToken,
+  };
+  const handleEditorPasteError = useCallback((pasteError: unknown) => {
+    setError(normalizeAppError(pasteError, locale));
+    setNotice(null);
+  }, [locale, setError, setNotice]);
+  const handleClipboardImagePaste = useCallback(async (
+    request: ClipboardImagePasteRequest,
+  ): Promise<string | null> => {
+    const context = editorPasteContextRef.current;
+    const isCurrentContext = () => {
+      const current = editorPasteContextRef.current;
+      return current.documentId === request.documentId
+        && current.documentEpoch === request.documentEpoch
+        && current.activeFileKind === 'markdown'
+        && current.authorityStatus === 'committed'
+        && current.activePath === context.activePath
+        && current.workspaceRoot === context.workspaceRoot
+        && current.workspaceToken === context.workspaceToken
+        && current.resourceDirectoryAuthorization?.path
+          === context.resourceDirectoryAuthorization?.path
+        && current.resourceDirectoryAuthorization?.token
+          === context.resourceDirectoryAuthorization?.token;
+    };
+    try {
+      if (
+        !isCurrentContext()
+        || !context.activePath
+        || !context.activeWorkspaceMarkdownFile
+        || !context.resourceDirectory
+        || !context.workspaceRoot
+        || !context.workspaceToken
+      ) throw new Error('Clipboard image paste is not authorized for the active workspace document.');
+      const bytesBase64 = await blobToBase64(request.blob);
+      if (!isCurrentContext()) return null;
+      const resource = await writeWorkspaceResource({
+        workspaceToken: context.workspaceToken,
+        workspaceRoot: context.workspaceRoot,
+        documentPath: context.activePath,
+        resourceDirectory: context.resourceDirectory,
+        bytesBase64,
+        mimeType: request.mimeType,
+        suggestedName: request.suggestedName,
+        ...(context.resourceDirectoryAuthorization?.path === context.resourceDirectory
+          ? { resourceDirectoryToken: context.resourceDirectoryAuthorization.token }
+          : {}),
+      });
+      if (!isCurrentContext()) return null;
+      const resourceName = request.suggestedName
+        || resource.fileName
+        || 'image';
+      const markdown = createMarkdownImageReference(resourceName, resource.markdownPath);
+      if (!markdown) throw new Error('Clipboard image resource path could not be inserted.');
+      return markdown;
+    } catch (pasteError) {
+      if (mountedRef.current) handleEditorPasteError(pasteError);
+      return null;
+    }
+  }, [handleEditorPasteError]);
+  const handleAuthorizeResourceDirectory = useCallback(async (): Promise<string | null> => {
+    try {
+      const authorization = await authorizeResourceDirectory();
+      if (!authorization) return null;
+      setResourceDirectoryAuthorization(authorization);
+      return authorization.path;
+    } catch (authorizationError) {
+      setError(normalizeAppError(authorizationError, locale));
+      setNotice(null);
+      return null;
+    }
+  }, [locale, setError, setNotice]);
   const editorFileKind = 'editor' in activePresentation ? activePresentation.editor : 'markdown';
   const isImageFile = activePresentation.preview === 'image';
   const isMediaFile = activePresentation.preview === 'media';
@@ -586,9 +735,11 @@ export default function App() {
       || workspaceSearchMode
       || workspaceEntryOperation
       || workspaceMoveOperation
+      || showExport
       || showSettings
       || workspaceIndexActionBusy
       || packagedSettlementBarrierActive
+      || appUpdater.update
       || feedbackDialog,
   );
 
@@ -1735,6 +1886,121 @@ export default function App() {
     setNotice(null);
   }, [setError, setNotice]);
 
+  const openExportDialog = useCallback(() => {
+    if (activeFileKind !== 'markdown' && activeFileKind !== 'excalidraw') return;
+    const preview = previewPaneRef.current?.querySelector<HTMLElement>('.mmd-preview-content');
+    const diagramErrors = preview
+      ? Array.from(preview.querySelectorAll<HTMLElement>('.image-error, .mmd-excalidraw-embed-status:not([aria-busy="true"])')).map((node) => node.textContent?.trim() || 'diagram error')
+      : [];
+    const imageSources = preview ? Array.from(preview.querySelectorAll<HTMLImageElement>('img')).map((image) => ({
+      src: image.currentSrc || image.src,
+      available: image.complete && image.naturalWidth > 0,
+    })) : [];
+    setExportIssues(collectExportPreflightIssues({ document: content, diagramErrors, imageSources }));
+    setExportValue((current) => ({ ...current, format: activeFileKind === 'excalidraw' ? 'excalidraw' : current.format === 'excalidraw' ? 'html' : current.format }));
+    setShowExport(true);
+  }, [activeFileKind, content, previewPaneRef]);
+
+  useEffect(() => {
+    if (isPopout) return;
+    const shortcuts = resolveShortcutProfile(settingsState.settings?.shortcuts ?? {});
+    const actions: Record<ShortcutAction, () => void> = {
+      save: () => void handleSave(),
+      saveAs: () => void handleSaveAs(),
+      quickOpen: () => showWorkspaceSearchDialog('quick-open'),
+      workspaceSearch: () => showWorkspaceSearchDialog('workspace-search'),
+      export: openExportDialog,
+      settings: () => setShowSettings(true),
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (openIntentModalActive) return;
+      const target = event.target as HTMLElement | null;
+      const typing = target?.matches('input, textarea, select, [contenteditable="true"]') ?? false;
+      for (const action of Object.keys(shortcuts) as ShortcutAction[]) {
+        if (typing && action !== 'save' && action !== 'saveAs') continue;
+        if (!shortcutMatchesEvent(shortcuts[action], event)) continue;
+        event.preventDefault();
+        actions[action]();
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleSave, handleSaveAs, isPopout, openExportDialog, openIntentModalActive, settingsState.settings?.shortcuts, showWorkspaceSearchDialog]);
+
+  const runExport = useCallback(async () => {
+    setExportBusy(true);
+    try {
+      const baseName = (activePath?.split(/[\\/]/u).pop() ?? 'document').replace(/\.(?:md|markdown|mdx|excalidraw)$/iu, '') || 'document';
+      const appearanceForExport = exportValue.theme === 'current' ? appearance : exportValue.theme;
+      const skinForExport = exportValue.theme === 'current'
+        ? skin
+        : exportValue.theme === 'dark' ? 'shanshui-yemo' : skin === 'shanshui-yemo' ? 'jinxiu-zhusha' : skin;
+      if (exportValue.format === 'excalidraw') {
+        if (activeFileKind !== 'excalidraw') throw new Error('Excalidraw bundle export requires an Excalidraw document');
+        const runtime = await loadLazyModuleWithRetry(() => import('./lib/excalidrawRuntime'));
+        const [one, two, three] = await Promise.all([
+          runtime.exportExcalidrawSceneAssets(content, appearanceForExport, 1),
+          runtime.exportExcalidrawSceneAssets(content, appearanceForExport, 2),
+          runtime.exportExcalidrawSceneAssets(content, appearanceForExport, 3),
+        ]);
+        const toBase64 = async (blob: Blob) => {
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          let binary = '';
+          for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+          return btoa(binary);
+        };
+        const saved = await saveExcalidrawBundle({
+          baseName,
+          source: content,
+          svgBase64: await toBase64(new Blob([two.svgText], { type: 'image/svg+xml' })),
+          png1xBase64: await toBase64(one.pngBlob),
+          png2xBase64: await toBase64(two.pngBlob),
+          png3xBase64: await toBase64(three.pngBlob),
+        });
+        if (!saved) return;
+      } else {
+        const preview = previewPaneRef.current?.querySelector<HTMLElement>('.mmd-preview-content');
+        if (!preview) throw new Error('Export preview is unavailable');
+        let bytes: Uint8Array;
+        if (exportValue.format === 'html') {
+          const [module, assets] = await Promise.all([
+            import('./lib/offlineHtmlExport'),
+            import('./lib/exportAssetInlining').then((assetModule) => assetModule.collectOfflineExportAssets(preview)),
+          ]);
+          const html = module.buildOfflineHtml({ title: baseName, bodyHtml: preview.innerHTML, themeCss: assets.css, theme: appearanceForExport, skin: skinForExport, assetDataUrls: assets.assetDataUrls });
+          bytes = new TextEncoder().encode(html);
+        } else {
+          const [module, assets] = await Promise.all([
+            import('./lib/longPngExport'),
+            import('./lib/exportAssetInlining').then((assetModule) => assetModule.collectOfflineExportAssets(preview)),
+          ]);
+          const sourceRect = preview.getBoundingClientRect();
+          const clone = preview.cloneNode(true) as HTMLElement;
+          for (const image of Array.from(clone.querySelectorAll<HTMLImageElement>('img'))) {
+            const source = image.getAttribute('src') ?? '';
+            if (assets.assetDataUrls[source]) image.setAttribute('src', assets.assetDataUrls[source]);
+          }
+          const blob = await module.renderElementToLongPng(clone, { scale: exportValue.scale, appearance: appearanceForExport, skin: skinForExport, background: appearanceForExport === 'dark' ? '#171717' : '#ffffff', cssText: assets.css, sourceWidth: sourceRect.width, sourceHeight: preview.scrollHeight || sourceRect.height });
+          bytes = new Uint8Array(await blob.arrayBuffer());
+        }
+        let binary = '';
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+        const saved = await saveExport({ kind: exportValue.format, defaultName: baseName, bytesBase64: btoa(binary) });
+        if (!saved) return;
+      }
+      setShowExport(false);
+      setError(null);
+      setNotice(locale === 'zh-CN' ? '导出已完成。' : 'Export completed.');
+    } catch (exportError) {
+      setShowExport(false);
+      setError(normalizeAppError(exportError, locale));
+      setNotice(null);
+    } finally {
+      setExportBusy(false);
+    }
+  }, [activeFileKind, activePath, appearance, content, exportValue, locale, previewPaneRef, setError, setNotice, skin]);
+
   const handleWorkspaceEntryConfirm = useCallback((name?: string) => {
     const operation = workspaceEntryOperation;
     if (!operation) return;
@@ -1849,64 +2115,129 @@ export default function App() {
   const handleWorkspaceAssetInsert = useCallback((
     asset: WorkspaceFileEntry,
     target: MarkdownMediaInsertionTarget,
-  ) => {
+  ): void => {
     if (
       activeFileKind !== 'markdown'
       || authorityStatus !== 'committed'
       || !activeWorkspaceMarkdownFile
+      || !activePath
+      || !workspaceRoot
+      || !workspaceToken
     ) return;
-    const markdown = createMarkdownMediaReference(asset, activeWorkspaceMarkdownFile);
-    if (!markdown) return;
-    mediaInsertionRequestIdRef.current += 1;
-    const insertion: MarkdownMediaInsertion = {
+    const insertionContext = {
+      activePath,
       documentEpoch,
       documentId,
-      markdown,
-      requestId: mediaInsertionRequestIdRef.current,
-      target,
+      workspaceRoot,
+      workspaceToken,
     };
-    if (target.kind === 'cursor' && editorPopoutOpenRef.current) {
-      const popoutInsertion: PendingMarkdownMediaCursorInsertion = {
-        asset: {
-          kind: asset.kind,
-          name: asset.name,
-          relative_path: asset.relative_path,
-        },
-        documentRelativePath: activeWorkspaceMarkdownFile.relative_path,
+    const isCurrentContext = () => {
+      const current = editorPasteContextRef.current;
+      return current.activeFileKind === 'markdown'
+        && current.authorityStatus === 'committed'
+        && current.activePath === insertionContext.activePath
+        && current.documentEpoch === insertionContext.documentEpoch
+        && current.documentId === insertionContext.documentId
+        && current.workspaceRoot === insertionContext.workspaceRoot
+        && current.workspaceToken === insertionContext.workspaceToken;
+    };
+    const commitMarkdown = (markdown: string | null) => {
+      if (!markdown) return;
+      mediaInsertionRequestIdRef.current += 1;
+      const insertion: MarkdownMediaInsertion = {
         documentEpoch,
         documentId,
-        requestId: insertion.requestId,
+        markdown,
+        requestId: mediaInsertionRequestIdRef.current,
+        target,
       };
-      const ready = editorPopoutReadyRef.current;
-      if (ready?.documentId === documentId && ready.documentEpoch === documentEpoch) {
-        sendCursorInsertionToEditorPopout({
-          ...popoutInsertion,
-          popoutInstanceId: ready.popoutInstanceId,
-        });
-      } else {
-        pendingPopoutMediaInsertionsRef.current.push(popoutInsertion);
-        const expectedInstanceId = expectedEditorPopoutInstanceIdRef.current;
-        if (expectedInstanceId) {
-          startEditorPopoutHandshakeRef.current?.({
-            documentEpoch,
-            documentId,
-            popoutInstanceId: expectedInstanceId,
+      if (target.kind === 'cursor' && editorPopoutOpenRef.current) {
+        const popoutInsertion: PendingMarkdownMediaCursorInsertion = {
+          asset: {
+            kind: asset.kind,
+            name: asset.name,
+            relative_path: asset.relative_path,
+          },
+          documentRelativePath: activeWorkspaceMarkdownFile.relative_path,
+          documentEpoch,
+          documentId,
+          requestId: insertion.requestId,
+        };
+        const ready = editorPopoutReadyRef.current;
+        if (ready?.documentId === documentId && ready.documentEpoch === documentEpoch) {
+          sendCursorInsertionToEditorPopout({
+            ...popoutInsertion,
+            popoutInstanceId: ready.popoutInstanceId,
           });
-        } else if (!pendingEditorPopoutReadyRequestIdRef.current) {
-          requestEditorPopoutReady();
+        } else {
+          pendingPopoutMediaInsertionsRef.current.push(popoutInsertion);
+          const expectedInstanceId = expectedEditorPopoutInstanceIdRef.current;
+          if (expectedInstanceId) {
+            startEditorPopoutHandshakeRef.current?.({
+              documentEpoch,
+              documentId,
+              popoutInstanceId: expectedInstanceId,
+            });
+          } else if (!pendingEditorPopoutReadyRequestIdRef.current) {
+            requestEditorPopoutReady();
+          }
         }
+        return;
       }
+      setMediaInsertion(insertion);
+    };
+
+    if (asset.kind !== 'excalidraw') {
+      commitMarkdown(createMarkdownMediaReference(asset, activeWorkspaceMarkdownFile));
       return;
     }
-    setMediaInsertion(insertion);
+    if (!excalidrawAssetSync) {
+      // Settings may still be loading. Preserve the source embed until a
+      // resource directory is available rather than losing the insertion.
+      commitMarkdown(createMarkdownMediaReference(asset, activeWorkspaceMarkdownFile));
+      return;
+    }
+    void (async () => {
+      try {
+        const syncModule = await loadLazyModuleWithRetry(() => import('./lib/excalidrawAssetSync'));
+        const result = await syncModule.renderAndSyncExcalidrawAssetPair({
+          appearance,
+          document: activeWorkspaceMarkdownFile,
+          documentPath: activePath,
+          name: asset.name,
+          resourceDirectory: excalidrawAssetSync.resourceDirectory,
+          ...(excalidrawAssetSync.resourceDirectoryToken
+            ? { resourceDirectoryToken: excalidrawAssetSync.resourceDirectoryToken }
+            : {}),
+          sourceRelativePath: asset.relative_path,
+          workspaceRoot: excalidrawAssetSync.workspaceRoot,
+          workspaceToken: excalidrawAssetSync.workspaceToken,
+        });
+        if (!isCurrentContext()) return;
+        commitMarkdown(result.markdown);
+      } catch (error) {
+        if (mountedRef.current) {
+          setError(normalizeAppError(error, locale));
+          setNotice(null);
+        }
+      }
+    })();
   }, [
     activeFileKind,
+    activePath,
     activeWorkspaceMarkdownFile,
+    appearance,
     authorityStatus,
     documentEpoch,
     documentId,
+    excalidrawAssetSync,
+    locale,
     requestEditorPopoutReady,
     sendCursorInsertionToEditorPopout,
+    setError,
+    setNotice,
+    workspaceRoot,
+    workspaceToken,
   ]);
 
   if (popoutPane === 'editor') {
@@ -1935,7 +2266,7 @@ export default function App() {
           ? <WorkspaceImagePreview key={activePath} enabled={documentAssetsEnabled} path={activePath} popout previewRevision={previewRevision} />
           : isMediaFile && activePath
             ? <WorkspaceMediaPreview key={activePath} enabled={documentAssetsEnabled} kind={mediaKind} mimeType={mediaMimeType} path={activePath} popout previewRevision={previewRevision} />
-            : <EditorPane activePath={activePath} content={content} documentEpoch={documentEpoch} documentId={documentId} editable={authorityStatus === 'committed'} fileKind={editorFileKind} mediaInsertion={currentMediaInsertion} outlineJump={currentOutlineJump} onContentChange={updateContent} popout spellcheckEnabled={settingsState.settings?.spellcheckEnabled ?? true} />}
+            : <EditorPane activePath={activePath} content={content} documentEpoch={documentEpoch} documentId={documentId} editable={authorityStatus === 'committed'} fileKind={editorFileKind} mediaInsertion={currentMediaInsertion} outlineJump={currentOutlineJump} onContentChange={updateContent} onPasteError={handleEditorPasteError} onPasteImage={handleClipboardImagePaste} popout spellcheckEnabled={settingsState.settings?.spellcheckEnabled ?? true} />}
       </PopoutPaneShell>
     );
   }
@@ -1970,7 +2301,13 @@ export default function App() {
             <PreviewPane dirty={dirty} outlineJump={currentOutlineJump} popout>
               {activePresentation.preview === 'html' && activePath
                 ? <WorkspaceHtmlPreview content={content} enabled={documentAssetsEnabled} path={activePath} />
-                : <JinxiuMarkdown currentFilePath={activePath} localAssetsEnabled={documentAssetsEnabled} workspaceRoot={workspaceRoot}>{content}</JinxiuMarkdown>}
+                : <JinxiuMarkdown
+                  currentFilePath={activePath}
+                  documentRelativePath={activeWorkspaceMarkdownFile?.relative_path ?? null}
+                  excalidrawAssetSync={excalidrawAssetSync}
+                  localAssetsEnabled={documentAssetsEnabled}
+                  workspaceRoot={workspaceRoot}
+                >{content}</JinxiuMarkdown>}
             </PreviewPane>
           )}
       </PopoutPaneShell>
@@ -1986,6 +2323,7 @@ export default function App() {
         dirty={dirty}
         onQuickOpen={() => showWorkspaceSearchDialog('quick-open')}
         onWorkspaceSearch={() => showWorkspaceSearchDialog('workspace-search')}
+        onExport={activeFileKind === 'markdown' || activeFileKind === 'excalidraw' ? openExportDialog : undefined}
       />
       <button
         type="button"
@@ -1998,7 +2336,9 @@ export default function App() {
         <Settings size={17} />
       </button>
 
-      {workspaceSearchMode && workspaceRoot && workspaceToken ? (
+      {showExport ? (
+        <ExportDialog busy={exportBusy} canExportExcalidraw={activeFileKind === 'excalidraw'} issues={exportIssues} locale={locale} value={exportValue} onCancel={() => setShowExport(false)} onChange={setExportValue} onExport={() => void runExport()} />
+      ) : workspaceSearchMode && workspaceRoot && workspaceToken ? (
         workspaceSearchMode === 'quick-open' ? (
           <QuickOpenDialog
             workspaceRoot={workspaceRoot}
@@ -2103,6 +2443,7 @@ export default function App() {
           locale={locale}
           settings={settingsState.settings}
           workspaceAvailable={Boolean(workspaceRoot && workspaceToken)}
+          onAuthorizeResourceDirectory={handleAuthorizeResourceDirectory}
           onClose={() => setShowSettings(false)}
           onDiscardWorkspaceIndex={discardCurrentWorkspaceIndex}
           onRebuildWorkspaceIndex={rebuildCurrentWorkspaceIndex}
@@ -2113,6 +2454,25 @@ export default function App() {
           onSave={async (nextSettings) => {
             await settingsState.updateSettings(nextSettings);
             setShowSettings(false);
+          }}
+        />
+      ) : appUpdater.update ? (
+        <UpdateAvailableDialog
+          locale={locale}
+          version={appUpdater.update.version}
+          currentVersion={appUpdater.update.currentVersion}
+          body={appUpdater.update.body}
+          busy={appUpdater.installing}
+          onLater={appUpdater.later}
+          onSkip={appUpdater.skip}
+          onUpdate={async () => {
+            try {
+              await appUpdater.install();
+            } catch (updateError) {
+              setError(normalizeAppError(updateError, locale));
+              setNotice(null);
+              appUpdater.later();
+            }
           }}
         />
       ) : feedbackDialog ? (
@@ -2226,6 +2586,8 @@ export default function App() {
               paneRef={editorPaneRef}
               popoutButton={editorPopoutButton}
               onContentChange={updateContent}
+              onPasteError={handleEditorPasteError}
+              onPasteImage={handleClipboardImagePaste}
               onPopout={handleEditorPopoutOpen}
               spellcheckEnabled={settingsState.settings?.spellcheckEnabled ?? true}
             />
@@ -2248,7 +2610,13 @@ export default function App() {
             >
               {activePresentation.preview === 'html' && activePath
                 ? <WorkspaceHtmlPreview content={content} enabled={documentAssetsEnabled} path={activePath} />
-                : <JinxiuMarkdown currentFilePath={activePath} localAssetsEnabled={documentAssetsEnabled} workspaceRoot={workspaceRoot}>{content}</JinxiuMarkdown>}
+                : <JinxiuMarkdown
+                  currentFilePath={activePath}
+                  documentRelativePath={activeWorkspaceMarkdownFile?.relative_path ?? null}
+                  excalidrawAssetSync={excalidrawAssetSync}
+                  localAssetsEnabled={documentAssetsEnabled}
+                  workspaceRoot={workspaceRoot}
+                >{content}</JinxiuMarkdown>}
             </PreviewPane>
           </>
         )}

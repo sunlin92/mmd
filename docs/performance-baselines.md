@@ -63,3 +63,19 @@ The ADR must cover cache permissions, content privacy, corruption recovery, sche
 - `scripts/perf/baselines/100k.json`
 
 Each artifact records OS/architecture, app/build identity, production implementation/schema IDs, fixture and production corpus digests, configured limits, warmup/sample/timing metadata, distributions, memory details, errors, and incomplete/rebaseline state.
+
+## R5 Product Performance Gate
+
+The workspace-index gates above remain a separate M3 contract. R5 adds a strict product evidence schema in `scripts/perf/professional-gate.mjs` for native desktop observations:
+
+- cold/warm startup, first editable frame, and first completed preview
+- 1 MB, 5 MB, and content-heavy Markdown load/edit/preview scenarios
+- 100, 500, and 1,000 element Excalidraw load/edit/save/3x export scenarios
+- idle, normal document, large document, PDF preview, and DOCX preview memory
+- unpacked app, installer, production frontend, and largest direct dependency bytes
+
+Generate byte-for-byte deterministic fixtures with `npm run perf:professional:fixtures`. Native automation writes disjoint observation JSON files, `npm run perf:professional:merge -- <target> <evidence.json> <observation...>` combines them, and `npm run perf:professional:gate -- <evidence.json> <report.json>` applies the fixed budgets. `collect-size-metrics.mjs` measures file trees directly rather than parsing human-readable `du` output.
+
+The gate fails for incomplete evidence, unknown targets or metrics, duplicate observations, invalid numbers, or any exceeded budget. `professional-evidence-template.mjs` intentionally emits `status: incomplete` with null values and cannot pass. This prevents fixture generation, unit benchmarks, or missing native measurements from being presented as desktop performance evidence.
+
+All timing values are milliseconds and all sizes are bytes. Startup measurements begin immediately before native process launch; editable/preview observations must come from the instrumented application, not window existence. Memory is the native process tree resident set after the scenario has settled. Each platform stores its evidence artifact separately because cross-platform values are not comparable.

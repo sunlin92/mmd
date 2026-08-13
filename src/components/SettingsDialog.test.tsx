@@ -57,6 +57,72 @@ describe('SettingsDialog', () => {
     }));
   });
 
+  it('updates the resource path only after an explicit directory authorization', async () => {
+    const onAuthorizeResourceDirectory = vi
+      .fn<() => Promise<string | null>>()
+      .mockResolvedValueOnce('/shared/mmd-assets')
+      .mockResolvedValueOnce(null);
+    const onSave = vi.fn<(settings: AppSettings) => Promise<void>>(async () => undefined);
+    await act(async () => root.render(
+      <SettingsDialog
+        busy={false}
+        locale="en"
+        settings={currentSettingsEnvelope.settings}
+        onAuthorizeResourceDirectory={onAuthorizeResourceDirectory}
+        onClose={vi.fn<() => void>()}
+        onReset={vi.fn<() => Promise<void>>(async () => undefined)}
+        onSave={onSave}
+      />,
+    ));
+
+    const input = container.querySelector<HTMLInputElement>('[name="resourceDirectory"]')!;
+    const authorize = container.querySelector<HTMLButtonElement>('[name="authorizeResourceDirectory"]')!;
+    expect(input.value).toBe('assets');
+    expect(authorize.title).toBe('Choose resource folder');
+
+    await act(async () => authorize.click());
+    expect(input.value).toBe('/shared/mmd-assets');
+
+    await act(async () => authorize.click());
+    expect(input.value).toBe('/shared/mmd-assets');
+
+    await act(async () => container.querySelector('form')?.dispatchEvent(
+      new Event('submit', { bubbles: true, cancelable: true }),
+    ));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      resourceDirectory: '/shared/mmd-assets',
+    }));
+  });
+
+  it('edits shortcuts, reports conflicts, and restores shortcut defaults', async () => {
+    const onSave = vi.fn<(settings: AppSettings) => Promise<void>>(async () => undefined);
+    await act(async () => root.render(
+      <SettingsDialog
+        busy={false}
+        locale="en"
+        settings={currentSettingsEnvelope.settings}
+        onClose={vi.fn<() => void>()}
+        onReset={vi.fn<() => Promise<void>>(async () => undefined)}
+        onSave={onSave}
+      />,
+    ));
+
+    const saveShortcut = container.querySelector<HTMLInputElement>('[name="shortcut-save"]')!;
+    const quickOpenShortcut = container.querySelector<HTMLInputElement>('[name="shortcut-quickOpen"]')!;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      setter?.call(saveShortcut, 'Ctrl+P');
+      saveShortcut.dispatchEvent(new Event('input', { bubbles: true }));
+      setter?.call(quickOpenShortcut, 'Ctrl+P');
+      quickOpenShortcut.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(container.textContent).toContain('Shortcut conflict');
+    expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(true);
+
+    act(() => container.querySelector<HTMLButtonElement>('[name="resetShortcuts"]')?.click());
+    expect(saveShortcut.value).toBe('Mod+S');
+  });
+
   it('manages the workspace index when a workspace is available', async () => {
     const onDiscardWorkspaceIndex = vi.fn<() => Promise<void>>(async () => undefined);
     const onRebuildWorkspaceIndex = vi.fn<() => Promise<void>>(async () => undefined);

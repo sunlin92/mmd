@@ -156,6 +156,167 @@ export function focusMainWindow(intentId?: string, coalesced = false): Promise<v
   return invoke<void>('focus_main_window', { intentId, coalesced });
 }
 
+export interface WriteWorkspaceResourceInput {
+  workspaceToken: string;
+  workspaceRoot: string;
+  documentPath: string;
+  resourceDirectory: string;
+  bytesBase64: string;
+  mimeType: string;
+  suggestedName?: string | null;
+  trustedGenerated?: boolean;
+  resourceDirectoryToken?: string;
+}
+
+export interface WriteWorkspaceResourceResponse {
+  relativePath: string;
+  markdownPath: string;
+  fileName: string;
+  digestMd5: string;
+  created: boolean;
+}
+
+export interface ResourceDirectoryAuthorization {
+  path: string;
+  token: string;
+}
+
+export interface WriteExcalidrawAssetPairInput {
+  workspaceToken: string;
+  workspaceRoot: string;
+  documentPath: string;
+  sourceRelativePath: string;
+  sourceContent: string;
+  resourceDirectory: string;
+  resourceDirectoryToken?: string | null;
+  svgBase64: string;
+  pngBase64: string;
+}
+
+export interface WriteExcalidrawAssetPairResponse {
+  svgMarkdownPath: string;
+  pngMarkdownPath: string;
+  svgFileName: string;
+  pngFileName: string;
+  sourceSha256: string;
+  updated: boolean;
+}
+
+export type ExportKind = 'html' | 'png';
+
+export interface SaveExportInput {
+  kind: ExportKind;
+  defaultName: string;
+  bytesBase64: string;
+}
+
+export interface SaveExportResponse {
+  path: string;
+  bytesWritten: number;
+}
+
+export interface SaveExcalidrawBundleInput {
+  baseName: string;
+  source: string;
+  svgBase64: string;
+  png1xBase64: string;
+  png2xBase64: string;
+  png3xBase64: string;
+}
+
+function decodeWriteWorkspaceResourceResponse(value: unknown): WriteWorkspaceResourceResponse {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid workspace resource response');
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length !== 5
+    || typeof record.relativePath !== 'string'
+    || typeof record.markdownPath !== 'string'
+    || typeof record.fileName !== 'string'
+    || typeof record.digestMd5 !== 'string'
+    || typeof record.created !== 'boolean'
+    || !/^[a-f0-9]{32}$/.test(record.digestMd5)
+    || record.relativePath.length === 0
+    || record.markdownPath.length === 0
+    || record.fileName.length === 0
+    || /[\\/]/u.test(record.fileName)
+  ) {
+    throw new Error('Invalid workspace resource response');
+  }
+  return {
+    relativePath: record.relativePath,
+    markdownPath: record.markdownPath,
+    fileName: record.fileName,
+    digestMd5: record.digestMd5,
+    created: record.created,
+  };
+}
+
+function decodeResourceDirectoryAuthorization(value: unknown): ResourceDirectoryAuthorization {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid resource directory authorization response');
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length !== 2
+    || typeof record.path !== 'string'
+    || record.path.length === 0
+    || typeof record.token !== 'string'
+    || record.token.length === 0
+  ) throw new Error('Invalid resource directory authorization response');
+  return { path: record.path, token: record.token };
+}
+
+function decodeWriteExcalidrawAssetPairResponse(value: unknown): WriteExcalidrawAssetPairResponse {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid Excalidraw asset pair response');
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length !== 6
+    || typeof record.svgMarkdownPath !== 'string'
+    || typeof record.pngMarkdownPath !== 'string'
+    || typeof record.svgFileName !== 'string'
+    || typeof record.pngFileName !== 'string'
+    || typeof record.sourceSha256 !== 'string'
+    || typeof record.updated !== 'boolean'
+    || !/^[a-f0-9]{64}$/u.test(record.sourceSha256)
+    || record.svgMarkdownPath.length === 0
+    || record.pngMarkdownPath.length === 0
+    || record.svgFileName.length === 0
+    || record.pngFileName.length === 0
+    || /[\\/]/u.test(record.svgFileName)
+    || /[\\/]/u.test(record.pngFileName)
+  ) {
+    throw new Error('Invalid Excalidraw asset pair response');
+  }
+  return {
+    svgMarkdownPath: record.svgMarkdownPath,
+    pngMarkdownPath: record.pngMarkdownPath,
+    svgFileName: record.svgFileName,
+    pngFileName: record.pngFileName,
+    sourceSha256: record.sourceSha256,
+    updated: record.updated,
+  };
+}
+
+function decodeSaveExportResponse(value: unknown): SaveExportResponse {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid export response');
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length !== 2
+    || typeof record.path !== 'string'
+    || record.path.length === 0
+    || typeof record.bytesWritten !== 'number'
+    || !Number.isSafeInteger(record.bytesWritten)
+    || record.bytesWritten <= 0
+  ) throw new Error('Invalid export response');
+  return { path: record.path, bytesWritten: record.bytesWritten };
+}
+
 export type WorkspaceOpenSettlement = 'applied' | 'discarded' | 'expired' | 'unknown';
 
 export async function settleOpenIntentWorkspace(
@@ -308,6 +469,25 @@ export async function openDirectoryDialog(): Promise<WorkspaceSnapshot | null> {
   return response === null ? null : decodeWorkspaceSnapshot(response);
 }
 
+export async function authorizeResourceDirectory(): Promise<ResourceDirectoryAuthorization | null> {
+  const response = await invoke<unknown>('authorize_resource_directory_dialog');
+  return response === null ? null : decodeResourceDirectoryAuthorization(response);
+}
+
+export async function saveExport(input: SaveExportInput): Promise<SaveExportResponse | null> {
+  const response = await invoke<unknown>('save_export_dialog', { input });
+  return response === null ? null : decodeSaveExportResponse(response);
+}
+
+export async function saveExcalidrawBundle(input: SaveExcalidrawBundleInput): Promise<string[] | null> {
+  const response = await invoke<unknown>('save_excalidraw_bundle_dialog', { input });
+  if (response === null) return null;
+  if (!Array.isArray(response) || response.length !== 5 || response.some((path) => typeof path !== 'string' || path.length === 0)) {
+    throw new Error('Invalid Excalidraw bundle response');
+  }
+  return response as string[];
+}
+
 export function persistWorkspaceSession(
   workspaceToken: string,
   workspaceRoot: string,
@@ -423,6 +603,18 @@ export async function deleteWorkspaceEntry(
 
 export function readWorkspaceImage(path: string): Promise<string> {
   return invoke<string>('read_workspace_image', { path });
+}
+
+export async function writeWorkspaceResource(
+  input: WriteWorkspaceResourceInput,
+): Promise<WriteWorkspaceResourceResponse> {
+  return decodeWriteWorkspaceResourceResponse(await invoke<unknown>('write_workspace_resource', { input }));
+}
+
+export async function writeExcalidrawAssetPair(
+  input: WriteExcalidrawAssetPairInput,
+): Promise<WriteExcalidrawAssetPairResponse> {
+  return decodeWriteExcalidrawAssetPairResponse(await invoke<unknown>('write_excalidraw_asset_pair', { input }));
 }
 
 export function readMarkdownExcalidraw(

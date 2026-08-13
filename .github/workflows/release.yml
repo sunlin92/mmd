@@ -30,6 +30,7 @@ jobs:
       - id: version
         run: npm run check:release-version -- --github-output
       - run: npm run test:release-tools
+      - run: npm run test:perf
       - run: npm run verify:m3-attestation
       - run: npm test
       - run: npm run typecheck
@@ -41,6 +42,19 @@ jobs:
     name: Build macOS arm64
     needs: source
     runs-on: macos-15
+    env: &trusted-release-env
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -63,14 +77,13 @@ jobs:
           key: aarch64-apple-darwin
       - run: npm ci
       - run: npm run check:release-version
+      - run: node scripts/ci/check-release-trust.mjs --output src-tauri/tauri.release.conf.json
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles dmg --ci
-        env:
-          APPLE_SIGNING_IDENTITY: '-'
+      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
       - name: Stage immutable artifact
         env:
           VERSION: ${{ needs.source.outputs.version }}
@@ -79,7 +92,12 @@ jobs:
           mapfile=($(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg'))
           test "${#mapfile[@]}" -eq 1
           cp "${mapfile[0]}" "staging/MMD_${VERSION}_aarch64.dmg"
-          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_aarch64.dmg"
+          updates=($(find src-tauri/target/aarch64-apple-darwin/release/bundle -type f -name '*.app.tar.gz'))
+          test "${#updates[@]}" -eq 1
+          test -f "${updates[0]}.sig"
+          cp "${updates[0]}" "staging/MMD_${VERSION}_darwin-aarch64.app.tar.gz"
+          cp "${updates[0]}.sig" "staging/MMD_${VERSION}_darwin-aarch64.app.tar.gz.sig"
+          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_aarch64.dmg" "MMD_${VERSION}_darwin-aarch64.app.tar.gz" "MMD_${VERSION}_darwin-aarch64.app.tar.gz.sig"
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -93,6 +111,7 @@ jobs:
     name: Build macOS x64
     needs: source
     runs-on: macos-15-intel
+    env: *trusted-release-env
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -115,14 +134,13 @@ jobs:
           key: x86_64-apple-darwin
       - run: npm ci
       - run: npm run check:release-version
+      - run: node scripts/ci/check-release-trust.mjs --output src-tauri/tauri.release.conf.json
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: npm run tauri -- build --target x86_64-apple-darwin --bundles dmg --ci
-        env:
-          APPLE_SIGNING_IDENTITY: '-'
+      - run: npm run tauri -- build --target x86_64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
       - name: Stage immutable artifact
         env:
           VERSION: ${{ needs.source.outputs.version }}
@@ -131,7 +149,12 @@ jobs:
           mapfile=($(find src-tauri/target/x86_64-apple-darwin/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg'))
           test "${#mapfile[@]}" -eq 1
           cp "${mapfile[0]}" "staging/MMD_${VERSION}_x64.dmg"
-          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_x64.dmg"
+          updates=($(find src-tauri/target/x86_64-apple-darwin/release/bundle -type f -name '*.app.tar.gz'))
+          test "${#updates[@]}" -eq 1
+          test -f "${updates[0]}.sig"
+          cp "${updates[0]}" "staging/MMD_${VERSION}_darwin-x86_64.app.tar.gz"
+          cp "${updates[0]}.sig" "staging/MMD_${VERSION}_darwin-x86_64.app.tar.gz.sig"
+          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_x64.dmg" "MMD_${VERSION}_darwin-x86_64.app.tar.gz" "MMD_${VERSION}_darwin-x86_64.app.tar.gz.sig"
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -145,6 +168,7 @@ jobs:
     name: Build Windows x64
     needs: source
     runs-on: windows-latest
+    env: *trusted-release-env
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -168,12 +192,22 @@ jobs:
           key: x86_64-pc-windows-msvc
       - run: npm ci
       - run: npm run check:release-version
+      - run: node scripts/ci/check-release-trust.mjs --output src-tauri/tauri.release.conf.json
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci
+      - name: Import and verify Windows signing certificate
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'mmd-release.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if ($certificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) { throw 'Windows signing certificate thumbprint mismatch' }
+          Remove-Item -LiteralPath $pfx -Force
+      - run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.release.conf.json --ci
       - name: Stage immutable artifact
         shell: pwsh
         env:
@@ -184,7 +218,13 @@ jobs:
           if ($files.Count -ne 1) { throw "Expected one NSIS installer, found $($files.Count)" }
           $name = "MMD_$env:VERSION`_x64-setup.exe"
           Copy-Item $files[0].FullName "staging/$name"
-          node scripts/ci/artifact-manifest.mjs create staging $name
+          $updates = @(Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle -Recurse -Filter '*.nsis.zip' -File)
+          if ($updates.Count -ne 1) { throw "Expected one Windows updater, found $($updates.Count)" }
+          if (-not (Test-Path -LiteralPath "$($updates[0].FullName).sig" -PathType Leaf)) { throw 'Windows updater signature is missing' }
+          $updateName = "MMD_$env:VERSION`_windows-x86_64.nsis.zip"
+          Copy-Item $updates[0].FullName "staging/$updateName"
+          Copy-Item "$($updates[0].FullName).sig" "staging/$updateName.sig"
+          node scripts/ci/artifact-manifest.mjs create staging $name $updateName "$updateName.sig"
           if ($LASTEXITCODE -ne 0) { throw 'Manifest creation failed' }
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -199,6 +239,7 @@ jobs:
     name: Build Linux x64
     needs: source
     runs-on: ubuntu-22.04
+    env: *trusted-release-env
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -224,12 +265,13 @@ jobs:
           key: x86_64-unknown-linux-gnu
       - run: npm ci
       - run: npm run check:release-version
+      - run: node scripts/ci/check-release-trust.mjs --output src-tauri/tauri.release.conf.json
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-unknown-linux-gnu --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-unknown-linux-gnu --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles appimage,deb --ci
+      - run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles appimage,deb --config src-tauri/tauri.release.conf.json --ci
       - name: Stage immutable artifacts
         env:
           VERSION: ${{ needs.source.outputs.version }}
@@ -241,7 +283,12 @@ jobs:
           test "${#debs[@]}" -eq 1
           cp "${appimages[0]}" "staging/MMD_${VERSION}_amd64.AppImage"
           cp "${debs[0]}" "staging/MMD_${VERSION}_amd64.deb"
-          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_amd64.AppImage" "MMD_${VERSION}_amd64.deb"
+          updates=($(find src-tauri/target/x86_64-unknown-linux-gnu/release/bundle -type f -name '*.AppImage.tar.gz'))
+          test "${#updates[@]}" -eq 1
+          test -f "${updates[0]}.sig"
+          cp "${updates[0]}" "staging/MMD_${VERSION}_linux-x86_64.AppImage.tar.gz"
+          cp "${updates[0]}.sig" "staging/MMD_${VERSION}_linux-x86_64.AppImage.tar.gz.sig"
+          node scripts/ci/artifact-manifest.mjs create staging "MMD_${VERSION}_amd64.AppImage" "MMD_${VERSION}_amd64.deb" "MMD_${VERSION}_linux-x86_64.AppImage.tar.gz" "MMD_${VERSION}_linux-x86_64.AppImage.tar.gz.sig"
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -393,6 +440,9 @@ jobs:
       LINUX_ID: ${{ needs.build-linux-x64.outputs.artifact-id }}
       LINUX_DIGEST: ${{ needs.build-linux-x64.outputs.artifact-digest }}
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Verify artifact IDs and digests
         run: |
           set -euo pipefail
@@ -444,10 +494,19 @@ jobs:
             "MMD_${VERSION}_aarch64.dmg"
             "MMD_${VERSION}_amd64.AppImage"
             "MMD_${VERSION}_amd64.deb"
+            "MMD_${VERSION}_darwin-aarch64.app.tar.gz"
+            "MMD_${VERSION}_darwin-aarch64.app.tar.gz.sig"
+            "MMD_${VERSION}_darwin-x86_64.app.tar.gz"
+            "MMD_${VERSION}_darwin-x86_64.app.tar.gz.sig"
+            "MMD_${VERSION}_linux-x86_64.AppImage.tar.gz"
+            "MMD_${VERSION}_linux-x86_64.AppImage.tar.gz.sig"
+            "MMD_${VERSION}_windows-x86_64.nsis.zip"
+            "MMD_${VERSION}_windows-x86_64.nsis.zip.sig"
             "MMD_${VERSION}_x64-setup.exe"
             "MMD_${VERSION}_x64.dmg"
           )
           diff -u <(printf '%s\n' "${expected_assets[@]}" | sort) <(printf '%s\n' "${actual_assets[@]}")
+          node scripts/ci/create-update-manifest.mjs release-assets "$VERSION" "${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}"
           (cd release-assets && sha256sum MMD_* | sort -k2 > SHA256SUMS.txt && sha256sum --check SHA256SUMS.txt)
       - id: upload-candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -514,9 +573,18 @@ jobs:
             "MMD_${VERSION}_aarch64.dmg"
             "MMD_${VERSION}_amd64.AppImage"
             "MMD_${VERSION}_amd64.deb"
+            "MMD_${VERSION}_darwin-aarch64.app.tar.gz"
+            "MMD_${VERSION}_darwin-aarch64.app.tar.gz.sig"
+            "MMD_${VERSION}_darwin-x86_64.app.tar.gz"
+            "MMD_${VERSION}_darwin-x86_64.app.tar.gz.sig"
+            "MMD_${VERSION}_linux-x86_64.AppImage.tar.gz"
+            "MMD_${VERSION}_linux-x86_64.AppImage.tar.gz.sig"
+            "MMD_${VERSION}_windows-x86_64.nsis.zip"
+            "MMD_${VERSION}_windows-x86_64.nsis.zip.sig"
             "MMD_${VERSION}_x64-setup.exe"
             "MMD_${VERSION}_x64.dmg"
             "SHA256SUMS.txt"
+            "latest.json"
           )
           diff -u <(printf '%s\n' "${expected[@]}" | sort) <(printf '%s\n' "${actual[@]}")
           (cd release-assets && sha256sum --check SHA256SUMS.txt)

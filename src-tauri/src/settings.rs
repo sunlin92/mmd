@@ -388,25 +388,99 @@ fn validate_settings(settings: &Settings) -> Result<(), SettingsError> {
     ) {
         return Err(invalid_error("Theme selection is not supported."));
     }
-    if settings.resource_directory.is_empty() || settings.resource_directory.len() > 128 {
+    if settings.resource_directory.is_empty() || settings.resource_directory.len() > 4096 {
         return Err(invalid_error("Resource directory is invalid."));
     }
     let resource_path = Path::new(&settings.resource_directory);
-    if resource_path.is_absolute()
-        || resource_path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
+    if resource_path.components().any(|component| {
+        matches!(component, Component::ParentDir | Component::CurDir)
+            || (!resource_path.is_absolute()
+                && matches!(component, Component::RootDir | Component::Prefix(_)))
+    }) {
         return Err(invalid_error(
-            "Resource directory must be a relative path without parent traversal.",
+            "Resource directory must not contain parent traversal.",
         ));
     }
-    if !settings.shortcuts.is_empty() || !settings.export_profiles.is_empty() {
+    const SHORTCUT_DEFAULTS: [(&str, &str); 6] = [
+        ("save", "Mod+S"),
+        ("saveAs", "Mod+Shift+S"),
+        ("quickOpen", "Mod+P"),
+        ("workspaceSearch", "Mod+Shift+F"),
+        ("export", "Mod+Shift+E"),
+        ("settings", "Mod+,"),
+    ];
+    if settings.shortcuts.len() > SHORTCUT_DEFAULTS.len()
+        || settings
+            .shortcuts
+            .keys()
+            .any(|action| !SHORTCUT_DEFAULTS.iter().any(|(known, _)| known == action))
+    {
+        return Err(invalid_error("Shortcut action is not supported."));
+    }
+    let mut normalized_shortcuts = std::collections::BTreeSet::new();
+    for (action, default_shortcut) in SHORTCUT_DEFAULTS {
+        let shortcut = settings
+            .shortcuts
+            .get(action)
+            .map(String::as_str)
+            .unwrap_or(default_shortcut);
+        let parts = shortcut.split('+').map(str::trim).collect::<Vec<_>>();
+        let mut modifiers = parts[..parts.len().saturating_sub(1)]
+            .iter()
+            .map(|part| part.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let modifiers_are_unique = modifiers
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == modifiers.len();
+        modifiers.sort();
+        let modifier_count = modifiers
+            .iter()
+            .filter(|part| matches!(part.as_str(), "mod" | "ctrl" | "alt" | "shift"))
+            .count();
+        let key = parts
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let supported_key = key.len() == 1
+            || matches!(
+                key.as_str(),
+                "enter"
+                    | "escape"
+                    | "space"
+                    | "tab"
+                    | "backspace"
+                    | "delete"
+                    | "arrowup"
+                    | "arrowdown"
+                    | "arrowleft"
+                    | "arrowright"
+            )
+            || (key.starts_with('f')
+                && key[1..]
+                    .parse::<u8>()
+                    .is_ok_and(|number| (1..=12).contains(&number)));
+        let normalized = format!("{}+{key}", modifiers.join("+"));
+        if shortcut.len() > 64
+            || parts.len() < 2
+            || modifier_count + 1 != parts.len()
+            || parts
+                .last()
+                .is_none_or(|key| key.is_empty() || key.len() > 12)
+            || !supported_key
+            || !modifiers_are_unique
+        {
+            return Err(invalid_error("Shortcut is invalid."));
+        }
+        if !normalized_shortcuts.insert(normalized) {
+            return Err(invalid_error("Shortcut conflicts with another action."));
+        }
+    }
+    if !settings.export_profiles.is_empty() {
         return Err(invalid_error(
-            "Shortcut and export profile placeholders must remain empty in this version.",
+            "Export profile placeholders must remain empty in this version.",
         ));
     }
     Ok(())
@@ -686,6 +760,77 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_settings_accept_known_unique_bindings_and_reject_conflicts() {
+        let directory = tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().to_path_buf());
+        let mut settings = Settings::default();
+        settings
+            .shortcuts
+            .insert("save".to_string(), "Mod+S".to_string());
+        settings
+            .shortcuts
+            .insert("quickOpen".to_string(), "Mod+P".to_string());
+        let saved = store.update(0, settings.clone()).unwrap();
+        assert_eq!(saved.settings.shortcuts, settings.shortcuts);
+
+        settings
+            .shortcuts
+            .insert("quickOpen".to_string(), "mod+s".to_string());
+        let error = store.update(saved.revision, settings).unwrap_err();
+        assert_eq!(error.code, SettingsErrorCode::Invalid);
+    }
+
+    #[test]
+    fn shortcut_settings_reject_unknown_actions_and_malformed_bindings() {
+        let directory = tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().to_path_buf());
+        let mut unknown = Settings::default();
+        unknown
+            .shortcuts
+            .insert("launchMissiles".to_string(), "Mod+M".to_string());
+        assert_eq!(
+            store.update(0, unknown).unwrap_err().code,
+            SettingsErrorCode::Invalid
+        );
+
+        let mut malformed = Settings::default();
+        malformed
+            .shortcuts
+            .insert("save".to_string(), "S".to_string());
+        assert_eq!(
+            store.update(0, malformed).unwrap_err().code,
+            SettingsErrorCode::Invalid
+        );
+
+        let mut conflicts_with_default = Settings::default();
+        conflicts_with_default
+            .shortcuts
+            .insert("save".to_string(), "Mod+P".to_string());
+        assert_eq!(
+            store.update(0, conflicts_with_default).unwrap_err().code,
+            SettingsErrorCode::Invalid
+        );
+
+        let mut unsupported_key = Settings::default();
+        unsupported_key
+            .shortcuts
+            .insert("save".to_string(), "Mod+not-a-key".to_string());
+        assert_eq!(
+            store.update(0, unsupported_key).unwrap_err().code,
+            SettingsErrorCode::Invalid
+        );
+
+        let mut duplicate_modifier = Settings::default();
+        duplicate_modifier
+            .shortcuts
+            .insert("save".to_string(), "Mod+Mod+S".to_string());
+        assert_eq!(
+            store.update(0, duplicate_modifier).unwrap_err().code,
+            SettingsErrorCode::Invalid
+        );
+    }
+
+    #[test]
     fn v0_optional_fields_default_and_current_schema_round_trips_exactly() {
         let directory = tempdir().unwrap();
         let store = SettingsStore::new(directory.path().to_path_buf());
@@ -718,6 +863,31 @@ mod tests {
 
         assert_eq!(saved.settings, current);
         assert_eq!(restarted, saved);
+    }
+
+    #[test]
+    fn absolute_resource_directory_is_a_persisted_preference_not_an_authority() {
+        let directory = tempdir().unwrap();
+        let resources = tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().to_path_buf());
+        let initial = store.load_or_create().unwrap();
+        let mut settings = initial.settings;
+        settings.resource_directory = resources.path().to_string_lossy().to_string();
+
+        let saved = store.update(initial.revision, settings.clone()).unwrap();
+
+        assert_eq!(
+            saved.settings.resource_directory,
+            settings.resource_directory
+        );
+        assert_eq!(
+            SettingsStore::new(directory.path().to_path_buf())
+                .load_or_create()
+                .unwrap()
+                .settings
+                .resource_directory,
+            settings.resource_directory
+        );
     }
 
     #[test]

@@ -63,6 +63,335 @@ describe('EditorPane', () => {
     vi.unstubAllGlobals();
   });
 
+  function dispatchPaste(view: EditorView, input: {
+    html?: string;
+    image?: File;
+    images?: File[];
+    rtf?: string;
+    text?: string;
+  }): ClipboardEvent {
+    const event = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(event, 'clipboardData', {
+      configurable: true,
+      value: {
+        getData: (type: string) => ({
+          'text/html': input.html ?? '',
+          'text/plain': input.text ?? '',
+          'text/rtf': input.rtf ?? '',
+        })[type] ?? '',
+        items: (input.images ?? (input.image ? [input.image] : [])).map((image) => ({
+          getAsFile: () => image,
+          kind: 'file',
+          type: image.type,
+        })),
+      },
+    });
+    view.contentDOM.dispatchEvent(event);
+    return event;
+  }
+
+  function dispatchEditorContextMenu(view: EditorView, clientX = 120, clientY = 90): MouseEvent {
+    const event = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+      clientX,
+      clientY,
+    });
+    view.dom.dispatchEvent(event);
+    return event;
+  }
+
+  it.each([
+    {
+      expected: '**Rich**',
+      input: { html: '<p><strong>Rich</strong></p>', text: 'Rich' },
+      label: 'HTML',
+    },
+    {
+      expected: 'plain text',
+      input: { text: 'plain text' },
+      label: 'plain text',
+    },
+    {
+      expected: 'Rich text',
+      input: { rtf: String.raw`{\rtf1 Rich text}` },
+      label: 'RTF',
+    },
+  ])('inserts $label clipboard content with one undoable transaction', ({ expected, input }) => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="replace me"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } }));
+
+    let event: ClipboardEvent | undefined;
+    act(() => {
+      event = dispatchPaste(view, input);
+    });
+
+    expect(event?.defaultPrevented).toBe(true);
+    expect(view.state.doc.toString()).toBe(expected);
+    expect(undoDepth(view.state)).toBe(1);
+    expect(onContentChange).toHaveBeenCalledOnce();
+    act(() => expect(undo(view)).toBe(true));
+    expect(view.state.doc.toString()).toBe('replace me');
+  });
+
+  it('persists a clipboard image and inserts the returned Markdown only while the editor is current', async () => {
+    let resolveImage: ((markdown: string | null) => void) | undefined;
+    const onPasteImage = vi.fn<() => Promise<string | null>>(() => new Promise<string | null>((resolve) => {
+      resolveImage = resolve;
+    }));
+    const onContentChange = vi.fn<(content: string) => void>();
+    const render = (documentEpoch: number, editable = true) => root.render(
+      <EditorPane
+        activePath="/workspace/notes.md"
+        content="draft"
+        documentEpoch={documentEpoch}
+        documentId={documentEpoch === 1 ? 'document-notes' : 'document-next'}
+        editable={editable}
+        onContentChange={onContentChange}
+        onPasteImage={onPasteImage}
+      />,
+    );
+    act(() => render(1));
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    const image = new File([new Uint8Array([1, 2, 3])], 'clipboard.png', { type: 'image/png' });
+
+    let event: ClipboardEvent | undefined;
+    act(() => {
+      event = dispatchPaste(view, { image });
+    });
+    expect(event?.defaultPrevented).toBe(true);
+    expect(onPasteImage).toHaveBeenCalledWith(expect.objectContaining({
+      blob: image,
+      documentEpoch: 1,
+      documentId: 'document-notes',
+      mimeType: 'image/png',
+      suggestedName: 'clipboard.png',
+    }));
+
+    act(() => render(2));
+    await act(async () => {
+      resolveImage?.('![clipboard.png](assets/clipboard.png)');
+      await Promise.resolve();
+    });
+
+    expect(onContentChange).not.toHaveBeenCalled();
+    expect(container.querySelector('.cm-content')?.textContent).toBe('draft');
+  });
+
+  it('inserts a persisted clipboard image reference as one undoable editor change', async () => {
+    const markdown = '![clipboard.png](../assets/clipboard.png)';
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="draft"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+          onPasteImage={vi.fn<() => Promise<string | null>>(async () => markdown)}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: view.state.doc.length } }));
+
+    await act(async () => {
+      dispatchPaste(view, {
+        image: new File([new Uint8Array([1])], 'clipboard.png', { type: 'image/png' }),
+      });
+      await Promise.resolve();
+    });
+
+    expect(view.state.doc.toString()).toBe(`draft${markdown}`);
+    expect(undoDepth(view.state)).toBe(1);
+    expect(onContentChange).toHaveBeenCalledOnce();
+    act(() => expect(undo(view)).toBe(true));
+    expect(view.state.doc.toString()).toBe('draft');
+  });
+
+
+
+  it('falls back to cleaned plain text when rich conversion fails and reports formatting loss', () => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    const onPasteError = vi.fn<(error: unknown) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="draft"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+          onPasteError={onPasteError}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } }));
+
+    let event: ClipboardEvent | undefined;
+    act(() => {
+      event = dispatchPaste(view, {
+        html: '<script>alert(1)</script>',
+        text: '  safe plain  ',
+      });
+    });
+
+    expect(event?.defaultPrevented).toBe(true);
+    expect(view.state.doc.toString()).toBe('safe plain');
+    expect(undoDepth(view.state)).toBe(1);
+    expect(onPasteError).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('cleaned plain text'),
+    }));
+    expect(onContentChange).toHaveBeenCalledOnce();
+  });
+
+  it('inserts mixed rich text and all clipboard images as one mapped undoable transaction', async () => {
+    const imageOne = new File([new Uint8Array([1])], 'one.png', { type: 'image/png' });
+    const imageTwo = new File([new Uint8Array([2])], 'two.png', { type: 'image/png' });
+    const imageResults = new Map<string, string>([
+      ['one.png', '![one.png](assets/one.png)'],
+      ['two.png', '![two.png](assets/two.png)'],
+    ]);
+    const onPasteImage = vi.fn<(request: { suggestedName: string | null }) => Promise<string | null>>(async (request) => (
+      imageResults.get(request.suggestedName ?? '') ?? null
+    ));
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="abcdef"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+          onPasteImage={onPasteImage}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: 3 } }));
+
+    await act(async () => {
+      dispatchPaste(view, {
+        html: '<p><strong>Rich</strong> text</p>',
+        images: [imageOne, imageTwo],
+        text: 'Rich text',
+      });
+      view.dispatch({
+        changes: { from: 0, insert: '>>' },
+        selection: { anchor: view.state.doc.length + 2 },
+      });
+      await Promise.resolve();
+    });
+
+    expect(onPasteImage).toHaveBeenCalledTimes(2);
+    expect(view.state.doc.toString()).toBe([
+      '>>abc**Rich** text',
+      '',
+      '![one.png](assets/one.png)',
+      '',
+      '![two.png](assets/two.png)def',
+    ].join('\n'));
+    expect(undoDepth(view.state)).toBe(2);
+    act(() => expect(undo(view)).toBe(true));
+    expect(view.state.doc.toString()).toBe('>>abcdef');
+  });
+
+  it('rejects SVG and oversized clipboard images before invoking the image paste callback', () => {
+    const onPasteImage = vi.fn<() => Promise<string | null>>();
+    const onPasteError = vi.fn<(error: unknown) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="draft"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={vi.fn<(content: string) => void>()}
+          onPasteError={onPasteError}
+          onPasteImage={onPasteImage}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    const oversized = new File([new Uint8Array([1])], 'large.png', { type: 'image/png' });
+    Object.defineProperty(oversized, 'size', { configurable: true, value: 16 * 1024 * 1024 + 1 });
+
+    let event: ClipboardEvent | undefined;
+    act(() => {
+      event = dispatchPaste(view, {
+        images: [
+          new File(['<svg></svg>'], 'unsafe.svg', { type: 'image/svg+xml' }),
+          oversized,
+        ],
+      });
+    });
+
+    expect(event?.defaultPrevented).toBe(true);
+    expect(onPasteImage).not.toHaveBeenCalled();
+    expect(onPasteError).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('SVG clipboard images'),
+    }));
+    expect(view.state.doc.toString()).toBe('draft');
+  });
+
+  it.each([
+    { editable: false, expected: 'draft', fileKind: 'markdown' as const },
+    { editable: true, expected: 'Richdraft', fileKind: 'html' as const },
+  ])('does not handle rich paste for $fileKind when editable=$editable', ({ editable, expected, fileKind }) => {
+    const onPasteImage = vi.fn<() => Promise<string | null>>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="draft"
+          documentEpoch={1}
+          documentId="document-notes"
+          editable={editable}
+          fileKind={fileKind}
+          onContentChange={vi.fn<(content: string) => void>()}
+          onPasteImage={onPasteImage}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+
+    act(() => {
+      dispatchPaste(view, { html: '<strong>Rich</strong>', text: 'Rich' });
+    });
+
+    expect(view.state.doc.toString()).toBe(expected);
+    expect(onPasteImage).not.toHaveBeenCalled();
+  });
+
   it('renders a native CodeMirror editor with line numbers', () => {
     act(() => {
       root.render(
@@ -886,6 +1215,159 @@ describe('EditorPane', () => {
     expect(view.state.doc.toString()).toBe('lpha');
     expect(onContentChange).toHaveBeenCalledOnce();
     expect(onContentChange).toHaveBeenCalledWith('lpha');
+  });
+
+  it('opens an accessible Markdown editor context menu and applies existing format commands', () => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="alpha beta"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={onContentChange}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+    act(() => view.dispatch({ selection: { anchor: 0, head: 5 } }));
+
+    let event: MouseEvent | undefined;
+    act(() => {
+      event = dispatchEditorContextMenu(view, 42, 72);
+    });
+
+    const menu = container.querySelector<HTMLElement>('[role="menu"][data-editor-context-menu="true"]');
+    expect(event?.defaultPrevented).toBe(true);
+    expect(menu).not.toBeNull();
+    expect(menu?.style.left).toBe('42px');
+    expect(menu?.style.top).toBe('72px');
+    expect(container.querySelector('[role="menuitem"][data-context-command-id="bold"]')?.textContent)
+      .toContain('Bold');
+    expect(container.querySelector('[role="menuitem"][data-context-action-id="insert-table"]')?.textContent)
+      .toContain('Table');
+
+    act(() => {
+      container.querySelector<HTMLButtonElement>('[data-context-command-id="bold"]')?.click();
+    });
+
+    expect(container.querySelector('[data-editor-context-menu="true"]')).toBeNull();
+    expect(view.state.doc.toString()).toBe('**alpha** beta');
+    expect(view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to))
+      .toBe('alpha');
+    expect(undoDepth(view.state)).toBe(1);
+    expect(onContentChange).toHaveBeenCalledWith('**alpha** beta');
+  });
+
+  it.each([
+    ['insert-table', '| Header | Header |\n| --- | --- |\n| Cell | Cell |', 2],
+    ['insert-image', '![alt text](path/to/image.png)', 2],
+    ['insert-formula', '$$\n\n$$', 3],
+    ['code-block', '```\n\n```', 4],
+    ['alert-tip', '> [!TIP]\n> ', 11],
+    ['link', '[]()', 1],
+  ] as const)('inserts %s from the context menu as one undoable transaction', (id, expected, caret) => {
+    const onContentChange = vi.fn<(content: string) => void>();
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content=""
+          documentEpoch={1}
+          documentId={`document-${id}`}
+          onContentChange={onContentChange}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+
+    act(() => {
+      dispatchEditorContextMenu(view);
+    });
+    act(() => {
+      container.querySelector<HTMLButtonElement>(`[data-context-command-id="${id}"], [data-context-action-id="${id}"]`)?.click();
+    });
+
+    expect(view.state.doc.toString()).toBe(expected);
+    expect(view.state.selection.main.head).toBe(caret);
+    expect(undoDepth(view.state)).toBe(1);
+    expect(onContentChange).toHaveBeenCalledWith(expected);
+  });
+
+  it('dismisses the editor context menu on Escape, outside click, and format palette handoff', () => {
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="alpha"
+          documentEpoch={1}
+          documentId="document-notes"
+          onContentChange={vi.fn<(content: string) => void>()}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+
+    act(() => {
+      dispatchEditorContextMenu(view);
+    });
+    expect(container.querySelector('[data-editor-context-menu="true"]')).not.toBeNull();
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Escape' }));
+    });
+    expect(container.querySelector('[data-editor-context-menu="true"]')).toBeNull();
+
+    act(() => {
+      dispatchEditorContextMenu(view);
+    });
+    expect(container.querySelector('[data-editor-context-menu="true"]')).not.toBeNull();
+    act(() => {
+      document.body.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+    });
+    expect(container.querySelector('[data-editor-context-menu="true"]')).toBeNull();
+
+    act(() => {
+      dispatchEditorContextMenu(view);
+    });
+    act(() => {
+      container.querySelector<HTMLButtonElement>('[data-context-action-id="open-format-palette"]')?.click();
+    });
+    expect(container.querySelector('[data-editor-context-menu="true"]')).toBeNull();
+    expect(container.querySelector('.markdown-format-dialog')).not.toBeNull();
+  });
+
+  it.each([
+    { editable: false, fileKind: 'markdown' as const },
+    { editable: true, fileKind: 'html' as const },
+  ])('leaves the native context menu alone for $fileKind when editable=$editable', ({ editable, fileKind }) => {
+    act(() => {
+      root.render(
+        <EditorPane
+          activePath="/workspace/notes.md"
+          content="alpha"
+          documentEpoch={1}
+          documentId="document-notes"
+          editable={editable}
+          fileKind={fileKind}
+          onContentChange={vi.fn<(content: string) => void>()}
+        />,
+      );
+    });
+    const editor = container.querySelector<HTMLElement>('.cm-editor');
+    const view = editor ? EditorView.findFromDOM(editor) : null;
+    if (!view) throw new Error('Expected CodeMirror editor');
+
+    const event = dispatchEditorContextMenu(view);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(container.querySelector('[data-editor-context-menu="true"]')).toBeNull();
   });
 
   it('opens the Markdown format command dialog with Control slash', () => {

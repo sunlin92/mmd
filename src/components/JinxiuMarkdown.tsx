@@ -12,6 +12,7 @@ import 'katex/dist/katex.min.css';
 import '../../public/styles/typora-theme/typora-jinxiu.css';
 import { mapH2ChildrenWrapHeadingSymbols } from '../lib/headingPunct';
 import { isLocalMarkdownExcalidrawEmbedSource } from '../lib/markdownExcalidrawEmbed';
+import type { ExcalidrawAssetSyncOptions } from '../lib/excalidrawAssetSync';
 import { preprocessMarkdown } from '../lib/markdownPreprocess';
 import { isLocalMarkdownHtmlEmbedSource, rehypeMarkdownHtmlEmbeds } from '../lib/markdownHtmlEmbed';
 import AdaptiveMarkdownImage from './AdaptiveMarkdownImage';
@@ -33,6 +34,8 @@ import {
 interface Props {
   children: string;
   currentFilePath: string | null;
+  documentRelativePath?: string | null;
+  excalidrawAssetSync?: ExcalidrawAssetSyncOptions | null;
   localAssetsEnabled?: boolean;
   workspaceRoot: string | null;
 }
@@ -49,16 +52,27 @@ function headingAttributes(children: React.ReactNode, node?: HastElement) {
   };
 }
 
-export default function JinxiuMarkdown({ children, currentFilePath, localAssetsEnabled = true, workspaceRoot }: Props) {
+export default function JinxiuMarkdown({
+  children,
+  currentFilePath,
+  documentRelativePath = null,
+  excalidrawAssetSync = null,
+  localAssetsEnabled = true,
+  workspaceRoot,
+}: Props) {
   const document = useMemo(() => ({
     children,
     currentFilePath,
+    documentRelativePath,
+    excalidrawAssetSync,
     localAssetsEnabled,
     workspaceRoot,
-  }), [children, currentFilePath, localAssetsEnabled, workspaceRoot]);
+  }), [children, currentFilePath, documentRelativePath, excalidrawAssetSync, localAssetsEnabled, workspaceRoot]);
   const deferredDocument = useDeferredValue(document);
   const source = useMemo(() => preprocessMarkdown(deferredDocument.children), [deferredDocument.children]);
   const deferredCurrentFilePath = deferredDocument.currentFilePath;
+  const deferredDocumentRelativePath = deferredDocument.documentRelativePath;
+  const deferredExcalidrawAssetSync = deferredDocument.excalidrawAssetSync;
   const deferredLocalAssetsEnabled = deferredDocument.localAssetsEnabled;
   const deferredWorkspaceRoot = deferredDocument.workspaceRoot;
   const components = useMemo<Components>(() => ({
@@ -76,7 +90,7 @@ export default function JinxiuMarkdown({ children, currentFilePath, localAssetsE
     },
     a: ({ href, title, children: c, ...props }) => {
       if (
-        (title === undefined || title === 'mmd:embed')
+        (title === undefined || title === 'mmd:embed' || title === 'mmd:source')
         && typeof href === 'string'
         && isLocalMarkdownExcalidrawEmbedSource(href, {
           currentFilePath: deferredCurrentFilePath,
@@ -86,8 +100,10 @@ export default function JinxiuMarkdown({ children, currentFilePath, localAssetsE
         return (
           <MarkdownExcalidrawPreview
             currentFilePath={deferredCurrentFilePath}
+            documentRelativePath={deferredDocumentRelativePath}
             enabled={deferredLocalAssetsEnabled}
             excalidrawSrc={href}
+            sync={title === 'mmd:source' ? deferredExcalidrawAssetSync : null}
             title={extractText(c).trim() || undefined}
             workspaceRoot={deferredWorkspaceRoot}
           />
@@ -139,7 +155,7 @@ export default function JinxiuMarkdown({ children, currentFilePath, localAssetsE
         ? <MermaidDiagram code={body} />
         : <CodeBlock code={body} language={language} />;
     },
-  }), [deferredCurrentFilePath, deferredLocalAssetsEnabled, deferredWorkspaceRoot]);
+  }), [deferredCurrentFilePath, deferredDocumentRelativePath, deferredExcalidrawAssetSync, deferredLocalAssetsEnabled, deferredWorkspaceRoot]);
 
   return (
     <div className="typora-jinxiu mmd-preview-content">

@@ -6,6 +6,7 @@ import tauriConfig from '../../src-tauri/tauri.conf.json';
 
 const cargoManifest = readFileSync(new URL('../../src-tauri/Cargo.toml', import.meta.url), 'utf8');
 const tauriRustLib = readFileSync(new URL('../../src-tauri/src/lib.rs', import.meta.url), 'utf8');
+const resourceStore = readFileSync(new URL('../../src-tauri/src/resource_store.rs', import.meta.url), 'utf8');
 
 function releaseProfiles() {
   return [...cargoManifest.matchAll(
@@ -82,7 +83,21 @@ describe('Tauri capabilities', () => {
       'core:webview:allow-create-webview-window',
       'core:window:allow-destroy',
       'core:window:allow-set-focus',
+      'process:allow-restart',
+      'updater:default',
     ]);
     expect(tauriConfig.bundle.targets).toBe('all');
+  });
+
+  it('registers only the process permission needed to relaunch after an update', () => {
+    expect(cargoManifest).toMatch(/^tauri-plugin-process = "=2\.3\.1"$/m);
+    expect(tauriRustLib).toContain('.plugin(tauri_plugin_process::init())');
+    expect(capability.permissions.filter((permission) => permission.startsWith('process:')))
+      .toEqual(['process:allow-restart']);
+  });
+
+  it('keeps macOS no-replace resource publication bound to the authorized directory handle', () => {
+    expect(resourceStore).toContain('libc::renameatx_np(');
+    expect(resourceStore).not.toContain('read_link(format!("/dev/fd/{}", directory.as_raw_fd()))');
   });
 });
