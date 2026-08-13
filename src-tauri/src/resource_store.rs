@@ -1910,8 +1910,10 @@ mod tests {
             .contains("explicitly"));
 
         open_workspace_file_inner(&state, &doc).unwrap();
+        let replacement = dir.path().join("replacement.md");
+        fs::write(&replacement, b"# Replacement").unwrap();
         fs::remove_file(&doc).unwrap();
-        fs::write(&doc, b"# Replacement").unwrap();
+        fs::rename(replacement, &doc).unwrap();
         input.document_path = doc.to_string_lossy().to_string();
         let error = write_workspace_resource_inner(&state, input).unwrap_err();
         assert!(
