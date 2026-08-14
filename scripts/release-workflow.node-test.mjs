@@ -118,18 +118,32 @@ test('release builds fall back to unsigned installers without weakening trusted 
     workflow.match(/check-release-trust\.mjs --allow-unsigned --output src-tauri\/tauri\.release\.conf\.json/g)?.length,
     4,
   );
+  assert.equal(
+    workflow.match(/check-release-trust\.mjs --allow-unsigned --output src-tauri\/tauri\.release\.conf\.json\n\s+env: \*trusted-release-env/g)?.length,
+    4,
+  );
   assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY \}\}/);
   assert.match(workflow, /APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}/);
   assert.match(workflow, /WINDOWS_CERTIFICATE_BASE64: \$\{\{ secrets\.WINDOWS_CERTIFICATE_BASE64 \}\}/);
-  assert.match(
-    workflow,
-    /APPLE_SIGNING_IDENTITY: \$\{\{ needs\.source\.outputs\.release-ready == 'true' && secrets\.APPLE_SIGNING_IDENTITY \|\| '-' \}\}/,
+  assert.equal(
+    workflow.match(/name: Build signed (?:macOS|Windows|Linux) package/g)?.length,
+    4,
   );
+  assert.equal(
+    workflow.match(/name: Build unsigned (?:macOS|Windows|Linux) package/g)?.length,
+    4,
+  );
+  assert.equal(
+    workflow.match(/name: Build unsigned macOS package[\s\S]{0,240}APPLE_SIGNING_IDENTITY: '-'/g)?.length,
+    2,
+  );
+  assert.doesNotMatch(workflow, /runs-on: (?:macos|windows|ubuntu)[^\n]*\n\s+env: \*trusted-release-env/);
   assert.match(
     workflow,
-    /name: Import and verify Windows signing certificate\n\s+if: needs\.source\.outputs\.release-ready == 'true'/,
+    /name: Import and verify Windows signing certificate\n\s+if: needs\.source\.outputs\.release-ready == 'true'[\s\S]{0,500}env: \*trusted-release-env/,
   );
   assert.match(workflow, /if \[\[ "\$RELEASE_READY" == true \]\]; then/);
+  assert.match(workflow, /scripts\/ci\/smoke-linux\.sh artifact x86_64-unknown-linux-gnu/);
   assert.match(workflow, /create-update-manifest\.mjs release-assets/);
   assert.match(workflow, /"latest\.json"/);
 });

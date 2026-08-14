@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   evaluateReleaseTrust,
   unsignedReleaseConfig,
@@ -19,6 +21,8 @@ const complete = {
   WINDOWS_CERTIFICATE_BASE64: 'base64-pfx',
   WINDOWS_CERTIFICATE_PASSWORD: 'pfx-password',
 };
+
+const scriptPath = fileURLToPath(new URL('./check-release-trust.mjs', import.meta.url));
 
 test('accepts trusted release secrets and emits a production updater override', () => {
   const result = evaluateReleaseTrust(complete);
@@ -60,4 +64,11 @@ test('unsigned release config disables updater artifacts and remote updates', ()
       },
     },
   });
+});
+
+test('runs the CLI through a Windows-safe main module check', async () => {
+  const script = await readFile(scriptPath, 'utf8');
+
+  assert.match(script, /path\.resolve\(process\.argv\[1\]\) === fileURLToPath\(import\.meta\.url\)/);
+  assert.doesNotMatch(script, /new URL\(process\.argv\[1\], 'file:'\)/);
 });

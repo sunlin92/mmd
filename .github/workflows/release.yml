@@ -33,7 +33,7 @@ jobs:
       - id: release-trust
         name: Detect signed release readiness
         run: node scripts/ci/check-release-trust.mjs --github-output
-        env:
+        env: &trusted-release-env
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
@@ -59,19 +59,6 @@ jobs:
     name: Build macOS arm64
     needs: source
     runs-on: macos-15
-    env: &trusted-release-env
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
-      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -95,14 +82,21 @@ jobs:
       - run: npm ci
       - run: npm run check:release-version
       - run: node scripts/ci/check-release-trust.mjs --allow-unsigned --output src-tauri/tauri.release.conf.json
+        env: *trusted-release-env
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
+      - name: Build signed macOS package
+        if: needs.source.outputs.release-ready == 'true'
+        run: npm run tauri -- build --target aarch64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
+        env: *trusted-release-env
+      - name: Build unsigned macOS package
+        if: needs.source.outputs.release-ready != 'true'
+        run: npm run tauri -- build --target aarch64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
         env:
-          APPLE_SIGNING_IDENTITY: ${{ needs.source.outputs.release-ready == 'true' && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          APPLE_SIGNING_IDENTITY: '-'
       - name: Stage immutable artifact
         env:
           VERSION: ${{ needs.source.outputs.version }}
@@ -135,7 +129,6 @@ jobs:
     name: Build macOS x64
     needs: source
     runs-on: macos-15-intel
-    env: *trusted-release-env
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -159,14 +152,21 @@ jobs:
       - run: npm ci
       - run: npm run check:release-version
       - run: node scripts/ci/check-release-trust.mjs --allow-unsigned --output src-tauri/tauri.release.conf.json
+        env: *trusted-release-env
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: npm run tauri -- build --target x86_64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
+      - name: Build signed macOS package
+        if: needs.source.outputs.release-ready == 'true'
+        run: npm run tauri -- build --target x86_64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
+        env: *trusted-release-env
+      - name: Build unsigned macOS package
+        if: needs.source.outputs.release-ready != 'true'
+        run: npm run tauri -- build --target x86_64-apple-darwin --bundles dmg --config src-tauri/tauri.release.conf.json --ci
         env:
-          APPLE_SIGNING_IDENTITY: ${{ needs.source.outputs.release-ready == 'true' && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          APPLE_SIGNING_IDENTITY: '-'
       - name: Stage immutable artifact
         env:
           VERSION: ${{ needs.source.outputs.version }}
@@ -199,7 +199,6 @@ jobs:
     name: Build Windows x64
     needs: source
     runs-on: windows-latest
-    env: *trusted-release-env
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -224,6 +223,7 @@ jobs:
       - run: npm ci
       - run: npm run check:release-version
       - run: node scripts/ci/check-release-trust.mjs --allow-unsigned --output src-tauri/tauri.release.conf.json
+        env: *trusted-release-env
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
@@ -232,6 +232,7 @@ jobs:
       - name: Import and verify Windows signing certificate
         if: needs.source.outputs.release-ready == 'true'
         shell: pwsh
+        env: *trusted-release-env
         run: |
           $pfx = Join-Path $env:RUNNER_TEMP 'mmd-release.pfx'
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
@@ -239,7 +240,13 @@ jobs:
           $certificate = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
           if ($certificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) { throw 'Windows signing certificate thumbprint mismatch' }
           Remove-Item -LiteralPath $pfx -Force
-      - run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.release.conf.json --ci
+      - name: Build signed Windows package
+        if: needs.source.outputs.release-ready == 'true'
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.release.conf.json --ci
+        env: *trusted-release-env
+      - name: Build unsigned Windows package
+        if: needs.source.outputs.release-ready != 'true'
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.release.conf.json --ci
       - name: Stage immutable artifact
         shell: pwsh
         env:
@@ -276,7 +283,6 @@ jobs:
     name: Build Linux x64
     needs: source
     runs-on: ubuntu-22.04
-    env: *trusted-release-env
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -303,12 +309,19 @@ jobs:
       - run: npm ci
       - run: npm run check:release-version
       - run: node scripts/ci/check-release-trust.mjs --allow-unsigned --output src-tauri/tauri.release.conf.json
+        env: *trusted-release-env
       - run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-unknown-linux-gnu --release
       - name: Native filesystem watcher
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-unknown-linux-gnu --release native_parent_watcher_reports_same_path_changes_and_stops -- --ignored
         env:
           MMD_RUN_NATIVE_WATCH_TESTS: '1'
-      - run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles appimage,deb --config src-tauri/tauri.release.conf.json --ci
+      - name: Build signed Linux package
+        if: needs.source.outputs.release-ready == 'true'
+        run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles appimage,deb --config src-tauri/tauri.release.conf.json --ci
+        env: *trusted-release-env
+      - name: Build unsigned Linux package
+        if: needs.source.outputs.release-ready != 'true'
+        run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles appimage,deb --config src-tauri/tauri.release.conf.json --ci
       - name: Stage immutable artifacts
         env:
           VERSION: ${{ needs.source.outputs.version }}
@@ -449,7 +462,7 @@ jobs:
           artifact-ids: ${{ needs.build-linux-x64.outputs.artifact-id }}
           path: artifact
           merge-multiple: true
-      - run: scripts/ci/smoke-linux.sh artifact
+      - run: scripts/ci/smoke-linux.sh artifact x86_64-unknown-linux-gnu
 
   assemble-release:
     name: Assemble verified release

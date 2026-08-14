@@ -1,5 +1,7 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 export const UPDATER_ENDPOINT = 'https://github.com/sunlin92/mmd/releases/latest/download/latest.json';
 
@@ -95,4 +97,4 @@ function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(process.argv[1], 'file:').href) main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
