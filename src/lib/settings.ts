@@ -22,10 +22,14 @@ const SETTINGS_KEYS = [
 ] as const;
 const ENVELOPE_KEYS = ['schemaVersion', 'revision', 'settings'] as const;
 const SKINS: readonly SettingsSkinId[] = [
+  'original',
   'jinxiu-zhusha',
   'ruyao-tianqing',
   'qinghua-jilan',
   'songke-zhuying',
+  'gujuan-nuanxing',
+  'zhuying-qingci',
+  'jiushu-huangzhi',
   'shanshui-yemo',
 ];
 const LOCALES: readonly SettingsLocaleMode[] = ['system', 'zh-CN', 'en'];

@@ -156,15 +156,14 @@ describe('App crash draft lifecycle', () => {
     container.remove();
   });
 
-  it('lists only in main and recovers without invoking a path open command', async () => {
+  it('does not inspect or offer crash drafts during main or popout startup', async () => {
     const session = createSession();
     mocks.useDocumentSession.mockReturnValue(session);
     await act(async () => root.render(<App />));
-    expect(mocks.list).toHaveBeenCalledOnce();
-    act(() => [...container.querySelectorAll('button')].find((button) => button.textContent === 'Recover')?.click());
-    await act(async () => Promise.resolve());
-    expect(mocks.recover).toHaveBeenCalledWith(documentId, entryToken);
-    expect(session.recoverCrashDraft).toHaveBeenCalledWith(recovered);
+    expect(mocks.list).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain('Recover Unsaved Work');
+    expect(mocks.recover).not.toHaveBeenCalled();
+    expect(session.recoverCrashDraft).not.toHaveBeenCalled();
     expect(session.openWorkspaceFilePath).not.toHaveBeenCalled();
     expect(session.handleOpenFile).not.toHaveBeenCalled();
 
@@ -206,27 +205,25 @@ describe('App crash draft lifecycle', () => {
     expect(container.querySelector('.unsaved-dialog')).not.toBeNull();
   });
 
-  it('offers the persisted catalog again after an unclean remount', async () => {
+  it('keeps persisted crash drafts silent after an unclean remount', async () => {
     mocks.useDocumentSession.mockReturnValue(createSession());
     await act(async () => root.render(<App />));
-    expect(container.textContent).toContain('Recover Unsaved Work');
+    expect(container.textContent).not.toContain('Recover Unsaved Work');
     act(() => root.unmount());
     root = createRoot(container);
     await act(async () => root.render(<App />));
-    expect(mocks.list).toHaveBeenCalledTimes(2);
-    expect(container.textContent).toContain('Recover Unsaved Work');
+    expect(mocks.list).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain('Recover Unsaved Work');
     expect(mocks.discard).not.toHaveBeenCalled();
   });
 
-  it('runs one overflow repair batch only after one explicit click', async () => {
+  it('does not surface crash-store repair during startup', async () => {
     mocks.useDocumentSession.mockReturnValue(createSession());
     mocks.list.mockRejectedValue({ code: 'storeFull', repairReceipt: 'd'.repeat(64) });
     mocks.resetOverflowBatch.mockResolvedValue({ removedEntries: 1, blockedEntries: 0, moreWorkRemaining: false });
     await act(async () => root.render(<App />));
+    expect(mocks.list).not.toHaveBeenCalled();
     expect(mocks.resetOverflowBatch).not.toHaveBeenCalled();
-    act(() => [...container.querySelectorAll('button')]
-      .find((button) => button.textContent?.includes('Repair Draft Storage'))?.click());
-    await act(async () => Promise.resolve());
-    expect(mocks.resetOverflowBatch).toHaveBeenCalledOnce();
+    expect(container.textContent).not.toContain('Repair Draft Storage');
   });
 });

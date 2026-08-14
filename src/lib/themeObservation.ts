@@ -8,7 +8,7 @@ export interface ObservedEffectiveTheme extends EffectiveTheme {
 const FALLBACK_THEME: ObservedEffectiveTheme = Object.freeze({
   appearance: 'light',
   revision: 0,
-  skin: 'jinxiu-zhusha',
+  skin: 'original',
 });
 
 let snapshot = FALLBACK_THEME;
@@ -20,7 +20,7 @@ function readRootTheme(): Omit<ObservedEffectiveTheme, 'revision'> {
   if (typeof document === 'undefined') return FALLBACK_THEME;
   const root = document.documentElement;
   const skinValue = root.getAttribute('data-skin');
-  const skin = isSkinId(skinValue) ? skinValue : 'jinxiu-zhusha';
+  const skin = isSkinId(skinValue) ? skinValue : 'original';
   const appearanceValue = root.getAttribute('data-appearance');
   const appearance = appearanceValue === 'dark' || appearanceValue === 'light'
     ? appearanceValue

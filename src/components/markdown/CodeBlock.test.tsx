@@ -38,9 +38,11 @@ describe('fenced code block rendering', () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    document.documentElement.removeAttribute('data-appearance');
+    document.documentElement.removeAttribute('data-skin');
   });
 
-  it('loads syntax highlighting only after the first non-Mermaid fence', async () => {
+  it('loads syntax highlighting only after the first non-Mermaid fence and keeps plain text soft wraps aligned', async () => {
     const { default: JinxiuMarkdown } = await import('../JinxiuMarkdown');
 
     act(() => root.render(
@@ -49,11 +51,11 @@ describe('fenced code block rendering', () => {
     expect(highlighterMocks.loaded).not.toHaveBeenCalled();
 
     act(() => root.render(
-      <JinxiuMarkdown currentFilePath={null} workspaceRoot={null}>{'```bash\nnode --version\nnpm --version\n```'}</JinxiuMarkdown>,
+      <JinxiuMarkdown currentFilePath={null} workspaceRoot={null}>{'```plain\na-very-long-unbroken-plain-text-line-that-must-wrap-inside-the-preview\nsecond line\n```'}</JinxiuMarkdown>,
     ));
 
     const fallback = container.querySelector('.jinxiu-code-surface pre[aria-busy="true"]');
-    expect(fallback?.querySelector('code')?.textContent).toBe('node --version\nnpm --version');
+    expect(fallback?.querySelector('code')?.textContent).toBe('a-very-long-unbroken-plain-text-line-that-must-wrap-inside-the-preview\nsecond line');
 
     await act(async () => {
       await vi.dynamicImportSettled();
@@ -64,13 +66,33 @@ describe('fenced code block rendering', () => {
     expect(container.querySelector('.jinxiu-code-surface [aria-busy="true"]')).toBeNull();
     const fencedCode = container.querySelector<HTMLElement>('pre.jinxiu-code-block-pre code.jinxiu-fenced-code-inner');
     const codeLines = container.querySelectorAll<HTMLElement>('.jinxiu-code-line');
+    const firstLineNumber = codeLines[0]?.querySelector<HTMLElement>('.react-syntax-highlighter-line-number');
     expect(fencedCode?.style.whiteSpace).toBe('pre-wrap');
-    expect(codeLines[0]?.style.display).toBe('flex');
+    expect(fencedCode?.style.overflowWrap).toBe('break-word');
+    expect(codeLines[0]?.style.display).not.toBe('flex');
+    expect(firstLineNumber).not.toBeNull();
     expect(container.querySelectorAll('.react-syntax-highlighter-line-number')).toHaveLength(2);
     const copyButton = container.querySelector<HTMLButtonElement>('.code-copy-button');
     expect(copyButton?.getAttribute('aria-label')).toBe('Copy code');
     await act(async () => copyButton?.click());
-    expect(clipboardMocks.writeText).toHaveBeenCalledWith('node --version\nnpm --version');
+    expect(clipboardMocks.writeText).toHaveBeenCalledWith('a-very-long-unbroken-plain-text-line-that-must-wrap-inside-the-preview\nsecond line');
     expect(container.querySelector('pre')?.style.backgroundColor).toBe('rgb(255, 255, 255)');
   }, 15_000);
+
+  it('selects the dark Prism base from the effective root appearance', async () => {
+    document.documentElement.setAttribute('data-skin', 'original');
+    document.documentElement.setAttribute('data-appearance', 'dark');
+    const { default: JinxiuMarkdown } = await import('../JinxiuMarkdown');
+
+    act(() => root.render(
+      <JinxiuMarkdown currentFilePath={null} workspaceRoot={null}>{'```javascript\nconst active = true;\n```'}</JinxiuMarkdown>,
+    ));
+    await act(async () => {
+      await vi.dynamicImportSettled();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector<HTMLElement>('pre.jinxiu-code-block-pre')?.style.backgroundColor)
+      .toBe('rgb(13, 17, 23)');
+  });
 });

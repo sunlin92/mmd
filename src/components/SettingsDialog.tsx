@@ -3,6 +3,7 @@ import { FolderOpen, RotateCcw, Settings2, X } from 'lucide-react';
 import type { AppSettings } from '../types';
 import type { EffectiveLocale } from '../lib/locale';
 import type { SettingsRecovery } from '../hooks/useSettings';
+import { SKINS } from '../lib/theme';
 import {
   DEFAULT_SHORTCUTS,
   findShortcutConflicts,
@@ -190,7 +191,7 @@ export function SettingsDialog({
 
           <section className="settings-section">
             <h3>{text.appearance}</h3>
-            <label className="settings-field"><span>{text.skin}</span><select name="selectedSkin" value={draft.selectedSkin} onChange={(event) => setDraft({ ...draft, selectedSkin: event.target.value as AppSettings['selectedSkin'] })}><option value="jinxiu-zhusha">Jinxiu Zhusha</option><option value="ruyao-tianqing">Ruyao Tianqing</option><option value="qinghua-jilan">Qinghua Jilan</option><option value="songke-zhuying">Songke Zhuying</option><option value="shanshui-yemo">Shanshui Yemo</option></select></label>
+            <label className="settings-field"><span>{text.skin}</span><select name="selectedSkin" value={draft.selectedSkin} onChange={(event) => setDraft({ ...draft, selectedSkin: event.target.value as AppSettings['selectedSkin'] })}>{SKINS.map((skin) => <option key={skin.id} value={skin.id}>{locale === 'zh-CN' ? skin.nameZh : skin.nameEn}</option>)}</select></label>
             <label className="settings-toggle"><span>{text.followSystem}</span><input name="followSystemTheme" type="checkbox" checked={draft.followSystemTheme} onChange={(event) => setDraft({ ...draft, followSystemTheme: event.target.checked })} /></label>
             <label className="settings-field"><span>{text.language}</span><select name="localeMode" value={draft.localeMode} onChange={(event) => setDraft({ ...draft, localeMode: event.target.value as AppSettings['localeMode'] })}><option value="system">System</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>
           </section>

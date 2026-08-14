@@ -25,12 +25,16 @@ pub const MENU_THEME_FOLLOW_SYSTEM_ID: &str = "theme-follow-system";
 pub const MENU_LOCALE_PREFIX: &str = "locale:";
 const SAVE_MENU_SYNC_ERROR: &str = "Native save menu synchronization failed";
 
-const SKINS: [(&str, &str); 5] = [
-    ("jinxiu-zhusha", "锦绣·朱砂"),
-    ("ruyao-tianqing", "汝窑·天青"),
-    ("qinghua-jilan", "青花·霁蓝"),
-    ("songke-zhuying", "宋刻·竹影"),
-    ("shanshui-yemo", "山水·夜墨"),
+const SKINS: [(&str, &str); 9] = [
+    ("original", "素笺·青黛"),
+    ("jinxiu-zhusha", "朱批·丹砂"),
+    ("ruyao-tianqing", "汝瓷·天青"),
+    ("qinghua-jilan", "青花·苏青"),
+    ("songke-zhuying", "宋版·竹青"),
+    ("gujuan-nuanxing", "杏笺·赭石"),
+    ("zhuying-qingci", "春笺·豆青"),
+    ("jiushu-huangzhi", "烟岚·缃素"),
+    ("shanshui-yemo", "玄卷·松烟"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,7 +62,7 @@ impl Default for NativeMenuState {
                 entries: Vec::new(),
             },
             save_enabled: false,
-            selected_skin: "jinxiu-zhusha".to_string(),
+            selected_skin: "original".to_string(),
             follow_system: false,
             locale_mode: "system".to_string(),
             effective_locale: "en".to_string(),
@@ -548,6 +552,14 @@ mod tests {
     #[test]
     fn maps_only_allow_listed_theme_ids_and_routes_them_to_main_authority() {
         assert_eq!(
+            action_for_menu_id("theme-skin:original"),
+            Some("theme-skin:original".to_string())
+        );
+        assert_eq!(
+            action_for_menu_id("theme-skin:gujuan-nuanxing"),
+            Some("theme-skin:gujuan-nuanxing".to_string())
+        );
+        assert_eq!(
             action_for_menu_id("theme-skin:jinxiu-zhusha"),
             Some("theme-skin:jinxiu-zhusha".to_string())
         );
@@ -582,7 +594,7 @@ mod tests {
     #[test]
     fn native_menu_state_preserves_theme_projection_across_full_rebuild_inputs() {
         let mut state = NativeMenuState::default();
-        assert_eq!(state.selected_skin(), "jinxiu-zhusha");
+        assert_eq!(state.selected_skin(), "original");
         assert!(!state.follow_system());
         assert_eq!(state.locale_mode(), "system");
         assert_eq!(state.effective_locale(), "en");
@@ -630,7 +642,7 @@ mod tests {
     fn appearance_items_are_single_select_and_include_follow_system() {
         let state = NativeMenuState::default();
         let items = appearance_menu_items(&state);
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 10);
         assert_eq!(
             items
                 .iter()
@@ -638,11 +650,15 @@ mod tests {
                 .map(|item| item.label)
                 .collect::<Vec<_>>(),
             vec![
-                "锦绣·朱砂",
-                "汝窑·天青",
-                "青花·霁蓝",
-                "宋刻·竹影",
-                "山水·夜墨",
+                "素笺·青黛",
+                "朱批·丹砂",
+                "汝瓷·天青",
+                "青花·苏青",
+                "宋版·竹青",
+                "杏笺·赭石",
+                "春笺·豆青",
+                "烟岚·缃素",
+                "玄卷·松烟",
             ]
         );
         assert_eq!(
@@ -658,7 +674,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AppearanceItemKind::Skin)
                 .count(),
-            5
+            9
         );
     }
 

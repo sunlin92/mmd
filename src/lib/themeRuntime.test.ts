@@ -328,7 +328,7 @@ describe('theme runtime', () => {
     await runtime.start();
 
     mediaQuery.change(true);
-    expect(root.values.get('data-skin')).toBe('shanshui-yemo');
+    expect(root.values.get('data-skin')).toBe('original');
     expect(root.values.get('data-appearance')).toBe('dark');
     mediaQuery.change(false);
     expect(root.values.get('data-skin')).toBe('songke-zhuying');

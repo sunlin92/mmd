@@ -23,6 +23,39 @@ describe('SettingsDialog', () => {
     container.remove();
   });
 
+  it('lists the complete LogicFrame palette catalog with localized exact names', async () => {
+    await act(async () => root.render(
+      <SettingsDialog busy={false} locale="en" settings={currentSettingsEnvelope.settings}
+        onClose={vi.fn<() => void>()}
+        onReset={vi.fn<() => Promise<void>>(async () => undefined)}
+        onSave={vi.fn<(settings: AppSettings) => Promise<void>>(async () => undefined)} />,
+    ));
+    const options = [...container.querySelectorAll<HTMLOptionElement>('select[name="selectedSkin"] option')];
+    expect(options.map(({ value, textContent }) => [value, textContent])).toEqual([
+      ['original', 'Plain Paper · Indigo'],
+      ['jinxiu-zhusha', 'Vermilion Notes · Cinnabar'],
+      ['ruyao-tianqing', 'Ru Ware · Sky Blue'],
+      ['qinghua-jilan', 'Blue-and-White · Cobalt'],
+      ['songke-zhuying', 'Song Edition · Bamboo Green'],
+      ['gujuan-nuanxing', 'Apricot Paper · Red Ochre'],
+      ['zhuying-qingci', 'Spring Paper · Pea Green'],
+      ['jiushu-huangzhi', 'Misty Landscape · Antique Silk'],
+      ['shanshui-yemo', 'Night Tome · Pine Soot Ink'],
+    ]);
+
+    await act(async () => root.render(
+      <SettingsDialog busy={false} locale="zh-CN" settings={currentSettingsEnvelope.settings}
+        onClose={vi.fn<() => void>()}
+        onReset={vi.fn<() => Promise<void>>(async () => undefined)}
+        onSave={vi.fn<(settings: AppSettings) => Promise<void>>(async () => undefined)} />,
+    ));
+    expect([...container.querySelectorAll<HTMLOptionElement>('select[name="selectedSkin"] option')]
+      .map(({ textContent }) => textContent)).toEqual([
+      '素笺·青黛', '朱批·丹砂', '汝瓷·天青', '青花·苏青', '宋版·竹青',
+      '杏笺·赭石', '春笺·豆青', '烟岚·缃素', '玄卷·松烟',
+    ]);
+  });
+
   it('renders compact native controls and saves autosave, spellcheck, wikilinks, resource and layout settings', async () => {
     const onSave = vi.fn<(settings: AppSettings) => Promise<void>>(async () => undefined);
     await act(async () => root.render(

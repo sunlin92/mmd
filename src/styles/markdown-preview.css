@@ -109,15 +109,37 @@
 .typora-jinxiu .jinxiu-code-surface pre.jinxiu-code-block-pre {
   max-width: 100%;
   overflow-x: hidden !important;
+  padding-right: 16px !important;
 }
 .typora-jinxiu .jinxiu-code-surface pre.jinxiu-code-block-pre code.jinxiu-fenced-code-inner {
   min-width: 0;
   white-space: pre-wrap !important;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+.typora-jinxiu .jinxiu-code-surface pre.jinxiu-code-block-pre code.jinxiu-fenced-code-inner span[class*="token"] {
+  overflow-wrap: normal !important;
+  word-break: normal !important;
 }
 .typora-jinxiu .jinxiu-code-surface pre.jinxiu-code-block-pre code .jinxiu-code-line {
   min-width: 0;
-  display: flex !important;
+  display: block !important;
+  position: relative;
+  box-sizing: border-box;
+  padding-left: var(--jinxiu-code-gutter, 4.9rem);
+}
+.typora-jinxiu .jinxiu-code-surface pre.jinxiu-code-block-pre code .jinxiu-code-line > span.linenumber,
+.typora-jinxiu .jinxiu-code-surface pre.jinxiu-code-block-pre code .jinxiu-code-line > span.react-syntax-highlighter-line-number {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  display: block !important;
+  box-sizing: border-box !important;
+  width: var(--jinxiu-code-gutter, 4.9rem) !important;
+  min-width: 3.25rem !important;
+  margin-right: 0 !important;
+  padding-right: 1rem !important;
+  text-align: right !important;
 }
 
 .typora-jinxiu pre code .token.keyword,

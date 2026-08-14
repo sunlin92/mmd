@@ -184,7 +184,7 @@ mod tests {
         let state = AppState::default();
 
         assert!(!state.native_menu_state().save_enabled());
-        assert_eq!(state.native_menu_state().selected_skin(), "jinxiu-zhusha");
+        assert_eq!(state.native_menu_state().selected_skin(), "original");
         state.set_native_save_menu_enabled(true);
         state
             .set_native_theme_preference("songke-zhuying", true)

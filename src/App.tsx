@@ -15,7 +15,6 @@ import type { DocxPreviewFeedback } from './components/DocxPreview';
 import { EditorPane, type ClipboardImagePasteRequest } from './components/EditorPane';
 import { ExternalFileChangeDialog } from './components/ExternalFileChangeDialog';
 import { DocumentSaveConflictDialog } from './components/DocumentSaveConflictDialog';
-import { CrashDraftRecoveryDialog } from './components/CrashDraftRecoveryDialog';
 import { CrashDraftStoreRepairDialog } from './components/CrashDraftStoreRepairDialog';
 import { FeedbackDialog } from './components/FeedbackDialog';
 import { ExportDialog, type ExportDialogValue } from './components/ExportDialog';
@@ -67,6 +66,7 @@ import {
 } from './lib/paneLayout';
 import { loadLazyModuleWithRetry } from './lib/lazyModule';
 import { resolveShortcutProfile, shortcutMatchesEvent, type ShortcutAction } from './lib/shortcutProfiles';
+import { resolveThemeForAppearance } from './lib/theme';
 import { useObservedEffectiveTheme } from './lib/themeObservation';
 import {
   decodeMarkdownOutlineJump,
@@ -544,7 +544,7 @@ export default function App() {
   }, [enqueueLocalOpenIntent]);
 
   const crashDraftRecovery = useCrashDraftRecovery({
-    enabled: !isPopout,
+    enabled: false,
     commands: crashDraftCommands,
     onRecoverDraft: requestCrashDraftRecovery,
     seedRevision: seedCrashDraftRevision,
@@ -727,7 +727,6 @@ export default function App() {
       || settingsState.busy
       || settingsState.recovery
       || crashDraftRecovery.error
-      || (crashDraftRecovery.catalog && crashDraftRecovery.catalog.entries.length > 0)
       || externalFileAction
       || saveConflict
       || showUnsavedExitPrompt
@@ -1935,7 +1934,7 @@ export default function App() {
       const appearanceForExport = exportValue.theme === 'current' ? appearance : exportValue.theme;
       const skinForExport = exportValue.theme === 'current'
         ? skin
-        : exportValue.theme === 'dark' ? 'shanshui-yemo' : skin === 'shanshui-yemo' ? 'jinxiu-zhusha' : skin;
+        : resolveThemeForAppearance({ appearance, skin }, appearanceForExport).skin;
       if (exportValue.format === 'excalidraw') {
         if (activeFileKind !== 'excalidraw') throw new Error('Excalidraw bundle export requires an Excalidraw document');
         const runtime = await loadLazyModuleWithRetry(() => import('./lib/excalidrawRuntime'));
@@ -2374,15 +2373,6 @@ export default function App() {
           overflowRepairProgress={crashDraftRecovery.overflowRepairProgress}
           onRepairOverflow={crashDraftRecovery.repairOverflowBatch}
           onRetry={crashDraftRecovery.retry}
-        />
-      ) : crashDraftRecovery.catalog && crashDraftRecovery.catalog.entries.length > 0 ? (
-        <CrashDraftRecoveryDialog
-          busy={crashDraftRecovery.busy}
-          catalog={crashDraftRecovery.catalog}
-          locale={locale}
-          onRecover={(entry) => void crashDraftRecovery.recover(entry)}
-          onDiscard={(entry) => void crashDraftRecovery.discard(entry)}
-          onDiscardAll={(token) => void crashDraftRecovery.discardAll(token)}
         />
       ) : settingsState.recovery ? (
         <SettingsDialog

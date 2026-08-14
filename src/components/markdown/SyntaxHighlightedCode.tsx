@@ -32,11 +32,19 @@ export default function SyntaxHighlightedCode({ body, dark, language }: { body: 
       style={prismStyle}
       PreTag="pre"
       showLineNumbers
-      wrapLongLines
-      customStyle={{ margin: 0, borderRadius: 0, fontSize: '14px', lineHeight: 1.62, padding: '14px 0 18px', backgroundColor: dark ? '#0d1117' : '#fff' }}
+      showInlineLineNumbers
+      wrapLines
+      customStyle={{ margin: 0, borderRadius: 0, fontSize: '14px', lineHeight: 1.62, padding: '14px 16px 18px 0', backgroundColor: dark ? '#0d1117' : '#fff' }}
       lineNumberStyle={{ minWidth: '3rem', paddingRight: '0.9rem', color: dark ? '#6e95c9' : '#1f82a6', userSelect: 'none' }}
       lineProps={{ className: 'jinxiu-code-line' }}
-      codeTagProps={{ className: 'jinxiu-fenced-code-inner' }}
+      codeTagProps={{
+        className: 'jinxiu-fenced-code-inner',
+        style: {
+          overflowWrap: 'break-word',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'normal',
+        },
+      }}
     >
       {body}
     </SyntaxHighlighter>

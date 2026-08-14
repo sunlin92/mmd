@@ -29,6 +29,16 @@ describe('settings projection', () => {
     expect(decodeSettingsEnvelope(currentSettingsEnvelope).settings.wikilinksEnabled).toBe(false);
   });
 
+  it.each(['original', 'gujuan-nuanxing', 'zhuying-qingci', 'jiushu-huangzhi'] as const)(
+    'accepts LogicFrame skin %s',
+    (selectedSkin) => {
+      expect(decodeSettingsEnvelope({
+        ...currentSettingsEnvelope,
+        settings: { ...currentSettingsEnvelope.settings, selectedSkin },
+      }).settings.selectedSkin).toBe(selectedSkin);
+    },
+  );
+
   it.each([
     { ...currentSettingsEnvelope, schemaVersion: 2 },
     { ...currentSettingsEnvelope, revision: -1 },

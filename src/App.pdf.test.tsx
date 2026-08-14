@@ -311,10 +311,10 @@ describe('App binary document composition', () => {
     expect(appMocks.excalidrawPane).toHaveBeenCalledOnce();
   });
 
-  it('enables crash recovery only in the main window', async () => {
+  it('does not scan crash recovery during main or popout startup', async () => {
     appMocks.useDocumentSession.mockReturnValue(createTextSession('markdown'));
     await act(async () => root.render(<App />));
-    expect(appMocks.useCrashDraftRecovery).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
+    expect(appMocks.useCrashDraftRecovery).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: false }));
     act(() => root.unmount());
     root = createRoot(container);
     window.history.replaceState({}, '', '/?pane=editor');
@@ -410,7 +410,7 @@ describe('App binary document composition', () => {
     expect(session.handleOverwriteSaveConflict).toHaveBeenCalledOnce();
   });
 
-  it('renders crash recovery and executes only one explicit repair batch per click', async () => {
+  it('keeps startup recovery catalogs silent and executes one explicit repair batch per click', async () => {
     const session = createTextSession('markdown');
     appMocks.useDocumentSession.mockReturnValue(session);
     const recover = vi.fn<() => void>();
@@ -429,8 +429,9 @@ describe('App binary document composition', () => {
       repairOverflowBatch: vi.fn<() => void>(), recover, retry: vi.fn<() => void>(),
     });
     await act(async () => root.render(<App />));
-    act(() => [...container.querySelectorAll('button')].find((button) => button.textContent === 'Recover')?.click());
-    expect(recover).toHaveBeenCalledOnce();
+    expect([...container.querySelectorAll('button')]
+      .some((button) => button.textContent === 'Recover')).toBe(false);
+    expect(recover).not.toHaveBeenCalled();
 
     const repairOverflowBatch = vi.fn<() => void>();
     appMocks.useCrashDraftRecovery.mockReturnValue({

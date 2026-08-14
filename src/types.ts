@@ -274,10 +274,14 @@ export interface DeleteWorkspaceEntryResponse {
 export const SETTINGS_SCHEMA_VERSION = 1 as const;
 
 export type SettingsSkinId =
+  | 'original'
   | 'jinxiu-zhusha'
   | 'ruyao-tianqing'
   | 'qinghua-jilan'
   | 'songke-zhuying'
+  | 'gujuan-nuanxing'
+  | 'zhuying-qingci'
+  | 'jiushu-huangzhi'
   | 'shanshui-yemo';
 
 export type SettingsLocaleMode = 'system' | 'zh-CN' | 'en';

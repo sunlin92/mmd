@@ -384,7 +384,15 @@ fn validate_settings(settings: &Settings) -> Result<(), SettingsError> {
     }
     if !matches!(
         settings.selected_skin.as_str(),
-        "jinxiu-zhusha" | "qinghua-jilan" | "ruyao-tianqing" | "shanshui-yemo" | "songke-zhuying"
+        "original"
+            | "jinxiu-zhusha"
+            | "ruyao-tianqing"
+            | "qinghua-jilan"
+            | "songke-zhuying"
+            | "gujuan-nuanxing"
+            | "zhuying-qingci"
+            | "jiushu-huangzhi"
+            | "shanshui-yemo"
     ) {
         return Err(invalid_error("Theme selection is not supported."));
     }

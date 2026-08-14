@@ -40,20 +40,32 @@ const REPRESENTATIVE_ROOT_STYLES: Record<SkinId, {
   readonly selection: string;
   readonly toolbar: string;
 }> = {
+  original: {
+    appearance: 'light', editor: '#ffffff', preview: '#ffffff', selection: '#264783', toolbar: '#f8fafc',
+  },
   'jinxiu-zhusha': {
-    appearance: 'light', editor: '#ffffff', preview: '#ffffff', selection: '#a32638', toolbar: '#f7f7f5',
+    appearance: 'light', editor: '#ffffff', preview: '#ffffff', selection: '#a13d32', toolbar: '#f7f7f5',
   },
   'ruyao-tianqing': {
-    appearance: 'light', editor: '#fcfdfc', preview: '#fcfdfc', selection: '#2f6f62', toolbar: '#f3f6f3',
+    appearance: 'light', editor: '#fcfdfc', preview: '#fcfdfc', selection: '#3f6f73', toolbar: '#f3f6f3',
   },
   'qinghua-jilan': {
     appearance: 'light', editor: '#ffffff', preview: '#ffffff', selection: '#235ba8', toolbar: '#f7f8fa',
   },
   'songke-zhuying': {
-    appearance: 'light', editor: '#fefefc', preview: '#fefefc', selection: '#3e6b4f', toolbar: '#f5f6f2',
+    appearance: 'light', editor: '#fefefc', preview: '#fefefc', selection: '#526b3f', toolbar: '#f5f6f2',
+  },
+  'gujuan-nuanxing': {
+    appearance: 'light', editor: '#fff7e8', preview: '#fff7e8', selection: '#8b4b08', toolbar: '#f2dfba',
+  },
+  'zhuying-qingci': {
+    appearance: 'light', editor: '#f3faf4', preview: '#f3faf4', selection: '#257432', toolbar: '#d3ebd8',
+  },
+  'jiushu-huangzhi': {
+    appearance: 'light', editor: '#fdfae6', preview: '#fdfae6', selection: '#544a3b', toolbar: '#e9dfc1',
   },
   'shanshui-yemo': {
-    appearance: 'dark', editor: '#202421', preview: '#202421', selection: '#477968', toolbar: '#1c201e',
+    appearance: 'dark', editor: '#202421', preview: '#202421', selection: '#72a18f', toolbar: '#1c201e',
   },
 };
 
@@ -130,8 +142,7 @@ function contrastRatio(foreground: string, background: string): number {
     / (Math.min(foregroundLuminance, backgroundLuminance) + 0.05);
 }
 
-function renderedRoot(skin: SkinId) {
-  const appearance = REPRESENTATIVE_ROOT_STYLES[skin].appearance;
+function renderedRoot(skin: SkinId, appearance = REPRESENTATIVE_ROOT_STYLES[skin].appearance) {
   const dom = new JSDOM(
     `<!doctype html><html data-skin="${skin}" data-appearance="${appearance}"><head><style>${baseCss}</style></head></html>`,
   );
@@ -144,9 +155,14 @@ function renderedRoot(skin: SkinId) {
 
 describe('application skin CSS contract', () => {
   it.each(SKIN_IDS)('defines the complete canonical token contract for %s', (skin) => {
-    const declarations = declarationsFor(`:root[data-skin="${skin}"]`);
-    expect([...CANONICAL_THEME_TOKENS].filter((token) => !declarations.has(token))).toEqual([]);
-    expect(declarations.size).toBe(CANONICAL_THEME_TOKENS.length);
+    const selectors = skin === 'original'
+      ? [':root[data-skin="original"][data-appearance="light"]', ':root[data-skin="original"][data-appearance="dark"]']
+      : [`:root[data-skin="${skin}"]`];
+    for (const selector of selectors) {
+      const declarations = declarationsFor(selector);
+      expect([...CANONICAL_THEME_TOKENS].filter((token) => !declarations.has(token))).toEqual([]);
+      expect(declarations.size).toBe(CANONICAL_THEME_TOKENS.length);
+    }
   });
 
   it('uses root appearance attributes in newly authored application CSS', () => {
@@ -223,11 +239,18 @@ describe('application skin CSS contract', () => {
 
     expect(preStyle.overflowX).toBe('hidden');
     expect(codeStyle.whiteSpace).toBe('pre-wrap');
-    expect(codeStyle.overflowWrap).toBe('anywhere');
-    expect(lineStyle.display).toBe('flex');
+    const lineNumber = dom.window.document.createElement('span');
+    lineNumber.className = 'react-syntax-highlighter-line-number';
+    line.append(lineNumber);
+
+    expect(codeStyle.overflowWrap).toBe('break-word');
+    expect(codeStyle.wordBreak).toBe('normal');
+    expect(lineStyle.display).toBe('block');
+    expect(lineStyle.paddingLeft).toBe('var(--jinxiu-code-gutter, 4.9rem)');
+    expect(dom.window.getComputedStyle(lineNumber).position).toBe('absolute');
     expect(fallbackPreStyle.overflowX).toBe('hidden');
     expect(fallbackCodeStyle.whiteSpace).toBe('pre-wrap');
-    expect(fallbackCodeStyle.overflowWrap).toBe('anywhere');
+    expect(fallbackCodeStyle.overflowWrap).toBe('break-word');
   });
 
   it.each(SKIN_IDS)('computes representative root styles for %s', (skin) => {
@@ -255,6 +278,24 @@ describe('application skin CSS contract', () => {
         contrastRatio(rendered.token(foregroundToken), rendered.token(backgroundToken)),
         `${skin}: ${label}`,
       ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it('matches the LogicFrame adaptive original dark tokens and preserves key contrast thresholds', () => {
+    const rendered = renderedRoot('original', 'dark');
+    expect(rendered.token('--bg')).toBe('#0f172a');
+    expect(rendered.token('--text-muted')).toBe('#64748b');
+    expect(rendered.token('--text-reading')).toBe('#a1a1aa');
+    expect(rendered.token('--accent')).toBe('#8eb0e0');
+    expect(rendered.token('--accent-hover')).toBe('#7a9ccb');
+    expect(rendered.colorScheme).toBe('dark');
+    for (const [label, foregroundToken, backgroundToken] of NORMAL_TEXT_PAIRS.filter(
+      ([pairLabel]) => pairLabel !== 'muted text on panel',
+    )) {
+      expect(
+        contrastRatio(rendered.token(foregroundToken), rendered.token(backgroundToken)),
+        `original dark: ${label}`,
+      ).toBeGreaterThanOrEqual(4.5);
     }
   });
 });

@@ -1,6 +1,7 @@
 import { Component, lazy, Suspense, useCallback, useState, type ReactNode } from 'react';
 import { Check, Copy } from 'lucide-react';
 import { useI18n } from '../../lib/i18n';
+import { useObservedEffectiveTheme } from '../../lib/themeObservation';
 import { normalizeFenceLanguage } from './markdownLanguage';
 
 const SyntaxHighlightedCode = lazy(() => import('./SyntaxHighlightedCode'));
@@ -10,7 +11,7 @@ function PlainCodeFallback({ body, dark, language, loading }: { body: string; da
     <pre
       aria-busy={loading}
       className="jinxiu-code-block-pre"
-      style={{ margin: 0, borderRadius: 0, fontSize: '14px', lineHeight: 1.62, padding: '14px 0 18px', backgroundColor: dark ? '#0d1117' : '#fff' }}
+      style={{ margin: 0, borderRadius: 0, fontSize: '14px', lineHeight: 1.62, padding: '14px 16px 18px 0', backgroundColor: dark ? '#0d1117' : '#fff' }}
     >
       <code className={`jinxiu-fenced-code-inner language-${language}`}>{body}</code>
     </pre>
@@ -31,8 +32,9 @@ class SyntaxHighlightErrorBoundary extends Component<{ children: ReactNode; fall
 
 export function CodeBlock({ code, language }: { code: string; language: string }) {
   const { t } = useI18n();
+  const { appearance } = useObservedEffectiveTheme();
   const [copied, setCopied] = useState(false);
-  const dark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+  const dark = appearance === 'dark';
   const body = code.replace(/\n$/, '');
   const lang = normalizeFenceLanguage(language);
 
