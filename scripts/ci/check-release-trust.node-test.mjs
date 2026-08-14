@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { evaluateReleaseTrust } from './check-release-trust.mjs';
+import {
+  evaluateReleaseTrust,
+  unsignedReleaseConfig,
+} from './check-release-trust.mjs';
 
 const complete = {
   TAURI_SIGNING_PRIVATE_KEY: 'private-key',
@@ -43,4 +46,18 @@ test('rejects placeholder, ad-hoc, and incomplete trust configuration', () => {
 test('reports release readiness without weakening strict trust validation', () => {
   assert.equal(evaluateReleaseTrust(complete).ready, true);
   assert.equal(evaluateReleaseTrust({}).ready, false);
+});
+
+test('unsigned release config disables updater artifacts and remote updates', () => {
+  assert.deepEqual(unsignedReleaseConfig(), {
+    bundle: {
+      createUpdaterArtifacts: false,
+    },
+    plugins: {
+      updater: {
+        endpoints: [],
+        pubkey: '',
+      },
+    },
+  });
 });

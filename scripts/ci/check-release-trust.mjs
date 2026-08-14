@@ -3,6 +3,20 @@ import process from 'node:process';
 
 export const UPDATER_ENDPOINT = 'https://github.com/sunlin92/mmd/releases/latest/download/latest.json';
 
+export function unsignedReleaseConfig() {
+  return {
+    bundle: {
+      createUpdaterArtifacts: false,
+    },
+    plugins: {
+      updater: {
+        endpoints: [],
+        pubkey: '',
+      },
+    },
+  };
+}
+
 const required = [
   'TAURI_SIGNING_PRIVATE_KEY',
   'TAURI_SIGNING_PRIVATE_KEY_PASSWORD',
@@ -47,6 +61,7 @@ export function evaluateReleaseTrust(environment) {
 function main() {
   const outputIndex = process.argv.indexOf('--output');
   const output = outputIndex >= 0 ? process.argv[outputIndex + 1] : null;
+  const allowUnsigned = process.argv.includes('--allow-unsigned');
   const result = evaluateReleaseTrust(process.env);
   if (process.argv.includes('--github-output')) {
     const githubOutput = process.env.GITHUB_OUTPUT;
@@ -61,12 +76,23 @@ function main() {
     }
     return;
   }
-  if (result.errors.length) {
+  if (result.errors.length && !allowUnsigned) {
     for (const error of result.errors) console.error(error);
     process.exitCode = 1;
     return;
   }
-  if (output) fs.writeFileSync(output, `${JSON.stringify(result.config, null, 2)}\n`, { mode: 0o600 });
+  if (allowUnsigned && !output) {
+    console.error('--allow-unsigned requires --output.');
+    process.exitCode = 1;
+    return;
+  }
+  if (output) {
+    const config = result.ready ? result.config : unsignedReleaseConfig();
+    if (!result.ready) {
+      console.log('Unsigned release fallback is active; updater artifacts and endpoints are disabled.');
+    }
+    fs.writeFileSync(output, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  }
 }
 
 if (process.argv[1] && import.meta.url === new URL(process.argv[1], 'file:').href) main();

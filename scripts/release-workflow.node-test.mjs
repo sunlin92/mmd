@@ -106,16 +106,30 @@ test('embedded publish transaction is valid Bash', async () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
-test('trusted release builds require updater and platform signing secrets', async () => {
+test('release builds fall back to unsigned installers without weakening trusted releases', async () => {
   const workflow = await readFile(workflowPath, 'utf8');
   assert.match(workflow, /release-ready: \$\{\{ steps\.release-trust\.outputs\.ready \}\}/);
   assert.match(workflow, /id: release-trust[\s\S]*check-release-trust\.mjs --github-output/);
-  assert.match(workflow, /if: needs\.source\.outputs\.release-ready == 'true'/);
-  assert.match(workflow, /node scripts\/ci\/check-release-trust\.mjs --output src-tauri\/tauri\.release\.conf\.json/);
+  assert.doesNotMatch(
+    workflow,
+    /build-(?:macos-arm64|macos-x64|windows-x64|linux-x64):[\s\S]{0,150}if: needs\.source\.outputs\.release-ready == 'true'/,
+  );
+  assert.equal(
+    workflow.match(/check-release-trust\.mjs --allow-unsigned --output src-tauri\/tauri\.release\.conf\.json/g)?.length,
+    4,
+  );
   assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY \}\}/);
   assert.match(workflow, /APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}/);
   assert.match(workflow, /WINDOWS_CERTIFICATE_BASE64: \$\{\{ secrets\.WINDOWS_CERTIFICATE_BASE64 \}\}/);
-  assert.doesNotMatch(workflow, /APPLE_SIGNING_IDENTITY: '-'/);
+  assert.match(
+    workflow,
+    /APPLE_SIGNING_IDENTITY: \$\{\{ needs\.source\.outputs\.release-ready == 'true' && secrets\.APPLE_SIGNING_IDENTITY \|\| '-' \}\}/,
+  );
+  assert.match(
+    workflow,
+    /name: Import and verify Windows signing certificate\n\s+if: needs\.source\.outputs\.release-ready == 'true'/,
+  );
+  assert.match(workflow, /if \[\[ "\$RELEASE_READY" == true \]\]; then/);
   assert.match(workflow, /create-update-manifest\.mjs release-assets/);
   assert.match(workflow, /"latest\.json"/);
 });
