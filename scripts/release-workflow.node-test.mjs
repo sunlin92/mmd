@@ -106,6 +106,27 @@ test('embedded publish transaction is valid Bash', async () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('release smoke jobs use non-instrumented mode and pass every required native target', async () => {
+  const workflow = await readFile(workflowPath, 'utf8');
+
+  assert.match(
+    workflow,
+    /smoke-macos\.sh artifact arm64 aarch64-apple-darwin release/,
+  );
+  assert.match(
+    workflow,
+    /smoke-macos\.sh artifact x86_64 x86_64-apple-darwin release/,
+  );
+  assert.match(
+    workflow,
+    /smoke-windows\.ps1 -ArtifactDirectory artifact -Target x86_64-pc-windows-msvc -Mode release/,
+  );
+  assert.match(
+    workflow,
+    /smoke-linux\.sh artifact x86_64-unknown-linux-gnu release/,
+  );
+});
+
 test('release builds fall back to unsigned installers without weakening trusted releases', async () => {
   const workflow = await readFile(workflowPath, 'utf8');
   assert.match(workflow, /release-ready: \$\{\{ steps\.release-trust\.outputs\.ready \}\}/);
@@ -143,7 +164,7 @@ test('release builds fall back to unsigned installers without weakening trusted 
     /name: Import and verify Windows signing certificate\n\s+if: needs\.source\.outputs\.release-ready == 'true'[\s\S]{0,500}env: \*trusted-release-env/,
   );
   assert.match(workflow, /if \[\[ "\$RELEASE_READY" == true \]\]; then/);
-  assert.match(workflow, /scripts\/ci\/smoke-linux\.sh artifact x86_64-unknown-linux-gnu/);
+  assert.match(workflow, /scripts\/ci\/smoke-linux\.sh artifact x86_64-unknown-linux-gnu release/);
   assert.match(workflow, /create-update-manifest\.mjs release-assets/);
   assert.match(workflow, /"latest\.json"/);
 });

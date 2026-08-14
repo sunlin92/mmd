@@ -4,13 +4,17 @@ set -euo pipefail
 artifact_dir=${1:?artifact directory required}
 expected_arch=${2:?expected architecture required}
 target=${3:?target required}
+smoke_mode=${4:-instrumented}
+[[ "$smoke_mode" == instrumented || "$smoke_mode" == release ]]
 [[ "$(uname -m)" == "$expected_arch" ]]
 node scripts/ci/artifact-manifest.mjs verify "$artifact_dir"
 
 mapfile_name="$RUNNER_TEMP/mmd-hdiutil.txt"
 mount_point=
 install_dir=
+app_pid=
 cleanup() {
+  if [[ -n "$app_pid" ]] && kill -0 "$app_pid" 2>/dev/null; then kill "$app_pid" || true; fi
   if [[ -n "$mount_point" ]]; then hdiutil detach "$mount_point" -force || true; fi
   if [[ -n "$install_dir" ]]; then rm -rf -- "$install_dir"; fi
 }
@@ -43,6 +47,17 @@ else
   echo "$signature"
   echo 'Unrecognized macOS signing classification.' >&2
   exit 1
+fi
+
+if [[ "$smoke_mode" == release ]]; then
+  "$binary" >"$RUNNER_TEMP/mmd-macos.log" 2>&1 &
+  app_pid=$!
+  sleep 5
+  kill -0 "$app_pid"
+  kill "$app_pid"
+  wait "$app_pid" || true
+  app_pid=
+  exit 0
 fi
 
 challenge="$RUNNER_TEMP/mmd-packaged-lifecycle-dmg.json"

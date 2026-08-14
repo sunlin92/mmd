@@ -377,7 +377,7 @@ jobs:
           artifact-ids: ${{ needs.build-macos-arm64.outputs.artifact-id }}
           path: artifact
           merge-multiple: true
-      - run: scripts/ci/smoke-macos.sh artifact arm64
+      - run: scripts/ci/smoke-macos.sh artifact arm64 aarch64-apple-darwin release
 
   smoke-macos-x64:
     name: Smoke macOS x64
@@ -403,7 +403,7 @@ jobs:
           artifact-ids: ${{ needs.build-macos-x64.outputs.artifact-id }}
           path: artifact
           merge-multiple: true
-      - run: scripts/ci/smoke-macos.sh artifact x86_64
+      - run: scripts/ci/smoke-macos.sh artifact x86_64 x86_64-apple-darwin release
 
   smoke-windows-x64:
     name: Smoke Windows x64
@@ -433,7 +433,7 @@ jobs:
           path: artifact
           merge-multiple: true
       - shell: pwsh
-        run: ./scripts/ci/smoke-windows.ps1 -ArtifactDirectory artifact
+        run: ./scripts/ci/smoke-windows.ps1 -ArtifactDirectory artifact -Target x86_64-pc-windows-msvc -Mode release
 
   smoke-linux-x64:
     name: Smoke Linux x64
@@ -462,7 +462,7 @@ jobs:
           artifact-ids: ${{ needs.build-linux-x64.outputs.artifact-id }}
           path: artifact
           merge-multiple: true
-      - run: scripts/ci/smoke-linux.sh artifact x86_64-unknown-linux-gnu
+      - run: scripts/ci/smoke-linux.sh artifact x86_64-unknown-linux-gnu release
 
   assemble-release:
     name: Assemble verified release

@@ -3,6 +3,8 @@ set -euo pipefail
 
 artifact_dir=${1:?artifact directory required}
 target=${2:?target required}
+smoke_mode=${3:-instrumented}
+[[ "$smoke_mode" == instrumented || "$smoke_mode" == release ]]
 artifact_dir=$(CDPATH= cd -- "$artifact_dir" && pwd -P)
 [[ "$(uname -m)" == 'x86_64' ]]
 node scripts/ci/artifact-manifest.mjs verify "$artifact_dir"
@@ -21,6 +23,26 @@ printf '%s\n' "$mime_association"
 
 installed_binary=$(command -v mmd)
 run_with_window_manager=(bash scripts/ci/run-xvfb-with-window-manager.sh)
+if [[ "$smoke_mode" == release ]]; then
+  run_for_five_seconds() {
+    local log=$1
+    shift
+    local status
+    set +e
+    "${run_with_window_manager[@]}" timeout --signal=TERM --kill-after=5s 5s "$@" >"$log" 2>&1
+    status=$?
+    set -e
+    [[ "$status" == 124 ]]
+  }
+
+  run_for_five_seconds "$RUNNER_TEMP/mmd-deb.log" "$installed_binary"
+  [[ -c /dev/fuse ]]
+  ldconfig -p | grep -q 'libfuse\.so\.2'
+  chmod +x "$appimage"
+  run_for_five_seconds "$RUNNER_TEMP/mmd-appimage.log" "$appimage"
+  exit 0
+fi
+
 deb_challenge="$RUNNER_TEMP/mmd-packaged-lifecycle-deb.json"
 node scripts/ci/packaged-lifecycle-runner.mjs \
   --evidence "$artifact_dir/m2-lifecycle-evidence.json" \
